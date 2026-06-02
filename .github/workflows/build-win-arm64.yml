@@ -88,6 +88,19 @@ jobs:
         with:
           targets: aarch64-pc-windows-msvc
 
+      - name: Configure LLVM for bindgen
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $llvmRoot = "C:\Program Files\LLVM"
+          if (-not (Test-Path $llvmRoot)) {
+            throw "LLVM not found at $llvmRoot"
+          }
+
+          "LIBCLANG_PATH=$llvmRoot\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CLANG_PATH=$llvmRoot\bin\clang.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$llvmRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Install dependencies
         shell: pwsh
         working-directory: cc-switch
@@ -104,6 +117,23 @@ jobs:
           $json = Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 100
           $json.bundle.createUpdaterArtifacts = $false
           $json | ConvertTo-Json -Depth 100 | Set-Content $path -Encoding UTF8
+
+      - name: Enable rquickjs bindgen for Windows ARM64
+        shell: pwsh
+        working-directory: cc-switch
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cargoToml = "src-tauri/Cargo.toml"
+          $content = Get-Content $cargoToml -Raw -Encoding UTF8
+          $old = 'rquickjs = { version = "0.8", features = ["array-buffer", "classes"] }'
+          $new = 'rquickjs = { version = "0.8", features = ["array-buffer", "classes", "bindgen"] }'
+
+          if (-not $content.Contains($old)) {
+            throw "Expected rquickjs dependency declaration not found in $cargoToml"
+          }
+
+          $content = $content.Replace($old, $new)
+          Set-Content $cargoToml -Value $content -Encoding UTF8
 
       - name: Build Windows ARM64 MSI
         shell: pwsh
