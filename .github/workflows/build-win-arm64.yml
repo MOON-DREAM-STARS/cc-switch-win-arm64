@@ -1,0 +1,180 @@
+name: Build CC Switch Windows ARM64
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Optional upstream tag, e.g. v3.16.1. Leave empty to use latest release."
+        required: false
+        type: string
+  schedule:
+    # UTC. 18:30 UTC = 02:30 Singapore time.
+    - cron: "30 18 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cc-switch-win-arm64-${{ inputs.upstream_tag || 'latest' }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve upstream release
+    runs-on: ubuntu-24.04
+    outputs:
+      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      skip: ${{ steps.resolve.outputs.skip }}
+    steps:
+      - name: Resolve upstream release
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$(gh release view --repo farion1231/cc-switch --json tagName -q .tagName)"
+          fi
+
+          RELEASE_TAG="cc-switch-${TAG}-windows-arm64"
+
+          echo "upstream_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release already exists: $RELEASE_TAG"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Need build: upstream=$TAG release=$RELEASE_TAG"
+          fi
+
+  build:
+    name: Build Windows ARM64
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Checkout upstream cc-switch
+        uses: actions/checkout@v6
+        with:
+          repository: farion1231/cc-switch
+          ref: ${{ needs.resolve.outputs.upstream_tag }}
+          path: cc-switch
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.12.3
+          run_install: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Install dependencies
+        shell: pwsh
+        working-directory: cc-switch
+        run: |
+          $ErrorActionPreference = "Stop"
+          pnpm install --frozen-lockfile
+
+      - name: Disable updater artifacts for unsigned personal build
+        shell: pwsh
+        working-directory: cc-switch
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "src-tauri/tauri.conf.json"
+          $json = Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 100
+          $json.bundle.createUpdaterArtifacts = $false
+          $json | ConvertTo-Json -Depth 100 | Set-Content $path -Encoding UTF8
+
+      - name: Build Windows ARM64 MSI
+        shell: pwsh
+        working-directory: cc-switch
+        run: |
+          $ErrorActionPreference = "Stop"
+          pnpm tauri build --target aarch64-pc-windows-msvc --bundles msi
+
+      - name: Prepare release assets
+        shell: pwsh
+        working-directory: cc-switch
+        env:
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.upstream_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force -Path "release-assets" | Out-Null
+
+          $targetRoot = "src-tauri/target/aarch64-pc-windows-msvc/release"
+
+          $msi = Get-ChildItem -Path "$targetRoot/bundle/msi" -Recurse -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -ne $msi) {
+            $msiName = "CC-Switch-$env:UPSTREAM_TAG-Windows-arm64.msi"
+            Copy-Item $msi.FullName "release-assets/$msiName"
+            Write-Host "MSI copied: $msiName"
+          } else {
+            Write-Warning "No MSI found"
+          }
+
+          $exe = Get-ChildItem -Path $targetRoot -Filter "cc-switch.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $exe) {
+            throw "cc-switch.exe not found under $targetRoot"
+          }
+
+          $portableDir = "release-assets/CC-Switch-Portable-arm64"
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+          Copy-Item $exe.FullName $portableDir
+
+          @(
+            "# CC Switch portable ARM64 build marker"
+            "portable=true"
+            "arch=arm64"
+            "upstream_tag=$env:UPSTREAM_TAG"
+          ) | Set-Content "$portableDir/portable.ini" -Encoding UTF8
+
+          $zipName = "CC-Switch-$env:UPSTREAM_TAG-Windows-arm64-Portable.zip"
+          Compress-Archive -Path "$portableDir/*" -DestinationPath "release-assets/$zipName" -Force
+          Remove-Item -Recurse -Force $portableDir
+
+          Get-ChildItem release-assets
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: cc-switch-${{ needs.resolve.outputs.upstream_tag }}-windows-arm64
+          path: cc-switch/release-assets/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.resolve.outputs.release_tag }}
+          name: CC Switch ${{ needs.resolve.outputs.upstream_tag }} Windows ARM64
+          prerelease: true
+          body: |
+            Unofficial Windows ARM64 build of CC Switch.
+
+            Upstream repository: farion1231/cc-switch
+            Upstream tag: ${{ needs.resolve.outputs.upstream_tag }}
+            Build target: aarch64-pc-windows-msvc
+            Runner: windows-11-arm
+
+            Notes:
+            - This is not an official CC Switch release.
+            - Updater artifacts are disabled for this personal build.
+            - Windows code signing is not configured, so SmartScreen may warn on first run.
+          files: cc-switch/release-assets/*
