@@ -173,6 +173,27 @@
       }
     }
   },
+  "combinedProvider": {
+    "name": "組合provider",
+    "editTitle": "編輯組合provider",
+    "description": "按請求模型將流量路由到目前應用中的普通 Provider。",
+    "detectingModels": "正在探測模型…",
+    "detectModelsFailed": "模型探測失敗，可手動填寫。",
+    "noOrdinaryProviders": "目前應用還沒有可用於組合的普通 Provider。",
+    "selectProvider": "選擇 Provider",
+    "manualModelPlaceholder": "選擇或手動輸入模型",
+    "saveSuccess": "組合 Provider 已儲存",
+    "mapping": {
+      "title": "模型映射",
+      "default": "預設模型",
+      "haiku": "Haiku",
+      "sonnet": "Sonnet",
+      "opus": "Opus"
+    },
+    "validation": {
+      "modelWithoutProvider": "請選擇 Provider 後再填寫模型。"
+    }
+  },
   "claudeCode": {
     "needsRouting": "需要路由",
     "noRoutingSupport": "不支援路由"
@@ -324,6 +345,8 @@
         "description": "控制路由服務開關、查看狀態與連接埠資訊",
         "enableFeature": "在主頁面顯示本地路由開關",
         "enableFeatureDescription": "開啟後，主頁面頂部將顯示路由和故障轉移開關",
+        "enableModelRouterProvider": "開啟組合 Provider",
+        "enableModelRouterProviderDescription": "開啟後，目前應用主頁會顯示「組合provider」卡片；請從該卡片的編輯入口設定模型映射。",
         "enableFailoverToggle": "在主頁面顯示故障轉移開關",
         "enableFailoverToggleDescription": "開啟後，主頁面頂部將獨立顯示故障轉移開關",
         "running": "執行中",

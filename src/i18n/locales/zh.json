@@ -173,6 +173,27 @@
       }
     }
   },
+  "combinedProvider": {
+    "name": "组合provider",
+    "editTitle": "编辑组合provider",
+    "description": "按请求模型把流量路由到当前应用中的普通 Provider。",
+    "detectingModels": "正在探测模型…",
+    "detectModelsFailed": "模型探测失败，可手动填写。",
+    "noOrdinaryProviders": "当前应用还没有可用于组合的普通 Provider。",
+    "selectProvider": "选择 Provider",
+    "manualModelPlaceholder": "选择或手动输入模型",
+    "saveSuccess": "组合 Provider 已保存",
+    "mapping": {
+      "title": "模型映射",
+      "default": "默认模型",
+      "haiku": "Haiku",
+      "sonnet": "Sonnet",
+      "opus": "Opus"
+    },
+    "validation": {
+      "modelWithoutProvider": "请选择 Provider 后再填写模型。"
+    }
+  },
   "claudeCode": {
     "needsRouting": "需要路由",
     "noRoutingSupport": "不支持路由"
@@ -324,6 +345,8 @@
         "description": "控制路由服务开关、查看状态与端口信息",
         "enableFeature": "在主页面显示本地路由开关",
         "enableFeatureDescription": "开启后，主页面顶部将显示路由和故障转移开关",
+        "enableModelRouterProvider": "开启组合 Provider",
+        "enableModelRouterProviderDescription": "开启后，当前应用主页会显示“组合provider”卡片；请从该卡片的编辑入口配置模型映射。",
         "enableFailoverToggle": "在主页面显示故障转移开关",
         "enableFailoverToggleDescription": "开启后，主页面顶部将独立显示故障转移开关",
         "running": "运行中",

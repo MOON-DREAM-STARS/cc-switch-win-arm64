@@ -118,6 +118,7 @@ export function useSettingsForm(): UseSettingsFormResult {
       skipClaudeOnboarding: data.skipClaudeOnboarding ?? false,
       preserveCodexOfficialAuthOnSwitch:
         data.preserveCodexOfficialAuthOnSwitch ?? false,
+      enableModelRouterProvider: data.enableModelRouterProvider ?? false,
       claudeConfigDir: sanitizeDir(data.claudeConfigDir),
       codexConfigDir: sanitizeDir(data.codexConfigDir),
       geminiConfigDir: sanitizeDir(data.geminiConfigDir),
@@ -143,6 +144,7 @@ export function useSettingsForm(): UseSettingsFormResult {
             enableClaudePluginIntegration: false,
             skipClaudeOnboarding: false,
             preserveCodexOfficialAuthOnSwitch: false,
+            enableModelRouterProvider: false,
             language: readPersistedLanguage(),
           } as SettingsFormState);
 
@@ -182,6 +184,7 @@ export function useSettingsForm(): UseSettingsFormResult {
         skipClaudeOnboarding: serverData.skipClaudeOnboarding ?? false,
         preserveCodexOfficialAuthOnSwitch:
           serverData.preserveCodexOfficialAuthOnSwitch ?? false,
+        enableModelRouterProvider: serverData.enableModelRouterProvider ?? false,
         claudeConfigDir: sanitizeDir(serverData.claudeConfigDir),
         codexConfigDir: sanitizeDir(serverData.codexConfigDir),
         geminiConfigDir: sanitizeDir(serverData.geminiConfigDir),

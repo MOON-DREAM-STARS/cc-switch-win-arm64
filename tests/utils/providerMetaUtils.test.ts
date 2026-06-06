@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { ProviderMeta } from "@/types";
-import { mergeProviderMeta } from "@/utils/providerMetaUtils";
+import {
+  ensureModelRouterMetaConfig,
+  mergeProviderMeta,
+  mergeProviderMetaWithExtra,
+  splitProviderMeta,
+  stripModelRouterMetaConfig,
+  stringifyProviderExtraMeta,
+} from "@/utils/providerMetaUtils";
 
 const buildEndpoint = (url: string) => ({
   url,
@@ -76,5 +83,100 @@ describe("mergeProviderMeta", () => {
     };
 
     expect(mergeProviderMeta(initial, null)).toBeUndefined();
+  });
+
+  it("keeps model_router in extra meta bucket", () => {
+    const initial: ProviderMeta = {
+      providerType: "model_router",
+      endpointAutoSelect: true,
+      modelRouter: {
+        version: 1,
+        routes: [
+          {
+            matchType: "role",
+            matchValue: "sonnet",
+            target: {
+              providerId: "primary",
+              upstreamModel: "gpt-5.4",
+            },
+          },
+        ],
+      },
+    };
+
+    const { managedMeta, extraMeta } = splitProviderMeta(initial);
+
+    expect(managedMeta).toEqual({
+      providerType: "model_router",
+      endpointAutoSelect: true,
+    });
+    expect(extraMeta).toEqual({
+      modelRouter: initial.modelRouter,
+    });
+    expect(JSON.parse(stringifyProviderExtraMeta(initial))).toEqual({
+      modelRouter: initial.modelRouter,
+    });
+  });
+
+  it("merges extra meta back without overriding managed fields", () => {
+    expect(
+      mergeProviderMetaWithExtra(
+        {
+          providerType: "model_router",
+          endpointAutoSelect: false,
+        },
+        {
+          modelRouter: {
+            version: 1,
+            routes: [],
+          },
+          providerType: "should-be-ignored",
+        },
+      ),
+    ).toEqual({
+      modelRouter: {
+        version: 1,
+        routes: [],
+      },
+      providerType: "model_router",
+      endpointAutoSelect: false,
+    });
+  });
+
+  it("injects modelRouter template into empty meta config", () => {
+    const parsed = JSON.parse(ensureModelRouterMetaConfig(""));
+
+    expect(parsed.modelRouter).toBeTruthy();
+    expect(parsed.modelRouter.routes?.[0]?.matchType).toBe("role");
+  });
+
+  it("preserves other extra meta when enabling modelRouter", () => {
+    const parsed = JSON.parse(
+      ensureModelRouterMetaConfig(
+        JSON.stringify({ foo: "bar" }),
+      ),
+    );
+
+    expect(parsed.foo).toBe("bar");
+    expect(parsed.modelRouter).toBeTruthy();
+  });
+
+  it("removes modelRouter meta when disabling router mode", () => {
+    expect(
+      stripModelRouterMetaConfig(
+        JSON.stringify({
+          modelRouter: { routes: [] },
+          foo: "bar",
+        }),
+      ),
+    ).toBe(JSON.stringify({ foo: "bar" }, null, 2));
+
+    expect(
+      stripModelRouterMetaConfig(
+        JSON.stringify({
+          modelRouter: { routes: [] },
+        }),
+      ),
+    ).toBe("");
   });
 });

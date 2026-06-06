@@ -119,6 +119,13 @@ describe("EditProviderDialog", () => {
         config: 'model_provider = "custom"\nmodel = "deepseek-v4-flash"\n',
         modelCatalog: dbModelCatalog,
       },
+      meta: {
+        providerType: "model_router",
+        modelRouter: {
+          version: 1,
+          routes: [],
+        },
+      },
     };
     const liveSettings = {
       auth: {
@@ -157,6 +164,7 @@ describe("EditProviderDialog", () => {
       ...liveSettings,
       modelCatalog: dbModelCatalog,
     });
+    expect(handleSubmit.mock.calls[0][0].provider.meta).toEqual(provider.meta);
   });
 
   it("代理接管中编辑 Codex 供应商时展示数据库配置而不是读取 live 代理配置", async () => {

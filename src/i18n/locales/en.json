@@ -173,6 +173,27 @@
       }
     }
   },
+  "combinedProvider": {
+    "name": "Combined Provider",
+    "editTitle": "Edit Combined Provider",
+    "description": "Route requests by model to ordinary providers in the current app.",
+    "detectingModels": "Detecting models…",
+    "detectModelsFailed": "Model detection failed; you can enter a model manually.",
+    "noOrdinaryProviders": "No ordinary providers are available in the current app.",
+    "selectProvider": "Select Provider",
+    "manualModelPlaceholder": "Select or enter a model",
+    "saveSuccess": "Combined Provider saved",
+    "mapping": {
+      "title": "Model Mapping",
+      "default": "Default Model",
+      "haiku": "Haiku",
+      "sonnet": "Sonnet",
+      "opus": "Opus"
+    },
+    "validation": {
+      "modelWithoutProvider": "Select a Provider before entering a model."
+    }
+  },
   "claudeCode": {
     "needsRouting": "Needs Routing",
     "noRoutingSupport": "No Routing Support"
@@ -324,6 +345,8 @@
         "description": "Control routing service toggle, view status and port info",
         "enableFeature": "Show Routing Toggle on Main Page",
         "enableFeatureDescription": "When enabled, the routing and failover toggles will appear at the top of the main page",
+        "enableModelRouterProvider": "Enable Combined Provider",
+        "enableModelRouterProviderDescription": "When enabled, the current app home page shows a Combined Provider card; configure model mappings from that card’s edit action.",
         "enableFailoverToggle": "Show Failover Toggle on Main Page",
         "enableFailoverToggleDescription": "When enabled, the failover toggle will appear independently at the top of the main page",
         "running": "Running",
