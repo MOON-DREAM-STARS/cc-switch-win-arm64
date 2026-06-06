@@ -52,6 +52,28 @@ export const providerSchema = z.object({
         });
       }
     }),
+  metaConfig: z
+    .string()
+    .optional()
+    .superRefine((value, ctx) => {
+      const text = value?.trim();
+      if (!text) return;
+
+      try {
+        const parsed = JSON.parse(text);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "Meta JSON 必须是对象",
+          });
+        }
+      } catch (error) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: parseJsonError(error),
+        });
+      }
+    }),
   // 图标配置
   icon: z.string().optional(),
   iconColor: z.string().optional(),

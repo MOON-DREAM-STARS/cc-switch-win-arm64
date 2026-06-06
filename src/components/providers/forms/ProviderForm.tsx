@@ -53,7 +53,12 @@ import {
   applyTemplateValues,
   hasApiKeyField,
 } from "@/utils/providerConfigUtils";
-import { mergeProviderMeta } from "@/utils/providerMetaUtils";
+import {
+  mergeProviderMeta,
+  mergeProviderMetaWithExtra,
+  splitProviderMeta,
+  stringifyProviderExtraMeta,
+} from "@/utils/providerMetaUtils";
 import {
   extractCodexWireApi,
   setCodexWireApi,
@@ -332,6 +337,8 @@ function ProviderFormFull({
   const isOmoCategory = appId === "opencode" && category === "omo";
   const isOmoSlimCategory = appId === "opencode" && category === "omo-slim";
   const isAnyOmoCategory = isOmoCategory || isOmoSlimCategory;
+  const isModelRouterProvider = initialData?.meta?.providerType === "model_router";
+  const initialProviderType = initialData?.meta?.providerType;
 
   useEffect(() => {
     setSelectedPresetId(initialData ? null : "custom");
@@ -375,6 +382,7 @@ function ProviderFormFull({
                 : appId === "hermes"
                   ? HERMES_DEFAULT_CONFIG
                   : CLAUDE_DEFAULT_CONFIG,
+                metaConfig: stringifyProviderExtraMeta(initialData?.meta),
       icon: initialData?.icon ?? "",
       iconColor: initialData?.iconColor ?? "",
     }),
@@ -647,6 +655,11 @@ function ProviderFormFull({
     settingsConfig: form.getValues("settingsConfig"),
     onConfigChange: handleSettingsConfigChange,
   });
+
+  const effectiveProviderType = isModelRouterProvider
+    ? "model_router"
+    : templatePreset?.providerType ||
+      (initialProviderType === "model_router" ? undefined : initialProviderType);
 
   const {
     useCommonConfig,
@@ -1052,12 +1065,10 @@ function ProviderFormFull({
 
     // OAuth 未登录：B 类（token 根本不存在，保存了也没法建立）
     const isCopilotProvider =
-      templatePreset?.providerType === "github_copilot" ||
-      initialData?.meta?.providerType === "github_copilot" ||
+      effectiveProviderType === "github_copilot" ||
       baseUrl.includes("githubcopilot.com");
     const isCodexOauthProvider =
-      templatePreset?.providerType === "codex_oauth" ||
-      initialData?.meta?.providerType === "codex_oauth";
+      effectiveProviderType === "codex_oauth";
     if (isCopilotProvider && !isCopilotAuthenticated) {
       toast.error(
         t("copilot.loginRequired", {
@@ -1108,7 +1119,11 @@ function ProviderFormFull({
 
     // 非官方供应商端点 / API Key 空：A 类
     // cloud_provider（如 Bedrock）通过模板变量处理认证，跳过通用校验
-    if (category !== "official" && category !== "cloud_provider") {
+    if (
+      !isModelRouterProvider &&
+      category !== "official" &&
+      category !== "cloud_provider"
+    ) {
       if (appId === "claude") {
         if (!isCodexOauthProvider && !baseUrl.trim()) {
           issues.push(
@@ -1170,12 +1185,10 @@ function ProviderFormFull({
   const performSubmit = async (values: ProviderFormData) => {
     // OAuth / 其它身份识别（与 handleSubmit 保持一致）
     const isCopilotProvider =
-      templatePreset?.providerType === "github_copilot" ||
-      initialData?.meta?.providerType === "github_copilot" ||
+      effectiveProviderType === "github_copilot" ||
       baseUrl.includes("githubcopilot.com");
     const isCodexOauthProvider =
-      templatePreset?.providerType === "codex_oauth" ||
-      initialData?.meta?.providerType === "codex_oauth";
+      effectiveProviderType === "codex_oauth";
 
     let settingsConfig: string;
 
@@ -1259,6 +1272,18 @@ function ProviderFormFull({
       settingsConfig,
     };
 
+    let extraMeta: Record<string, unknown> | undefined;
+    if (values.metaConfig?.trim()) {
+      try {
+        const parsed = JSON.parse(values.metaConfig.trim()) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          extraMeta = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // 语法已由表单 schema 校验，这里保持容错回退。
+      }
+    }
+
     if (appId === "opencode") {
       if (isAnyOmoCategory) {
         if (!isEditMode) {
@@ -1340,12 +1365,17 @@ function ProviderFormFull({
       }
     }
 
-    const baseMeta: ProviderMeta | undefined =
-      payload.meta ?? (initialData?.meta ? { ...initialData.meta } : undefined);
+    const { managedMeta: initialManagedMeta } = splitProviderMeta(
+      initialData?.meta,
+    );
+    const { managedMeta: payloadManagedMeta } = splitProviderMeta(payload.meta);
+    const baseMeta = mergeProviderMetaWithExtra(
+      payloadManagedMeta ?? initialManagedMeta,
+      extraMeta,
+    );
 
     // 确定 providerType（新建时从预设获取，编辑时从现有数据获取）
-    const providerType =
-      templatePreset?.providerType || initialData?.meta?.providerType;
+    const providerType = effectiveProviderType;
 
     const nextMeta: ProviderMeta = {
       ...(baseMeta ?? {}),
@@ -1395,7 +1425,7 @@ function ProviderFormFull({
           ? pricingConfig.pricingModelSource
           : undefined,
       apiFormat:
-        appId === "claude" && category !== "official"
+        appId === "claude" && category !== "official" && !isModelRouterProvider
           ? localApiFormat
           : appId === "codex" && category !== "official"
             ? localCodexApiFormat
@@ -1403,11 +1433,15 @@ function ProviderFormFull({
       apiKeyField:
         appId === "claude" &&
         category !== "official" &&
+        !isModelRouterProvider &&
         localApiKeyField !== "ANTHROPIC_AUTH_TOKEN"
           ? localApiKeyField
           : undefined,
       isFullUrl:
-        supportsFullUrl && category !== "official" && localIsFullUrl
+        supportsFullUrl &&
+        category !== "official" &&
+        !isModelRouterProvider &&
+        localIsFullUrl
           ? true
           : undefined,
     };
@@ -1938,7 +1972,7 @@ function ProviderFormFull({
             }
           />
 
-          {appId === "claude" && (
+          {appId === "claude" && !isModelRouterProvider && (
             <ClaudeFormFields
               providerId={providerId}
               shouldShowApiKey={
@@ -1954,21 +1988,15 @@ function ProviderFormFull({
               isPartner={isClaudePartner}
               partnerPromotionKey={claudePartnerPromotionKey}
               isCopilotPreset={
-                templatePreset?.providerType === "github_copilot" ||
-                initialData?.meta?.providerType === "github_copilot" ||
+                effectiveProviderType === "github_copilot" ||
                 baseUrl.includes("githubcopilot.com")
               }
-              isCodexOauthPreset={
-                templatePreset?.providerType === "codex_oauth" ||
-                initialData?.meta?.providerType === "codex_oauth"
-              }
+              isCodexOauthPreset={effectiveProviderType === "codex_oauth"}
               usesOAuth={
                 templatePreset?.requiresOAuth === true ||
-                templatePreset?.providerType === "github_copilot" ||
-                initialData?.meta?.providerType === "github_copilot" ||
+                effectiveProviderType === "github_copilot" ||
                 baseUrl.includes("githubcopilot.com") ||
-                templatePreset?.providerType === "codex_oauth" ||
-                initialData?.meta?.providerType === "codex_oauth"
+                effectiveProviderType === "codex_oauth"
               }
               isCopilotAuthenticated={isCopilotAuthenticated}
               selectedGitHubAccountId={selectedGitHubAccountId}
@@ -2283,6 +2311,34 @@ function ProviderFormFull({
                 )}
               />
             </>
+          ) : isModelRouterProvider ? (
+            <div className="space-y-3 rounded-lg border border-dashed border-border-default bg-muted/20 p-4">
+              <p className="text-sm font-medium">
+                {t("providerForm.modelRouterConfigTitle", {
+                  defaultValue: "组合 Provider 运行方式",
+                })}
+              </p>
+              <ul className="list-disc space-y-1 pl-5 text-xs text-muted-foreground">
+                <li>
+                  {t("providerForm.modelRouterConfigHint1", {
+                    defaultValue:
+                      "该 Provider 本身不需要填写 API Key 或 Base URL。",
+                  })}
+                </li>
+                <li>
+                  {t("providerForm.modelRouterConfigHint2", {
+                    defaultValue:
+                      "请在下方 Meta JSON 中配置 modelRouter.routes，并引用已存在的真实 providerId。",
+                  })}
+                </li>
+                <li>
+                  {t("providerForm.modelRouterConfigHint3", {
+                    defaultValue:
+                      "启用本地路由后，请求会按 exact / role / default 顺序分发。",
+                  })}
+                </li>
+              </ul>
+            </div>
           ) : (
             <>
               <CommonConfigEditor
@@ -2302,6 +2358,57 @@ function ProviderFormFull({
               {settingsConfigErrorField}
             </>
           )}
+
+          <div className="space-y-2">
+            <Label htmlFor="metaConfig">
+              {t("providerForm.metaJsonLabel", {
+                defaultValue: "额外 Meta JSON（可选）",
+              })}
+            </Label>
+            <JsonEditor
+              id="metaConfig"
+              value={form.watch("metaConfig") ?? ""}
+              onChange={(value) => form.setValue("metaConfig", value)}
+              placeholder={`{
+  "modelRouter": {
+    "routes": [
+      {
+        "matchType": "role",
+        "matchValue": "sonnet",
+        "target": {
+          "providerId": "openrouter-main",
+          "upstreamModel": "openai/gpt-5.4"
+        },
+        "fallbacks": [
+          {
+            "providerId": "backup-provider",
+            "upstreamModel": "gpt-5.4-mini"
+          }
+        ]
+      }
+    ]
+  }
+}`}
+              rows={10}
+              showValidation={true}
+              language="json"
+            />
+            <p className="text-xs text-muted-foreground">
+              {t("providerForm.metaJsonHint", {
+                defaultValue:
+                  "用于承载未内建到表单的额外 meta 字段，例如组合 Provider / model_router。表单管理的字段会优先覆盖同名项。",
+              })}
+            </p>
+            <FormField
+              control={form.control}
+              name="metaConfig"
+              render={() => (
+                <FormItem className="space-y-0">
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </div>
 
           {!isAnyOmoCategory &&
             appId !== "opencode" &&

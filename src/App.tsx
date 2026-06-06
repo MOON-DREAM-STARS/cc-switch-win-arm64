@@ -43,6 +43,7 @@ import { openclawKeys, useOpenClawHealth } from "@/hooks/useOpenClaw";
 import { hermesKeys, useOpenHermesWebUI } from "@/hooks/useHermes";
 import { hermesApi } from "@/lib/api/hermes";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
+import { useManagedCombinedProvider } from "@/hooks/useManagedCombinedProvider";
 import { useAutoCompact } from "@/hooks/useAutoCompact";
 import { useUsageCacheBridge } from "@/hooks/useUsageCacheBridge";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
@@ -50,6 +51,7 @@ import { useLastValidValue } from "@/hooks/useLastValidValue";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { isTextEditableTarget } from "@/utils/domUtils";
 import { deepClone } from "@/utils/deepClone";
+import { isModelRouterProvider } from "@/utils/combinedProviderUtils";
 import { cn } from "@/lib/utils";
 import {
   isWindows,
@@ -61,6 +63,7 @@ import { AppSwitcher } from "@/components/AppSwitcher";
 import { ProviderList } from "@/components/providers/ProviderList";
 import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
 import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
+import { CompositeProviderEditor } from "@/components/providers/CompositeProviderEditor";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { SettingsPage } from "@/components/settings/SettingsPage";
 import { UpdateBadge } from "@/components/UpdateBadge";
@@ -225,6 +228,8 @@ function App() {
   }, [sharedFeatureApp, currentView]);
 
   const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
+  const [editingCompositeProvider, setEditingCompositeProvider] =
+    useState<Provider | null>(null);
   const [usageProvider, setUsageProvider] = useState<Provider | null>(null);
   const [confirmAction, setConfirmAction] = useState<{
     provider: Provider;
@@ -234,6 +239,9 @@ function App() {
   const [showEnvBanner, setShowEnvBanner] = useState(false);
 
   const effectiveEditingProvider = useLastValidValue(editingProvider);
+  const effectiveEditingCompositeProvider = useLastValidValue(
+    editingCompositeProvider,
+  );
   const effectiveUsageProvider = useLastValidValue(usageProvider);
 
   const toolbarRef = useRef<HTMLDivElement>(null);
@@ -265,6 +273,12 @@ function App() {
     isProxyRunning,
   });
   const providers = useMemo(() => data?.providers ?? {}, [data]);
+  const { visibleProviders } = useManagedCombinedProvider({
+    appId: activeApp,
+    providers,
+    enabled: settingsData?.enableModelRouterProvider ?? false,
+    isLoading,
+  });
   const currentProviderId = data?.currentProviderId ?? "";
   const isOpenClawView =
     activeApp === "openclaw" &&
@@ -608,6 +622,17 @@ function App() {
     setEditingProvider(null);
   };
 
+  const handleEditCompositeProvider = async ({
+    provider,
+    originalId,
+  }: {
+    provider: Provider;
+    originalId?: string;
+  }) => {
+    await updateProvider(provider, originalId);
+    setEditingCompositeProvider(null);
+  };
+
   const handleConfirmAction = async () => {
     if (!confirmAction) return;
     const { provider, action } = confirmAction;
@@ -930,7 +955,7 @@ function App() {
                     className="space-y-4"
                   >
                     <ProviderList
-                      providers={providers}
+                      providers={visibleProviders}
                       currentProviderId={currentProviderId}
                       appId={activeApp}
                       isLoading={isLoading}
@@ -941,6 +966,10 @@ function App() {
                       activeProviderId={activeProviderId}
                       onSwitch={switchProvider}
                       onEdit={(provider) => {
+                        if (isModelRouterProvider(provider)) {
+                          setEditingCompositeProvider(provider);
+                          return;
+                        }
                         setEditingProvider(provider);
                       }}
                       onDelete={(provider) =>
@@ -1534,6 +1563,19 @@ function App() {
         onSubmit={handleEditProvider}
         appId={activeApp}
         isProxyTakeover={isCurrentAppTakeoverActive}
+      />
+
+      <CompositeProviderEditor
+        open={Boolean(editingCompositeProvider)}
+        provider={effectiveEditingCompositeProvider}
+        providers={providers}
+        appId={activeApp}
+        onOpenChange={(open) => {
+          if (!open) {
+            setEditingCompositeProvider(null);
+          }
+        }}
+        onSubmit={handleEditCompositeProvider}
       />
 
       {effectiveUsageProvider && (

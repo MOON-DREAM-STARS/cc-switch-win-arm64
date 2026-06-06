@@ -125,6 +125,12 @@ export function ProxyTabContent({
               onEnableLocalProxyChange={(checked) =>
                 onAutoSave({ enableLocalProxy: checked })
               }
+              enableModelRouterProvider={
+                settings?.enableModelRouterProvider ?? false
+              }
+              onEnableModelRouterProviderChange={(checked) =>
+                onAutoSave({ enableModelRouterProvider: checked })
+              }
               onToggleProxy={handleToggleProxy}
               isProxyPending={isProxyPending}
             />

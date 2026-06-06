@@ -26,6 +26,8 @@ vi.mock("@/hooks/useProxyStatus", () => ({
     isLoading: false,
     isRunning: false,
     isTakeoverActive: false,
+    takeoverStatus: null,
+    startProxyServer: vi.fn(),
     startWithTakeover: vi.fn(),
     stopWithRestore: vi.fn(),
     switchProxyProvider: vi.fn(),
@@ -35,6 +37,30 @@ vi.mock("@/hooks/useProxyStatus", () => ({
     isStopping: false,
     isPending: false,
   }),
+}));
+
+vi.mock("@/lib/query/proxy", () => ({
+  useProxyTakeoverStatus: () => ({ data: null }),
+  useSetProxyTakeoverForApp: () => ({
+    mutateAsync: vi.fn(),
+    isPending: false,
+  }),
+  useGlobalProxyConfig: () => ({
+    data: {
+      listenAddress: "127.0.0.1",
+      listenPort: 15721,
+      enableLogging: true,
+    },
+  }),
+  useUpdateGlobalProxyConfig: () => ({
+    mutateAsync: vi.fn(),
+    isPending: false,
+  }),
+}));
+
+vi.mock("@/lib/query/failover", () => ({
+  useFailoverQueue: () => ({ data: [] }),
+  useProviderHealth: () => ({ data: null }),
 }));
 
 interface SettingsMock {
@@ -357,6 +383,35 @@ describe("SettingsPage Component", () => {
     // 清除选择按钮
     fireEvent.click(screen.getByRole("button", { name: "common.clear" }));
     expect(importExportMock.clearSelection).toHaveBeenCalled();
+  });
+
+  it("should autosave combined provider toggle from local routing settings", async () => {
+    settingsMock = createSettingsMock({
+      settings: {
+        ...createSettingsMock().settings,
+        enableLocalProxy: true,
+        enableModelRouterProvider: false,
+      },
+    });
+
+    renderSettingsPage();
+
+    fireEvent.click(screen.getByText("settings.tabProxy"));
+    fireEvent.click(screen.getByText("settings.advanced.proxy.title"));
+    fireEvent.click(
+      screen.getByRole("switch", {
+        name: "settings.advanced.proxy.enableModelRouterProvider",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(settingsMock.updateSettings).toHaveBeenCalledWith({
+        enableModelRouterProvider: true,
+      });
+      expect(settingsMock.autoSaveSettings).toHaveBeenCalledWith({
+        enableModelRouterProvider: true,
+      });
+    });
   });
 
   it("should pass onImportSuccess callback to useImportExport hook", async () => {

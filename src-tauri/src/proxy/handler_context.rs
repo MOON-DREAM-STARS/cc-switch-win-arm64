@@ -65,6 +65,10 @@ pub struct RequestContext {
     pub optimizer_config: OptimizerConfig,
     /// Copilot 优化器配置
     pub copilot_optimizer_config: CopilotOptimizerConfig,
+    /// 当前请求已解析出的 provider 链长度（含 model_router 展开后结果）
+    pub provider_chain_len: usize,
+    /// 是否保留当前设置中的 provider，不把实际命中的 target 同步回 UI/托盘
+    pub preserve_current_provider: bool,
 }
 
 impl RequestContext {
@@ -97,6 +101,13 @@ impl RequestContext {
             .await
             .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
 
+        // 从请求体提取模型名称
+        let request_model = body
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
         // 从数据库读取整流器配置
         let rectifier_config = state.db.get_rectifier_config().unwrap_or_default();
         let optimizer_config = state.db.get_optimizer_config().unwrap_or_default();
@@ -104,13 +115,15 @@ impl RequestContext {
 
         let current_provider_id =
             crate::settings::get_current_provider(&app_type).unwrap_or_default();
-
-        // 从请求体提取模型名称
-        let request_model = body
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown")
-            .to_string();
+        let preserve_current_provider = if current_provider_id.is_empty() {
+            false
+        } else {
+            state
+                .db
+                .get_provider_by_id(&current_provider_id, app_type_str)
+                .map(|provider| provider.is_some_and(|p| p.is_model_router()))
+                .unwrap_or(false)
+        };
 
         // 提取 Session ID
         let session_result = extract_session_id(headers, body, app_type_str);
@@ -128,13 +141,16 @@ impl RequestContext {
         // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
         let providers = state
             .provider_router
-            .select_providers(app_type_str)
+            .select_providers_for_model(app_type_str, Some(&request_model))
             .await
             .map_err(|e| match e {
                 crate::error::AppError::AllProvidersCircuitOpen => {
                     ProxyError::AllProvidersCircuitOpen
                 }
                 crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
+                crate::error::AppError::InvalidInput(_) => {
+                    ProxyError::InvalidRequest(e.to_string())
+                }
                 _ => ProxyError::DatabaseError(e.to_string()),
             })?;
 
@@ -152,6 +168,8 @@ impl RequestContext {
             session_id
         );
 
+        let provider_chain_len = providers.len();
+
         Ok(Self {
             start_time,
             app_config,
@@ -167,6 +185,8 @@ impl RequestContext {
             rectifier_config,
             optimizer_config,
             copilot_optimizer_config,
+            provider_chain_len,
+            preserve_current_provider,
         })
     }
 
@@ -185,6 +205,35 @@ impl RequestContext {
         self
     }
 
+    /// 以新的模型名刷新 provider 链；用于 Gemini 这类模型名不在 JSON body 中的请求。
+    pub async fn refresh_providers_for_model(
+        &mut self,
+        state: &ProxyState,
+    ) -> Result<(), ProxyError> {
+        let providers = state
+            .provider_router
+            .select_providers_for_model(self.app_type_str, Some(&self.request_model))
+            .await
+            .map_err(|e| match e {
+                crate::error::AppError::AllProvidersCircuitOpen => {
+                    ProxyError::AllProvidersCircuitOpen
+                }
+                crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
+                crate::error::AppError::InvalidInput(_) => {
+                    ProxyError::InvalidRequest(e.to_string())
+                }
+                _ => ProxyError::DatabaseError(e.to_string()),
+            })?;
+
+        self.provider = providers
+            .first()
+            .cloned()
+            .ok_or(ProxyError::NoAvailableProvider)?;
+        self.providers = providers;
+        self.provider_chain_len = self.providers.len();
+        Ok(())
+    }
+
     /// 创建 RequestForwarder
     ///
     /// 使用共享的 ProviderRouter，确保熔断器状态跨请求保持
@@ -193,26 +242,29 @@ impl RequestContext {
     /// - 故障转移开启：超时配置正常生效（0 表示禁用超时）
     /// - 故障转移关闭：超时配置不生效（全部传入 0）
     pub fn create_forwarder(&self, state: &ProxyState) -> RequestForwarder {
-        let (non_streaming_timeout, first_byte_timeout, idle_timeout) =
-            if self.app_config.auto_failover_enabled {
-                // 故障转移开启：使用配置的值（0 = 禁用超时）
-                (
-                    self.app_config.non_streaming_timeout as u64,
-                    self.app_config.streaming_first_byte_timeout as u64,
-                    self.app_config.streaming_idle_timeout as u64,
-                )
-            } else {
-                // 故障转移关闭：不启用超时配置
-                log::debug!(
-                    "[{}] Failover disabled, timeout configs are bypassed",
-                    self.tag
-                );
-                (0, 0, 0)
-            };
+        let fallback_active = self.app_config.auto_failover_enabled || self.provider_chain_len > 1;
+
+        let (non_streaming_timeout, first_byte_timeout, idle_timeout) = if fallback_active {
+            // 故障转移开启：使用配置的值（0 = 禁用超时）
+            (
+                self.app_config.non_streaming_timeout as u64,
+                self.app_config.streaming_first_byte_timeout as u64,
+                self.app_config.streaming_idle_timeout as u64,
+            )
+        } else {
+            // 故障转移关闭：不启用超时配置
+            log::debug!(
+                "[{}] Failover disabled, timeout configs are bypassed",
+                self.tag
+            );
+            (0, 0, 0)
+        };
 
         // 故障转移关闭时强制 max_retries=0（仅尝试 1 个 provider），与「不超时 + 不切换」语义一致。
         let max_retries = if self.app_config.auto_failover_enabled {
             self.app_config.max_retries
+        } else if self.provider_chain_len > 1 {
+            self.provider_chain_len.saturating_sub(1) as u32
         } else {
             0
         };
@@ -235,6 +287,8 @@ impl RequestContext {
             self.optimizer_config.clone(),
             self.copilot_optimizer_config.clone(),
             max_retries,
+            self.provider_chain_len,
+            self.preserve_current_provider,
         )
     }
 
@@ -258,7 +312,7 @@ impl RequestContext {
     /// - 故障转移关闭：返回 0（禁用超时检查）
     #[inline]
     pub fn streaming_timeout_config(&self) -> StreamingTimeoutConfig {
-        if self.app_config.auto_failover_enabled {
+        if self.app_config.auto_failover_enabled || self.provider_chain_len > 1 {
             // 故障转移开启：使用配置的值（0 = 禁用超时）
             StreamingTimeoutConfig {
                 first_byte_timeout: self.app_config.streaming_first_byte_timeout as u64,

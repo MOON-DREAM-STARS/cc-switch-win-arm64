@@ -35,9 +35,64 @@ impl ProviderRouter {
     /// - 故障转移关闭时：仅返回当前供应商
     /// - 故障转移开启时：仅使用故障转移队列，按队列顺序依次尝试（P1 → P2 → ...）
     pub async fn select_providers(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
+        let current_id = AppType::from_str(app_type)
+            .ok()
+            .and_then(|app_enum| {
+                crate::settings::get_effective_current_provider(&self.db, &app_enum)
+                    .ok()
+                    .flatten()
+            })
+            .or_else(|| self.db.get_current_provider(app_type).ok().flatten());
+
+        if let Some(current_id) = current_id {
+            if let Some(current) = self.db.get_provider_by_id(&current_id, app_type)? {
+                if current.is_model_router() {
+                    return Ok(vec![current]);
+                }
+            }
+        }
+
+        self.select_providers_for_model(app_type, None).await
+    }
+
+    /// 选择可用的供应商；若当前 provider 为 model_router，则可按请求模型展开目标链。
+    pub async fn select_providers_for_model(
+        &self,
+        app_type: &str,
+        request_model: Option<&str>,
+    ) -> Result<Vec<Provider>, AppError> {
         let mut result = Vec::new();
         let mut total_providers = 0usize;
         let mut circuit_open_count = 0usize;
+
+        let current_id = AppType::from_str(app_type)
+            .ok()
+            .and_then(|app_enum| {
+                crate::settings::get_effective_current_provider(&self.db, &app_enum)
+                    .ok()
+                    .flatten()
+            })
+            .or_else(|| self.db.get_current_provider(app_type).ok().flatten());
+
+        if let Some(current_id) = current_id.as_deref() {
+            if let Some(current) = self.db.get_provider_by_id(current_id, app_type)? {
+                if current.is_model_router() {
+                    let model = request_model.ok_or_else(|| {
+                        AppError::InvalidInput(format!(
+                            "model_router provider '{}' requires request model",
+                            current.id
+                        ))
+                    })?;
+                    result = crate::proxy::model_router::resolve_provider_chain(
+                        self.db.as_ref(),
+                        app_type,
+                        &current,
+                        model,
+                    )?;
+                    return Ok(result);
+                }
+            }
+        }
 
         // 检查该应用的自动故障转移开关是否开启（从 proxy_config 表读取）
         let auto_failover_enabled = match self.db.get_proxy_config_for_app(app_type).await {
@@ -78,15 +133,6 @@ impl ProviderRouter {
             }
         } else {
             // 故障转移关闭：仅使用当前供应商，跳过熔断器检查
-            let current_id = AppType::from_str(app_type)
-                .ok()
-                .and_then(|app_enum| {
-                    crate::settings::get_effective_current_provider(&self.db, &app_enum)
-                        .ok()
-                        .flatten()
-                })
-                .or_else(|| self.db.get_current_provider(app_type).ok().flatten());
-
             if let Some(current_id) = current_id {
                 if let Some(current) = self.db.get_provider_by_id(&current_id, app_type)? {
                     total_providers = 1;
@@ -358,6 +404,135 @@ mod tests {
 
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id, "a");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_model_router_uses_request_model_when_failover_disabled() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let target_a = Provider::with_id("a".to_string(), "A".to_string(), json!({}), None);
+        let target_b = Provider::with_id("b".to_string(), "B".to_string(), json!({}), None);
+        let mut router =
+            Provider::with_id("router".to_string(), "Router".to_string(), json!({}), None);
+        router.meta = Some(crate::provider::ProviderMeta {
+            provider_type: Some("model_router".to_string()),
+            model_router: Some(crate::provider::ModelRouterConfig {
+                routes: vec![crate::provider::ModelRouterRule {
+                    match_type: crate::provider::ModelRouterMatchType::Role,
+                    match_value: Some("sonnet".to_string()),
+                    target: Some(crate::provider::ModelRouterProviderRef {
+                        provider_id: "a".to_string(),
+                        upstream_model: Some("gpt-5.4".to_string()),
+                        label: None,
+                    }),
+                    provider_chain: Vec::new(),
+                    fallbacks: vec![crate::provider::ModelRouterProviderRef {
+                        provider_id: "b".to_string(),
+                        upstream_model: Some("gpt-5.4-mini".to_string()),
+                        label: None,
+                    }],
+                }],
+            }),
+            ..Default::default()
+        });
+
+        db.save_provider("claude", &target_a).unwrap();
+        db.save_provider("claude", &target_b).unwrap();
+        db.save_provider("claude", &router).unwrap();
+        db.set_current_provider("claude", "router").unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        let providers = router
+            .select_providers_for_model("claude", Some("claude-sonnet-4-6"))
+            .await
+            .unwrap();
+
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].id, "a");
+        assert_eq!(
+            providers[0]
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.runtime_upstream_model.as_deref()),
+            Some("gpt-5.4")
+        );
+        assert_eq!(providers[1].id, "b");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_model_router_requires_request_model() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let mut router_provider =
+            Provider::with_id("router".to_string(), "Router".to_string(), json!({}), None);
+        router_provider.meta = Some(crate::provider::ProviderMeta {
+            provider_type: Some("model_router".to_string()),
+            model_router: Some(crate::provider::ModelRouterConfig::default()),
+            ..Default::default()
+        });
+
+        db.save_provider("claude", &router_provider).unwrap();
+        db.set_current_provider("claude", "router").unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        let err = router
+            .select_providers_for_model("claude", None)
+            .await
+            .expect_err("missing model should error");
+
+        assert!(matches!(err, AppError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_model_router_takes_precedence_over_failover_queue() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let target = Provider::with_id("target".to_string(), "Target".to_string(), json!({}), None);
+        let queued = Provider::with_id("queued".to_string(), "Queued".to_string(), json!({}), None);
+        let mut router_provider =
+            Provider::with_id("router".to_string(), "Router".to_string(), json!({}), None);
+        router_provider.meta = Some(crate::provider::ProviderMeta {
+            provider_type: Some("model_router".to_string()),
+            model_router: Some(crate::provider::ModelRouterConfig {
+                routes: vec![crate::provider::ModelRouterRule {
+                    match_type: crate::provider::ModelRouterMatchType::Default,
+                    match_value: None,
+                    target: Some(crate::provider::ModelRouterProviderRef {
+                        provider_id: "target".to_string(),
+                        upstream_model: Some("gpt-5.4".to_string()),
+                        label: None,
+                    }),
+                    provider_chain: Vec::new(),
+                    fallbacks: Vec::new(),
+                }],
+            }),
+            ..Default::default()
+        });
+
+        db.save_provider("claude", &target).unwrap();
+        db.save_provider("claude", &queued).unwrap();
+        db.save_provider("claude", &router_provider).unwrap();
+        db.set_current_provider("claude", "router").unwrap();
+        db.add_to_failover_queue("claude", "queued").unwrap();
+
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        let providers = router
+            .select_providers_for_model("claude", Some("anything"))
+            .await
+            .unwrap();
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id, "target");
     }
 
     #[tokio::test]

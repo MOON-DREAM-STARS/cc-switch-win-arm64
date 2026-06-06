@@ -173,6 +173,27 @@
       }
     }
   },
+  "combinedProvider": {
+    "name": "組み合わせ Provider",
+    "editTitle": "組み合わせ Provider を編集",
+    "description": "リクエストモデルに応じて、現在のアプリの通常 Provider にルーティングします。",
+    "detectingModels": "モデルを検出中…",
+    "detectModelsFailed": "モデル検出に失敗しました。手動入力できます。",
+    "noOrdinaryProviders": "現在のアプリに組み合わせ可能な通常 Provider がありません。",
+    "selectProvider": "Provider を選択",
+    "manualModelPlaceholder": "モデルを選択または入力",
+    "saveSuccess": "組み合わせ Provider を保存しました",
+    "mapping": {
+      "title": "モデルマッピング",
+      "default": "デフォルトモデル",
+      "haiku": "Haiku",
+      "sonnet": "Sonnet",
+      "opus": "Opus"
+    },
+    "validation": {
+      "modelWithoutProvider": "モデルを入力する前に Provider を選択してください。"
+    }
+  },
   "claudeCode": {
     "needsRouting": "ルーティングが必要",
     "noRoutingSupport": "ルーティング非対応"
@@ -324,6 +345,8 @@
         "description": "ルーティングサービスの切り替え、ステータスとポート情報を表示",
         "enableFeature": "メインページにルーティング切り替えを表示",
         "enableFeatureDescription": "有効にすると、メインページ上部にルーティングとフェイルオーバーの切り替えが表示されます",
+        "enableModelRouterProvider": "組み合わせ Provider を有効化",
+        "enableModelRouterProviderDescription": "有効にすると、現在のアプリのホームに組み合わせ Provider カードが表示されます。モデルマッピングはそのカードの編集から設定します。",
         "enableFailoverToggle": "メインページにフェイルオーバー切り替えを表示",
         "enableFailoverToggleDescription": "有効にすると、メインページ上部にフェイルオーバー切り替えが独立して表示されます",
         "running": "実行中",

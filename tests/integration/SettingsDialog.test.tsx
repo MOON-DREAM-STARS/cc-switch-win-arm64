@@ -4,6 +4,7 @@ import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { http, HttpResponse } from "msw";
 import { SettingsPage } from "@/components/settings/SettingsPage";
+import i18n from "@/i18n";
 import {
   resetProviderState,
   getSettings,
@@ -133,7 +134,12 @@ const renderDialog = (
   );
 };
 
-beforeEach(() => {
+const waitForDefaultLanguage = () =>
+  screen.findByText("language:zh", {}, { timeout: 5000 });
+
+beforeEach(async () => {
+  window.localStorage.clear();
+  await i18n.changeLanguage("zh");
   resetProviderState();
   toastSuccessMock.mockReset();
   toastErrorMock.mockReset();
@@ -147,9 +153,7 @@ describe("SettingsPage integration", () => {
   it("loads default settings from MSW", async () => {
     renderDialog();
 
-    await waitFor(() =>
-      expect(screen.getByText("language:zh")).toBeInTheDocument(),
-    );
+    await waitForDefaultLanguage();
     fireEvent.click(screen.getByText("settings.tabAdvanced"));
     fireEvent.click(screen.getByText("settings.advanced.configDir.title"));
     const appInput = await screen.findByPlaceholderText(
@@ -162,9 +166,7 @@ describe("SettingsPage integration", () => {
     const onImportSuccess = vi.fn();
     renderDialog({ onImportSuccess });
 
-    await waitFor(() =>
-      expect(screen.getByText("language:zh")).toBeInTheDocument(),
-    );
+    await waitForDefaultLanguage();
 
     fireEvent.click(screen.getByText("settings.tabAdvanced"));
     fireEvent.click(screen.getByText("settings.advanced.data.title"));
@@ -186,9 +188,7 @@ describe("SettingsPage integration", () => {
   it("saves settings and handles restart prompt", async () => {
     renderDialog();
 
-    await waitFor(() =>
-      expect(screen.getByText("language:zh")).toBeInTheDocument(),
-    );
+    await waitForDefaultLanguage();
 
     fireEvent.click(screen.getByText("settings.tabAdvanced"));
     fireEvent.click(screen.getByText("settings.advanced.configDir.title"));
@@ -213,9 +213,7 @@ describe("SettingsPage integration", () => {
   it("allows browsing and resetting directories", async () => {
     renderDialog();
 
-    await waitFor(() =>
-      expect(screen.getByText("language:zh")).toBeInTheDocument(),
-    );
+    await waitForDefaultLanguage();
 
     fireEvent.click(screen.getByText("settings.tabAdvanced"));
     fireEvent.click(screen.getByText("settings.advanced.configDir.title"));
@@ -254,9 +252,7 @@ describe("SettingsPage integration", () => {
   it("notifies when export fails", async () => {
     renderDialog();
 
-    await waitFor(() =>
-      expect(screen.getByText("language:zh")).toBeInTheDocument(),
-    );
+    await waitForDefaultLanguage();
     fireEvent.click(screen.getByText("settings.tabAdvanced"));
     fireEvent.click(screen.getByText("settings.advanced.data.title"));
 

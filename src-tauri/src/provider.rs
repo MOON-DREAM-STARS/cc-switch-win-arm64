@@ -70,6 +70,10 @@ impl Provider {
         self.provider_type() == Some("codex_oauth")
     }
 
+    pub fn is_model_router(&self) -> bool {
+        self.provider_type() == Some("model_router")
+    }
+
     pub fn is_github_copilot(&self) -> bool {
         self.provider_type() == Some("github_copilot")
             || self.claude_base_url_contains("githubcopilot.com")
@@ -363,6 +367,97 @@ pub struct ClaudeDesktopModelRoute {
     pub supports_1m: Option<bool>,
 }
 
+/// Model Router V1：引用已有 providerId 的目标节点。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRouterProviderRef {
+    #[serde(alias = "provider_id")]
+    pub provider_id: String,
+    #[serde(alias = "upstream_model")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Model Router 路由匹配类型。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRouterMatchType {
+    Exact,
+    Role,
+    #[default]
+    Default,
+}
+
+/// Model Router 支持的角色关键词。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelRouterRole {
+    Opus,
+    Sonnet,
+    Haiku,
+    #[default]
+    Default,
+}
+
+/// Model Router 路由规则。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRouterRule {
+    #[serde(alias = "match_type")]
+    pub match_type: ModelRouterMatchType,
+    #[serde(alias = "match_value")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<ModelRouterProviderRef>,
+    #[serde(alias = "provider_chain", alias = "providers")]
+    #[serde(default, alias = "providers", skip_serializing_if = "Vec::is_empty")]
+    pub provider_chain: Vec<ModelRouterProviderRef>,
+    #[serde(alias = "fallback_targets")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<ModelRouterProviderRef>,
+}
+
+impl ModelRouterRule {
+    pub fn normalized_provider_chain(&self) -> Vec<ModelRouterProviderRef> {
+        let mut chain = Vec::new();
+
+        if let Some(target) = self.target.clone() {
+            chain.push(target);
+        }
+
+        chain.extend(self.provider_chain.clone());
+        chain.extend(self.fallbacks.clone());
+
+        chain
+    }
+}
+
+fn default_model_router_version() -> u32 {
+    1
+}
+
+/// Model Router 配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRouterConfig {
+    #[serde(default = "default_model_router_version")]
+    pub version: u32,
+    #[serde(default, alias = "rules")]
+    pub routes: Vec<ModelRouterRule>,
+}
+
+impl Default for ModelRouterConfig {
+    fn default() -> Self {
+        Self {
+            version: default_model_router_version(),
+            routes: Vec::new(),
+        }
+    }
+}
+
 /// Codex Responses -> Chat Completions 的 reasoning 能力描述。
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CodexChatReasoningConfig {
@@ -472,10 +567,26 @@ pub struct ProviderMeta {
     /// - "github_copilot": GitHub Copilot 供应商
     #[serde(rename = "providerType", skip_serializing_if = "Option::is_none")]
     pub provider_type: Option<String>,
+    /// CC Switch 自动管理的组合 Provider 标记。
+    #[serde(
+        rename = "managedModelRouterProvider",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub managed_model_router_provider: Option<bool>,
+    /// 组合 Provider 的模型路由配置。
+    #[serde(
+        rename = "modelRouter",
+        alias = "model_router",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_router: Option<ModelRouterConfig>,
     /// GitHub Copilot 关联账号 ID（仅 github_copilot 供应商使用）
     /// 用于多账号支持，关联到特定的 GitHub 账号
     #[serde(rename = "githubAccountId", skip_serializing_if = "Option::is_none")]
     pub github_account_id: Option<String>,
+    /// 运行时上游模型覆盖，仅在本地代理内存中使用，不写入配置。
+    #[serde(skip)]
+    pub runtime_upstream_model: Option<String>,
 }
 
 impl ProviderMeta {
@@ -901,8 +1012,9 @@ pub struct OpenCodeModelLimit {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, OpenCodeProviderConfig, Provider,
-        ProviderManager, ProviderMeta, UniversalProvider,
+        ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, ModelRouterConfig,
+        ModelRouterMatchType, ModelRouterProviderRef, ModelRouterRule, OpenCodeProviderConfig,
+        Provider, ProviderManager, ProviderMeta, UniversalProvider,
     };
     use serde_json::json;
 
@@ -1003,6 +1115,54 @@ mod tests {
             ..Default::default()
         });
         assert!(copilot.is_github_copilot());
+    }
+
+    #[test]
+    fn provider_model_router_detection_uses_provider_type() {
+        let mut router = Provider::with_id(
+            "router".to_string(),
+            "Router".to_string(),
+            json!({ "env": {} }),
+            None,
+        );
+        router.meta = Some(ProviderMeta {
+            provider_type: Some("model_router".to_string()),
+            ..Default::default()
+        });
+
+        assert!(router.is_model_router());
+    }
+
+    #[test]
+    fn provider_meta_serializes_model_router_without_runtime_override() {
+        let meta = ProviderMeta {
+            provider_type: Some("model_router".to_string()),
+            model_router: Some(ModelRouterConfig {
+                routes: vec![ModelRouterRule {
+                    match_type: ModelRouterMatchType::Role,
+                    match_value: Some("sonnet".to_string()),
+                    target: Some(ModelRouterProviderRef {
+                        provider_id: "target-a".to_string(),
+                        upstream_model: Some("gpt-5.4".to_string()),
+                        label: None,
+                    }),
+                    provider_chain: Vec::new(),
+                    fallbacks: Vec::new(),
+                }],
+            }),
+            runtime_upstream_model: Some("runtime-only".to_string()),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&meta).expect("serialize ProviderMeta");
+
+        assert_eq!(
+            value.get("providerType").and_then(|item| item.as_str()),
+            Some("model_router")
+        );
+        assert!(value.get("modelRouter").is_some());
+        assert!(value.get("runtimeUpstreamModel").is_none());
+        assert!(value.get("runtime_upstream_model").is_none());
     }
 
     #[test]

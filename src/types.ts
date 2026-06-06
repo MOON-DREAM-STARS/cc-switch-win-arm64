@@ -173,6 +173,38 @@ export interface CodexChatReasoning {
   outputFormat?: CodexChatReasoningOutputFormat;
 }
 
+export type ProviderModelRouterMatchType = "exact" | "role" | "default";
+
+export type ProviderModelRouterRole =
+  | "default"
+  | "haiku"
+  | "sonnet"
+  | "opus";
+
+export interface ProviderModelRouterTargetRef {
+  providerId?: string;
+  upstreamModel?: string;
+  label?: string;
+  [key: string]: unknown;
+}
+
+export interface ProviderModelRouterRule {
+  id?: string;
+  enabled?: boolean;
+  matchType?: ProviderModelRouterMatchType;
+  matchValue?: string;
+  target?: ProviderModelRouterTargetRef;
+  providerChain?: ProviderModelRouterTargetRef[];
+  fallbacks?: ProviderModelRouterTargetRef[];
+  [key: string]: unknown;
+}
+
+export interface ProviderModelRouterConfig {
+  version?: number;
+  routes?: ProviderModelRouterRule[];
+  [key: string]: unknown;
+}
+
 // 供应商元数据（字段名与后端一致，保持 snake_case）
 export interface ProviderMeta {
   // 自定义端点：以 URL 为键，值为端点信息
@@ -223,6 +255,11 @@ export interface ProviderMeta {
   providerType?: string;
   // GitHub Copilot 关联账号 ID（旧字段，保留兼容读取）
   githubAccountId?: string;
+  // 组合 Provider / model_router 路由配置；前端仅做最小结构保真与透传
+  modelRouter?: ProviderModelRouterConfig;
+  model_router?: ProviderModelRouterConfig;
+  // CC Switch 自动管理的组合 Provider 标记
+  managedModelRouterProvider?: boolean;
 }
 
 // Skill 同步方式
@@ -325,6 +362,8 @@ export interface Settings {
   silentStartup?: boolean;
   // 是否启用主页面本地代理功能（默认关闭）
   enableLocalProxy?: boolean;
+  // 是否启用组合 Provider（默认关闭）
+  enableModelRouterProvider?: boolean;
   // User has confirmed the local proxy first-run notice
   proxyConfirmed?: boolean;
   // User has confirmed the usage query first-run notice

@@ -119,6 +119,8 @@ pub struct RequestForwarder {
     /// `max_attempts = max_retries + 1`，所以 max_retries=0 表示仅尝试一家、
     /// max_retries=3（默认）表示最多 4 家。loop 同时受 providers.len() 自然限制。
     max_attempts: usize,
+    /// 当前请求是否来自组合 provider；若是，成功后不把真实 target 回写为当前 provider。
+    preserve_current_provider: bool,
 }
 
 impl RequestForwarder {
@@ -141,6 +143,8 @@ impl RequestForwarder {
         optimizer_config: OptimizerConfig,
         copilot_optimizer_config: CopilotOptimizerConfig,
         max_retries: u32,
+        _provider_chain_len: usize,
+        preserve_current_provider: bool,
     ) -> Self {
         // max_retries 是「失败后重试次数」语义，attempt 上限 = retries + 1。
         // saturating_add 防止 u32::MAX + 1 溢出。
@@ -164,6 +168,7 @@ impl RequestForwarder {
                 streaming_first_byte_timeout,
             ),
             max_attempts,
+            preserve_current_provider,
         }
     }
 
@@ -437,8 +442,8 @@ impl RequestForwarder {
                         let mut status = self.status.write().await;
                         status.success_requests += 1;
                         status.last_error = None;
-                        let should_switch =
-                            self.current_provider_id_at_start.as_str() != provider.id.as_str();
+                        let should_switch = !self.preserve_current_provider
+                            && self.current_provider_id_at_start.as_str() != provider.id.as_str();
                         if should_switch {
                             status.failover_count += 1;
 
@@ -567,8 +572,8 @@ impl RequestForwarder {
                                             let mut status = self.status.write().await;
                                             status.success_requests += 1;
                                             status.last_error = None;
-                                            let should_switch =
-                                                self.current_provider_id_at_start.as_str()
+                                            let should_switch = !self.preserve_current_provider
+                                                && self.current_provider_id_at_start.as_str()
                                                     != provider.id.as_str();
                                             if should_switch {
                                                 status.failover_count += 1;
@@ -730,8 +735,8 @@ impl RequestForwarder {
                                         let mut status = self.status.write().await;
                                         status.success_requests += 1;
                                         status.last_error = None;
-                                        let should_switch =
-                                            self.current_provider_id_at_start.as_str()
+                                        let should_switch = !self.preserve_current_provider
+                                            && self.current_provider_id_at_start.as_str()
                                                 != provider.id.as_str();
                                         if should_switch {
                                             status.failover_count += 1;
@@ -946,7 +951,24 @@ impl RequestForwarder {
         // 应用模型映射（独立于格式转换）
         // Claude Desktop proxy 模式必须先把 Desktop 可见的 claude-* route
         // 映射成真实上游模型名，并且未知 route 要直接报错，不能使用默认模型兜底。
-        let mapped_body = if matches!(app_type, AppType::ClaudeDesktop) {
+        let mapped_body = if let Some(runtime_model) = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.runtime_upstream_model.as_deref())
+            .filter(|value| !value.is_empty())
+        {
+            let mut overridden = body.clone();
+            log::debug!(
+                "[{}] [MR-003] runtime model override: {} -> {}",
+                app_type.as_str(),
+                body.get("model")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown"),
+                runtime_model
+            );
+            overridden["model"] = serde_json::json!(runtime_model);
+            overridden
+        } else if matches!(app_type, AppType::ClaudeDesktop) {
             crate::claude_desktop_config::map_proxy_request_model(body.clone(), provider)
                 .map_err(|e| ProxyError::InvalidRequest(e.to_string()))?
         } else {
@@ -2406,6 +2428,26 @@ mod tests {
         }
     }
 
+    fn test_provider_with_runtime_model(runtime_model: Option<&str>) -> Provider {
+        Provider {
+            id: "test-provider".to_string(),
+            name: "Test Provider".to_string(),
+            settings_config: json!({ "env": {} }),
+            website_url: None,
+            category: None,
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(crate::provider::ProviderMeta {
+                runtime_upstream_model: runtime_model.map(|value| value.to_string()),
+                ..Default::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        }
+    }
+
     fn test_forwarder(
         non_streaming_timeout: Duration,
         streaming_first_byte_timeout: Duration,
@@ -2429,6 +2471,7 @@ mod tests {
             non_streaming_timeout,
             streaming_first_byte_timeout,
             max_attempts: 1,
+            preserve_current_provider: false,
         }
     }
 
@@ -3036,6 +3079,29 @@ mod tests {
             == Some("github_copilot");
 
         assert!(is_copilot, "应该通过 provider_type 检测为 Copilot");
+    }
+
+    #[test]
+    fn runtime_model_override_is_preferred_over_default_model_mapping() {
+        let provider = test_provider_with_runtime_model(Some("gpt-5.4"));
+        let body = json!({"model": "claude-sonnet-4-6"});
+
+        let mapped_body = if let Some(runtime_model) = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.runtime_upstream_model.as_deref())
+            .filter(|value| !value.is_empty())
+        {
+            let mut overridden = body.clone();
+            overridden["model"] = json!(runtime_model);
+            overridden
+        } else {
+            let (mapped_body, _, _) =
+                super::super::model_mapper::apply_model_mapping(body.clone(), &provider);
+            mapped_body
+        };
+
+        assert_eq!(mapped_body["model"], "gpt-5.4");
     }
 
     /// 验证 is_copilot 检测逻辑：通过 base_url 判断

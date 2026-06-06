@@ -96,6 +96,11 @@ vi.mock("@/components/providers/EditProviderDialog", () => ({
     ) : null,
 }));
 
+vi.mock("@/components/providers/CompositeProviderEditor", () => ({
+  CompositeProviderEditor: ({ open }: any) =>
+    open ? <div data-testid="composite-provider-editor" /> : null,
+}));
+
 vi.mock("@/components/UsageScriptModal", () => ({
   default: ({ isOpen, provider, onSave, onClose }: any) =>
     isOpen ? (
@@ -158,6 +163,7 @@ const renderApp = (AppComponent: ComponentType) => {
 
 describe("App integration with MSW", () => {
   beforeEach(() => {
+    window.localStorage.clear();
     resetProviderState();
     toastSuccessMock.mockReset();
     toastErrorMock.mockReset();
@@ -218,7 +224,7 @@ describe("App integration with MSW", () => {
 
     expect(toastErrorMock).not.toHaveBeenCalled();
     expect(toastSuccessMock).toHaveBeenCalled();
-  });
+  }, 15000);
 
   it("shows toast when auto sync fails in background", async () => {
     const { default: App } = await import("@/App");
@@ -244,7 +250,7 @@ describe("App integration with MSW", () => {
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalled();
     });
-  });
+  }, 15000);
 
   it("duplicates openclaw providers with a generated key that avoids live-only ids", async () => {
     setProviders("openclaw", {

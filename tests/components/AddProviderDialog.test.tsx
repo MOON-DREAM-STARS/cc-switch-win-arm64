@@ -63,6 +63,29 @@ describe("AddProviderDialog", () => {
     const handleSubmit = vi.fn().mockResolvedValue(undefined);
     const handleOpenChange = vi.fn();
 
+    mockFormValues.meta = {
+      custom_endpoints: {
+        "https://api.new-endpoint.com": {
+          url: "https://api.new-endpoint.com",
+          addedAt: 1,
+        },
+      },
+      providerType: "model_router",
+      modelRouter: {
+        version: 1,
+        routes: [
+          {
+            matchType: "role",
+            matchValue: "sonnet",
+            target: {
+              providerId: "primary",
+              upstreamModel: "gpt-5.4",
+            },
+          },
+        ],
+      },
+    };
+
     render(
       <AddProviderDialog
         open
@@ -84,6 +107,10 @@ describe("AddProviderDialog", () => {
     expect(submitted.meta?.custom_endpoints).toEqual(
       mockFormValues.meta?.custom_endpoints,
     );
+    expect(submitted.meta?.modelRouter).toEqual(
+      mockFormValues.meta?.modelRouter,
+    );
+    expect(submitted.meta?.providerType).toBe("model_router");
     expect(handleOpenChange).toHaveBeenCalledWith(false);
   });
 

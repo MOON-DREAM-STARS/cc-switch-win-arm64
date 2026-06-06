@@ -1,5 +1,179 @@
 import type { CustomEndpoint, ProviderMeta } from "@/types";
 
+const MANAGED_PROVIDER_META_KEYS = new Set<string>([
+  "custom_endpoints",
+  "commonConfigEnabled",
+  "claudeDesktopMode",
+  "claudeDesktopModelRoutes",
+  "usage_script",
+  "endpointAutoSelect",
+  "isPartner",
+  "partnerPromotionKey",
+  "testConfig",
+  "costMultiplier",
+  "pricingModelSource",
+  "apiFormat",
+  "authBinding",
+  "apiKeyField",
+  "isFullUrl",
+  "promptCacheKey",
+  "codexFastMode",
+  "codexChatReasoning",
+  "providerType",
+  "githubAccountId",
+]);
+
+const isNonEmptyObject = (
+  value: Record<string, unknown> | undefined,
+): value is Record<string, unknown> => Boolean(value && Object.keys(value).length > 0);
+
+export function splitProviderMeta(meta: ProviderMeta | undefined): {
+  managedMeta: ProviderMeta | undefined;
+  extraMeta: Record<string, unknown> | undefined;
+} {
+  if (!meta) {
+    return {
+      managedMeta: undefined,
+      extraMeta: undefined,
+    };
+  }
+
+  const managedMeta: Record<string, unknown> = {};
+  const extraMeta: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(meta as Record<string, unknown>)) {
+    if (value === undefined) continue;
+
+    if (MANAGED_PROVIDER_META_KEYS.has(key)) {
+      managedMeta[key] = value;
+      continue;
+    }
+
+    extraMeta[key] = value;
+  }
+
+  return {
+    managedMeta: isNonEmptyObject(managedMeta)
+      ? (managedMeta as ProviderMeta)
+      : undefined,
+    extraMeta: isNonEmptyObject(extraMeta) ? extraMeta : undefined,
+  };
+}
+
+export function stringifyProviderExtraMeta(
+  meta: ProviderMeta | undefined,
+): string {
+  const { extraMeta } = splitProviderMeta(meta);
+  return extraMeta ? JSON.stringify(extraMeta, null, 2) : "";
+}
+
+export function mergeProviderMetaWithExtra(
+  managedMeta: ProviderMeta | undefined,
+  extraMeta: Record<string, unknown> | undefined,
+): ProviderMeta | undefined {
+  const merged = {
+    ...(extraMeta ?? {}),
+    ...(managedMeta ?? {}),
+  };
+
+  return Object.keys(merged).length > 0 ? (merged as ProviderMeta) : undefined;
+}
+
+export function ensureModelRouterMetaConfig(value: string | undefined): string {
+  const text = value?.trim();
+
+  if (!text) {
+    return JSON.stringify(
+      {
+        modelRouter: {
+          routes: [
+            {
+              matchType: "role",
+              matchValue: "sonnet",
+              target: {
+                providerId: "target-provider-id",
+                upstreamModel: "gpt-5.4",
+              },
+              fallbacks: [],
+            },
+          ],
+        },
+      },
+      null,
+      2,
+    );
+  }
+
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("invalid meta object");
+    }
+
+    if (parsed.modelRouter) {
+      return JSON.stringify(parsed, null, 2);
+    }
+
+    return JSON.stringify(
+      {
+        ...parsed,
+        modelRouter: {
+          routes: [
+            {
+              matchType: "role",
+              matchValue: "sonnet",
+              target: {
+                providerId: "target-provider-id",
+                upstreamModel: "gpt-5.4",
+              },
+              fallbacks: [],
+            },
+          ],
+        },
+      },
+      null,
+      2,
+    );
+  } catch {
+    return JSON.stringify(
+      {
+        modelRouter: {
+          routes: [
+            {
+              matchType: "role",
+              matchValue: "sonnet",
+              target: {
+                providerId: "target-provider-id",
+                upstreamModel: "gpt-5.4",
+              },
+              fallbacks: [],
+            },
+          ],
+        },
+      },
+      null,
+      2,
+    );
+  }
+}
+
+export function stripModelRouterMetaConfig(value: string | undefined): string {
+  const text = value?.trim();
+  if (!text) return "";
+
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return "";
+    }
+
+    const { modelRouter, model_router, ...rest } = parsed;
+    return Object.keys(rest).length > 0 ? JSON.stringify(rest, null, 2) : "";
+  } catch {
+    return text;
+  }
+}
+
 /**
  * 合并供应商元数据中的自定义端点。
  * - 当 customEndpoints 为空对象时，明确删除自定义端点但保留其它元数据。

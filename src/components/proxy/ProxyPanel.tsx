@@ -9,6 +9,7 @@ import {
   Loader2,
   Zap,
   Power,
+  Route,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -33,6 +34,8 @@ import { AnimatePresence, motion } from "framer-motion";
 interface ProxyPanelProps {
   enableLocalProxy: boolean;
   onEnableLocalProxyChange: (checked: boolean) => void;
+  enableModelRouterProvider: boolean;
+  onEnableModelRouterProviderChange: (checked: boolean) => void;
   onToggleProxy: (checked: boolean) => Promise<void>;
   isProxyPending: boolean;
 }
@@ -40,6 +43,8 @@ interface ProxyPanelProps {
 export function ProxyPanel({
   enableLocalProxy,
   onEnableLocalProxyChange,
+  enableModelRouterProvider,
+  onEnableModelRouterProviderChange,
   onToggleProxy,
   isProxyPending,
 }: ProxyPanelProps) {
@@ -223,7 +228,24 @@ export function ProxyPanel({
           onCheckedChange={onEnableLocalProxyChange}
         />
 
-        {/* [2] Proxy service toggle — always visible */}
+        {/* [2] Managed combined Provider card */}
+        <ToggleRow
+          icon={<Route className="h-4 w-4 text-violet-500" />}
+          title={t("settings.advanced.proxy.enableModelRouterProvider", {
+            defaultValue: "开启组合 Provider",
+          })}
+          description={t(
+            "settings.advanced.proxy.enableModelRouterProviderDescription",
+            {
+              defaultValue:
+                "开启后，当前应用主页会显示“组合provider”卡片；请从该卡片的编辑入口配置模型映射。",
+            },
+          )}
+          checked={enableModelRouterProvider}
+          onCheckedChange={onEnableModelRouterProviderChange}
+        />
+
+        {/* [3] Proxy service toggle — always visible */}
         <div className="flex items-center justify-between rounded-xl border border-border bg-card/50 p-4 transition-colors hover:bg-muted/50">
           <div className="flex items-center gap-3">
             <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-background ring-1 ring-border">
