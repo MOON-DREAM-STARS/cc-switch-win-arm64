@@ -118,4 +118,98 @@ describe("useManagedCombinedProvider", () => {
       ordinaryProvider,
     );
   });
+
+  it("normalizes legacy managed providers without replacing custom identity fields", async () => {
+    const legacyManaged: Provider = {
+      id: COMBINED_PROVIDER_ID,
+      name: "我的组合 Provider",
+      notes: "custom notes",
+      websiteUrl: "https://example.com/combined",
+      icon: "route",
+      iconColor: "#123456",
+      settingsConfig: { env: {} },
+      meta: {
+        providerType: "model_router",
+        managedModelRouterProvider: true,
+        model_router: {
+          routes: [
+            {
+              id: "combined-default",
+              matchType: "default",
+              target: { providerId: ordinaryProvider.id },
+            },
+          ],
+        },
+      },
+    };
+    const { wrapper } = createWrapper();
+
+    renderHook(
+      () =>
+        useManagedCombinedProvider({
+          appId: "claude",
+          providers: {
+            [ordinaryProvider.id]: ordinaryProvider,
+            [legacyManaged.id]: legacyManaged,
+          },
+          enabled: true,
+          isLoading: false,
+        }),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(apiMocks.update).toHaveBeenCalledTimes(1));
+    expect(apiMocks.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: COMBINED_PROVIDER_ID,
+        name: "我的组合 Provider",
+        notes: "custom notes",
+        websiteUrl: "https://example.com/combined",
+        icon: "route",
+        iconColor: "#123456",
+        meta: expect.objectContaining({
+          modelRouter: expect.objectContaining({ version: 1 }),
+        }),
+      }),
+      "claude",
+    );
+    const [updatedProvider] = apiMocks.update.mock.calls[0];
+    expect(updatedProvider.meta.model_router).toBeUndefined();
+  });
+
+  it("does not update an already normalized managed provider with custom identity fields", async () => {
+    const managed: Provider = {
+      id: COMBINED_PROVIDER_ID,
+      name: "我的组合 Provider",
+      notes: "custom notes",
+      websiteUrl: "https://example.com/combined",
+      icon: "route",
+      iconColor: "#123456",
+      settingsConfig: { env: {} },
+      meta: {
+        providerType: "model_router",
+        managedModelRouterProvider: true,
+        modelRouter: { version: 1, routes: [] },
+      },
+    };
+    const { wrapper } = createWrapper();
+
+    renderHook(
+      () =>
+        useManagedCombinedProvider({
+          appId: "claude",
+          providers: {
+            [ordinaryProvider.id]: ordinaryProvider,
+            [managed.id]: managed,
+          },
+          enabled: true,
+          isLoading: false,
+        }),
+      { wrapper },
+    );
+
+    await act(async () => {});
+
+    expect(apiMocks.update).not.toHaveBeenCalled();
+  });
 });
