@@ -22,6 +22,7 @@ import {
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
 import { IconPicker } from "@/components/IconPicker";
 import { ProviderIcon } from "@/components/ProviderIcon";
+import { ModelInputWithFetch } from "@/components/providers/forms/shared";
 import { getIconMetadata } from "@/icons/extracted/metadata";
 import type { Provider, ProviderModelRouterRule } from "@/types";
 import type { AppId } from "@/lib/api";
@@ -475,9 +476,8 @@ export function CompositeProviderEditor({
           {roleLabels.map(({ role, key, defaultLabel }) => {
             const label = t(key, { defaultValue: defaultLabel });
             const selectedProvider = providers[mappings[role].providerId];
-            const models = selectedProvider
-              ? (detection[selectedProvider.id]?.models ?? [])
-              : [];
+            const state = selectedProvider ? detection[selectedProvider.id] : undefined;
+            const models = state?.models ?? [];
 
             return (
               <div
@@ -534,23 +534,18 @@ export function CompositeProviderEditor({
                   <Label htmlFor={`combined-${role}-model`} className="md:hidden">
                     {label} Model
                   </Label>
-                  <Input
+                  <ModelInputWithFetch
                     id={`combined-${role}-model`}
-                    aria-label={`${label} Model`}
                     value={mappings[role].upstreamModel}
-                    onChange={(event) =>
-                      updateMapping(role, { upstreamModel: event.target.value })
-                    }
-                    list={`combined-${role}-models`}
+                    onChange={(value) => updateMapping(role, { upstreamModel: value })}
                     placeholder={t("combinedProvider.manualModelPlaceholder", {
                       defaultValue: "选择或手动输入模型",
                     })}
+                    fetchedModels={models}
+                    isLoading={state?.status === "detecting"}
+                    ariaLabel={`${label} Model`}
+                    dropdownAriaLabel={`${label} Model options`}
                   />
-                  <datalist id={`combined-${role}-models`}>
-                    {models.map((model) => (
-                      <option key={model.id} value={model.id} />
-                    ))}
-                  </datalist>
                 </div>
               </div>
             );
