@@ -498,7 +498,10 @@ fn create_usage_collector(
     }
 
     let state = state.clone();
-    let provider_id = ctx.provider.id.clone();
+    let provider_id = ctx
+        .logical_provider_id
+        .clone()
+        .unwrap_or_else(|| ctx.provider.id.clone());
     let request_model = ctx.request_model.clone();
     let app_type_str = parser_config.app_type_str;
     let tag = ctx.tag;
@@ -584,7 +587,10 @@ fn spawn_log_usage(
     }
 
     let state = state.clone();
-    let provider_id = ctx.provider.id.clone();
+    let provider_id = ctx
+        .logical_provider_id
+        .clone()
+        .unwrap_or_else(|| ctx.provider.id.clone());
     let app_type_str = ctx.app_type_str.to_string();
     let model = model.to_string();
     let request_model = request_model.to_string();

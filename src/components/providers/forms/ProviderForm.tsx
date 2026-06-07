@@ -2359,56 +2359,6 @@ function ProviderFormFull({
             </>
           )}
 
-          <div className="space-y-2">
-            <Label htmlFor="metaConfig">
-              {t("providerForm.metaJsonLabel", {
-                defaultValue: "额外 Meta JSON（可选）",
-              })}
-            </Label>
-            <JsonEditor
-              id="metaConfig"
-              value={form.watch("metaConfig") ?? ""}
-              onChange={(value) => form.setValue("metaConfig", value)}
-              placeholder={`{
-  "modelRouter": {
-    "routes": [
-      {
-        "matchType": "role",
-        "matchValue": "sonnet",
-        "target": {
-          "providerId": "openrouter-main",
-          "upstreamModel": "openai/gpt-5.4"
-        },
-        "fallbacks": [
-          {
-            "providerId": "backup-provider",
-            "upstreamModel": "gpt-5.4-mini"
-          }
-        ]
-      }
-    ]
-  }
-}`}
-              rows={10}
-              showValidation={true}
-              language="json"
-            />
-            <p className="text-xs text-muted-foreground">
-              {t("providerForm.metaJsonHint", {
-                defaultValue:
-                  "用于承载未内建到表单的额外 meta 字段，例如组合 Provider / model_router。表单管理的字段会优先覆盖同名项。",
-              })}
-            </p>
-            <FormField
-              control={form.control}
-              name="metaConfig"
-              render={() => (
-                <FormItem className="space-y-0">
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-          </div>
 
           {!isAnyOmoCategory &&
             appId !== "opencode" &&

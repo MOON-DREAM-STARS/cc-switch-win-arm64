@@ -94,11 +94,14 @@ impl ProxyService {
         } else {
             ClaudeTakeoverAuthPolicy::PreserveExistingOrAuthToken
         };
-        // Copilot/Codex 接管时 live config 可能还是旧供应商；显示模型必须跟随目标 provider。
+        // Copilot/Codex/model_router 接管时 live config 可能还是旧供应商；显示模型必须跟随目标 provider。
         let takeover_model_fields = if provider.uses_managed_account_auth() {
-            Self::build_claude_takeover_model_fields(&provider.settings_config)
+            Self::build_claude_takeover_model_fields_for_provider(
+                &provider.settings_config,
+                provider,
+            )
         } else {
-            Self::build_claude_takeover_model_fields(config)
+            Self::build_claude_takeover_model_fields_for_provider(config, provider)
         };
 
         Self::apply_claude_takeover_fields_with_policy_and_models(
@@ -190,6 +193,91 @@ impl ProxyService {
                 );
             }
         }
+    }
+
+    fn build_claude_takeover_model_fields_for_provider(
+        config: &Value,
+        provider: &Provider,
+    ) -> Vec<(&'static str, String)> {
+        if provider.is_model_router() {
+            if let Some(fields) = Self::build_model_router_takeover_model_fields(provider) {
+                return fields;
+            }
+        }
+
+        Self::build_claude_takeover_model_fields(config)
+    }
+
+    fn build_model_router_takeover_model_fields(
+        provider: &Provider,
+    ) -> Option<Vec<(&'static str, String)>> {
+        let config = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.model_router.as_ref())?;
+
+        let mut default_model = None;
+        let mut haiku_model = None;
+        let mut sonnet_model = None;
+        let mut opus_model = None;
+
+        for route in &config.routes {
+            match route.match_type {
+                crate::provider::ModelRouterMatchType::Default => {
+                    default_model.get_or_insert("cc-switch-default".to_string());
+                }
+                crate::provider::ModelRouterMatchType::Role => match route
+                    .match_value
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .as_deref()
+                {
+                    Some("haiku") => {
+                        haiku_model.get_or_insert(CLAUDE_TAKEOVER_HAIKU_MODEL.to_string());
+                    }
+                    Some("sonnet") => {
+                        sonnet_model.get_or_insert(CLAUDE_TAKEOVER_SONNET_MODEL.to_string());
+                    }
+                    Some("opus") => {
+                        opus_model.get_or_insert(CLAUDE_TAKEOVER_OPUS_MODEL.to_string());
+                    }
+                    _ => {}
+                },
+                crate::provider::ModelRouterMatchType::Exact => {}
+            }
+        }
+
+        if haiku_model.is_none() && sonnet_model.is_none() && opus_model.is_none() {
+            if let Some(model) = default_model.clone() {
+                sonnet_model = Some(model);
+            }
+        }
+
+        let mut fields = Vec::new();
+        if let Some(model) = haiku_model {
+            fields.push(("ANTHROPIC_DEFAULT_HAIKU_MODEL", model));
+            fields.push((
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+                "组合 Haiku".to_string(),
+            ));
+        }
+        if let Some(model) = sonnet_model {
+            fields.push(("ANTHROPIC_DEFAULT_SONNET_MODEL", model));
+            fields.push((
+                "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+                "组合 Sonnet".to_string(),
+            ));
+        }
+        if let Some(model) = opus_model {
+            fields.push(("ANTHROPIC_DEFAULT_OPUS_MODEL", model));
+            fields.push((
+                "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+                "组合 Opus".to_string(),
+            ));
+        }
+
+        (!fields.is_empty()).then_some(fields)
     }
 
     fn build_claude_takeover_model_fields(config: &Value) -> Vec<(&'static str, String)> {
@@ -2614,6 +2702,61 @@ mod tests {
             .expect("serialize models_cache"),
         )
         .expect("write models_cache.json");
+    }
+
+    #[test]
+    fn model_router_claude_takeover_exposes_router_role_models() {
+        let mut provider = Provider::with_id(
+            "router".to_string(),
+            "组合provider".to_string(),
+            json!({ "env": {} }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some("model_router".to_string()),
+            model_router: Some(crate::provider::ModelRouterConfig {
+                routes: vec![
+                    crate::provider::ModelRouterRule {
+                        match_type: crate::provider::ModelRouterMatchType::Role,
+                        match_value: Some("sonnet".to_string()),
+                        target: None,
+                        provider_chain: Vec::new(),
+                        fallbacks: Vec::new(),
+                    },
+                    crate::provider::ModelRouterRule {
+                        match_type: crate::provider::ModelRouterMatchType::Role,
+                        match_value: Some("opus".to_string()),
+                        target: None,
+                        provider_chain: Vec::new(),
+                        fallbacks: Vec::new(),
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let mut live_config = json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://stale.example.com",
+                "ANTHROPIC_AUTH_TOKEN": "stale-key",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "stale-target-model"
+            }
+        });
+        ProxyService::apply_claude_takeover_fields_for_provider(
+            &mut live_config,
+            "http://127.0.0.1:15721",
+            &provider,
+        );
+
+        let env = live_config
+            .get("env")
+            .and_then(|value| value.as_object())
+            .expect("env should exist");
+        assert_env_str(env, "ANTHROPIC_DEFAULT_SONNET_MODEL", Some("claude-sonnet-4-6"));
+        assert_env_str(env, "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME", Some("组合 Sonnet"));
+        assert_env_str(env, "ANTHROPIC_DEFAULT_OPUS_MODEL", Some("claude-opus-4-8"));
+        assert_env_str(env, "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME", Some("组合 Opus"));
     }
 
     #[test]

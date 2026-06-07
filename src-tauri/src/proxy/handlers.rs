@@ -297,7 +297,10 @@ async fn handle_claude_transform(
         // 创建使用量收集器；关闭 usage logging 时不要再解析转换后的 SSE。
         let usage_collector = if usage_logging_enabled(state) {
             let state = state.clone();
-            let provider_id = ctx.provider.id.clone();
+            let provider_id = ctx
+                .logical_provider_id
+                .clone()
+                .unwrap_or_else(|| ctx.provider.id.clone());
             let model = ctx.request_model.clone();
             let status_code = status.as_u16();
             let start_time = ctx.start_time;
@@ -415,7 +418,10 @@ async fn handle_claude_transform(
         let request_model = ctx.request_model.clone();
         tokio::spawn({
             let state = state.clone();
-            let provider_id = ctx.provider.id.clone();
+            let provider_id = ctx
+                .logical_provider_id
+                .clone()
+                .unwrap_or_else(|| ctx.provider.id.clone());
             let model = model.to_string();
             let session_id = ctx.session_id.clone();
             async move {
@@ -718,7 +724,10 @@ async fn handle_codex_chat_to_responses_transform(
 
         let usage_collector = if usage_logging_enabled(state) {
             let state = state.clone();
-            let provider_id = ctx.provider.id.clone();
+            let provider_id = ctx
+                .logical_provider_id
+                .clone()
+                .unwrap_or_else(|| ctx.provider.id.clone());
             let request_model = ctx.request_model.clone();
             let start_time = ctx.start_time;
             let session_id = ctx.session_id.clone();
@@ -816,7 +825,10 @@ async fn handle_codex_chat_to_responses_transform(
         let request_model = ctx.request_model.clone();
         tokio::spawn({
             let state = state.clone();
-            let provider_id = ctx.provider.id.clone();
+            let provider_id = ctx
+                .logical_provider_id
+                .clone()
+                .unwrap_or_else(|| ctx.provider.id.clone());
             let model = model.to_string();
             let session_id = ctx.session_id.clone();
             let latency_ms = ctx.latency_ms();
@@ -1283,9 +1295,14 @@ fn log_forward_error(
     let error_message = get_error_message(error);
     let request_id = uuid::Uuid::new_v4().to_string();
 
+    let provider_id = ctx
+        .logical_provider_id
+        .clone()
+        .unwrap_or_else(|| ctx.provider.id.clone());
+
     if let Err(e) = logger.log_error_with_context(
         request_id,
-        ctx.provider.id.clone(),
+        provider_id,
         ctx.app_type_str.to_string(),
         ctx.request_model.clone(),
         status_code,

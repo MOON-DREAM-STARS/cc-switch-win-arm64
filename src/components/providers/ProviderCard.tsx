@@ -67,6 +67,10 @@ interface ProviderCardProps {
 
 /** 判断是否为官方供应商（无自定义 base URL / API key，直连官方 API） */
 function isOfficialProvider(provider: Provider, appId: AppId): boolean {
+  if (provider.meta?.providerType === "model_router") {
+    return false;
+  }
+
   if (provider.category === "official") {
     return true;
   }
@@ -191,9 +195,12 @@ export function ProviderCard({
   }, [provider.notes, displayUrl, fallbackUrlText]);
 
   const usageEnabled = provider.meta?.usage_script?.enabled ?? false;
+  const isModelRouter = provider.meta?.providerType === "model_router";
   const isOfficial = isOfficialProvider(provider, appId);
   const isOfficialBlockedByProxy =
-    isProxyTakeover && (provider.category === "official" || isOfficial);
+    isProxyTakeover &&
+    !isModelRouter &&
+    (provider.category === "official" || isOfficial);
   const isCopilot =
     provider.meta?.providerType === PROVIDER_TYPES.GITHUB_COPILOT ||
     provider.meta?.usage_script?.templateType === "github_copilot";
@@ -218,7 +225,7 @@ export function ProviderCard({
     (provider.settingsConfig as Record<string, any>)?.config,
   ]);
   const isClaudeThirdParty =
-    appId === "claude" && provider.category === "third_party";
+    appId === "claude" && provider.category === "third_party" && !isModelRouter;
 
   // 获取用量数据以判断是否有多套餐
   // 累加模式应用（OpenCode/OpenClaw/Hermes）：使用 isInConfig 代替 isCurrent

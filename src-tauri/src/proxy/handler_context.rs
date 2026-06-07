@@ -43,7 +43,7 @@ pub struct RequestContext {
     providers: Vec<Provider>,
     /// 请求开始时的"当前供应商"（用于判断是否需要同步 UI/托盘）
     ///
-    /// 这里使用本地 settings 的设备级 current provider。
+    /// 使用有效 current provider：优先本地 settings，失效/缺失时 fallback 到数据库 current。
     /// 代理模式下如果实际使用的 provider 与此不一致，会触发切换以确保 UI 始终准确。
     pub current_provider_id: String,
     /// 请求中的模型名称
@@ -69,6 +69,8 @@ pub struct RequestContext {
     pub provider_chain_len: usize,
     /// 是否保留当前设置中的 provider，不把实际命中的 target 同步回 UI/托盘
     pub preserve_current_provider: bool,
+    /// 逻辑 provider ID。组合 provider 请求展开到真实 target 后，使用量仍归属逻辑路由 provider。
+    pub logical_provider_id: Option<String>,
 }
 
 impl RequestContext {
@@ -113,17 +115,12 @@ impl RequestContext {
         let optimizer_config = state.db.get_optimizer_config().unwrap_or_default();
         let copilot_optimizer_config = state.db.get_copilot_optimizer_config().unwrap_or_default();
 
-        let current_provider_id =
-            crate::settings::get_current_provider(&app_type).unwrap_or_default();
-        let preserve_current_provider = if current_provider_id.is_empty() {
-            false
-        } else {
-            state
-                .db
-                .get_provider_by_id(&current_provider_id, app_type_str)
-                .map(|provider| provider.is_some_and(|p| p.is_model_router()))
-                .unwrap_or(false)
-        };
+        let current_provider_attribution =
+            resolve_current_provider_attribution(&state.db, &app_type, app_type_str)
+                .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
+        let current_provider_id = current_provider_attribution.current_provider_id;
+        let preserve_current_provider = current_provider_attribution.preserve_current_provider;
+        let logical_provider_id = current_provider_attribution.logical_provider_id;
 
         // 提取 Session ID
         let session_result = extract_session_id(headers, body, app_type_str);
@@ -187,6 +184,7 @@ impl RequestContext {
             copilot_optimizer_config,
             provider_chain_len,
             preserve_current_provider,
+            logical_provider_id,
         })
     }
 
@@ -328,6 +326,35 @@ impl RequestContext {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CurrentProviderAttribution {
+    current_provider_id: String,
+    preserve_current_provider: bool,
+    logical_provider_id: Option<String>,
+}
+
+fn resolve_current_provider_attribution(
+    db: &crate::database::Database,
+    app_type: &AppType,
+    app_type_str: &str,
+) -> Result<CurrentProviderAttribution, crate::error::AppError> {
+    let current_provider_id = crate::settings::get_effective_current_provider(db, app_type)?
+        .unwrap_or_default();
+    let preserve_current_provider = if current_provider_id.is_empty() {
+        false
+    } else {
+        db.get_provider_by_id(&current_provider_id, app_type_str)?
+            .is_some_and(|provider| provider.is_model_router())
+    };
+    let logical_provider_id = preserve_current_provider.then(|| current_provider_id.clone());
+
+    Ok(CurrentProviderAttribution {
+        current_provider_id,
+        preserve_current_provider,
+        logical_provider_id,
+    })
+}
+
 /// Pull the Gemini model name out of an API path.
 ///
 /// Accepts forms like `/v1beta/models/gemini-pro:generateContent`,
@@ -348,7 +375,72 @@ pub(crate) fn extract_gemini_model_from_path(endpoint: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_gemini_model_from_path;
+    use super::{extract_gemini_model_from_path, resolve_current_provider_attribution};
+    use crate::app_config::AppType;
+    use crate::database::Database;
+    use crate::provider::{Provider, ProviderMeta};
+    use crate::settings::AppSettings;
+    use serde_json::json;
+    use serial_test::serial;
+    use std::ffi::OsString;
+
+    struct TestSettingsGuard {
+        _dir: tempfile::TempDir,
+        previous_home: Option<OsString>,
+    }
+
+    impl TestSettingsGuard {
+        fn with_empty_settings() -> Self {
+            let previous_home = std::env::var_os("CC_SWITCH_TEST_HOME");
+            let dir = tempfile::tempdir().expect("create temp settings home");
+            std::env::set_var("CC_SWITCH_TEST_HOME", dir.path());
+            crate::settings::update_settings(AppSettings::default())
+                .expect("reset test settings");
+            Self {
+                _dir: dir,
+                previous_home,
+            }
+        }
+    }
+
+    impl Drop for TestSettingsGuard {
+        fn drop(&mut self) {
+            match &self.previous_home {
+                Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+                None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+            }
+            crate::settings::reload_settings().expect("restore settings store");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn current_provider_attribution_falls_back_to_db_current_model_router() {
+        let _guard = TestSettingsGuard::with_empty_settings();
+        let db = Database::memory().expect("create memory db");
+        let mut router = Provider::with_id(
+            "router".to_string(),
+            "Router".to_string(),
+            json!({}),
+            None,
+        );
+        router.meta = Some(ProviderMeta {
+            provider_type: Some("model_router".to_string()),
+            ..Default::default()
+        });
+
+        db.save_provider("claude", &router).expect("save router");
+        db.set_current_provider("claude", "router")
+            .expect("set db current provider");
+
+        let attribution =
+            resolve_current_provider_attribution(&db, &AppType::Claude, "claude")
+                .expect("resolve attribution");
+
+        assert_eq!(attribution.current_provider_id, "router");
+        assert!(attribution.preserve_current_provider);
+        assert_eq!(attribution.logical_provider_id.as_deref(), Some("router"));
+    }
 
     #[test]
     fn extract_model_with_action() {
