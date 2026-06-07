@@ -132,6 +132,25 @@ describe("providerModelDetection", () => {
     });
   });
 
+  it("preserves 1M markers when building composite routes", () => {
+    expect(
+      buildCompositeRoutes([], {
+        default: { providerId: "", upstreamModel: "" },
+        sonnet: { providerId: "p1", upstreamModel: "sonnet-model[1M]" },
+        haiku: { providerId: "", upstreamModel: "" },
+        opus: { providerId: "", upstreamModel: "" },
+      }),
+    ).toEqual([
+      {
+        id: "combined-role-sonnet",
+        enabled: true,
+        matchType: "role",
+        matchValue: "sonnet",
+        target: { providerId: "p1", upstreamModel: "sonnet-model[1M]" },
+      },
+    ]);
+  });
+
   it("builds managed default and role routes from mapping rows", () => {
     expect(
       buildCompositeRoutes(
