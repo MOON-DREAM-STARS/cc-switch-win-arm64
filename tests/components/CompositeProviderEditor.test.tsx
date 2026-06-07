@@ -71,6 +71,36 @@ const routerProvider: Provider = {
   meta: { providerType: "model_router" },
 };
 
+const networkClaudeProvider: Provider = {
+  id: "network-claude",
+  name: "Network Claude Provider",
+  settingsConfig: {
+    env: {
+      ANTHROPIC_BASE_URL: "https://api.example.com",
+      ANTHROPIC_API_KEY: "test-api-key",
+    },
+  },
+};
+
+const compositeProviderWithDefaultNetworkRoute: Provider = {
+  ...combinedProvider,
+  meta: {
+    providerType: "model_router",
+    managedModelRouterProvider: true,
+    modelRouter: {
+      version: 1,
+      routes: [
+        {
+          id: "combined-default",
+          enabled: true,
+          matchType: "default",
+          target: { providerId: "network-claude", upstreamModel: "gpt-5.4-mini" },
+        },
+      ],
+    },
+  },
+};
+
 const selectProvider = async (
   user: ReturnType<typeof userEvent.setup>,
   label: string,
@@ -106,6 +136,57 @@ describe("CompositeProviderEditor", () => {
 
     expect(screen.getAllByText("普通 Provider").length).toBeGreaterThan(0);
     expect(screen.queryByText("Other Router")).not.toBeInTheDocument();
+  });
+
+  it("shows fetched default model options from the dropdown arrow and applies a selection", async () => {
+    const user = userEvent.setup();
+    fetchMocks.fetchModelsForConfig.mockResolvedValue([
+      { id: "gpt-5.4-mini", ownedBy: "openai" },
+      { id: "gpt-5.4[1M]", ownedBy: "openai" },
+      { id: "gpt-5.5", ownedBy: "openai" },
+    ]);
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={compositeProviderWithDefaultNetworkRoute}
+        providers={{
+          [compositeProviderWithDefaultNetworkRoute.id]:
+            compositeProviderWithDefaultNetworkRoute,
+          [networkClaudeProvider.id]: networkClaudeProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(fetchMocks.fetchModelsForConfig).toHaveBeenCalledWith(
+        "https://api.example.com",
+        "test-api-key",
+        undefined,
+        undefined,
+      ),
+    );
+    expect(await screen.findByText("3 models")).toBeInTheDocument();
+
+    const defaultModelInput = screen.getByLabelText("默认模型 Model");
+    const defaultModelRow = defaultModelInput.closest("div")?.parentElement;
+    expect(defaultModelRow).toBeTruthy();
+
+    const modelDropdownTrigger = within(defaultModelRow as HTMLElement).getByRole(
+      "button",
+      { name: "默认模型 Model options" },
+    );
+    await user.click(modelDropdownTrigger);
+
+    expect(await screen.findByRole("menuitem", { name: "gpt-5.4-mini" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "gpt-5.4[1M]" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "gpt-5.5" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("menuitem", { name: "gpt-5.5" }));
+    expect(defaultModelInput).toHaveValue("gpt-5.5");
   });
 
   it("saves default and role mappings as modelRouter routes", async () => {
