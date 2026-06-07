@@ -33,10 +33,14 @@ export const createManagedCombinedProvider = (
 ): Provider => {
   const { model_router: _modelRouterAlias, ...meta } = existing?.meta ?? {};
 
+  const name = existing?.name?.trim()
+    ? existing.name
+    : COMBINED_PROVIDER_NAME;
+
   return {
     ...(existing ?? {}),
     id: COMBINED_PROVIDER_ID,
-    name: COMBINED_PROVIDER_NAME,
+    name,
     settingsConfig: existing?.settingsConfig ?? { env: {} },
     meta: {
       ...meta,

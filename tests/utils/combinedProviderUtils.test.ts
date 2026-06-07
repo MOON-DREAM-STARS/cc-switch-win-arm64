@@ -68,7 +68,7 @@ describe("combinedProviderUtils", () => {
 
     const normalized = normalizeManagedCombinedProvider(existing);
 
-    expect(normalized.name).toBe(COMBINED_PROVIDER_NAME);
+    expect(normalized.name).toBe("旧名称");
     expect(normalized.createdAt).toBe(123);
     expect(normalized.sortIndex).toBe(7);
     expect(normalized.meta?.modelRouter?.routes).toEqual(
