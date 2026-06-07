@@ -434,6 +434,7 @@ mod tests {
                         label: None,
                     }],
                 }],
+                ..Default::default()
             }),
             ..Default::default()
         });
@@ -511,6 +512,7 @@ mod tests {
                     provider_chain: Vec::new(),
                     fallbacks: Vec::new(),
                 }],
+                ..Default::default()
             }),
             ..Default::default()
         });

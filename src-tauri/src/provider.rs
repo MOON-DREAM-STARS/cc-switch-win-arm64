@@ -1149,6 +1149,7 @@ mod tests {
                     provider_chain: Vec::new(),
                     fallbacks: Vec::new(),
                 }],
+                ..Default::default()
             }),
             runtime_upstream_model: Some("runtime-only".to_string()),
             ..Default::default()

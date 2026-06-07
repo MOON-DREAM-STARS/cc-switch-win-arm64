@@ -165,7 +165,10 @@ mod tests {
         let mut provider = provider_with_id("router");
         provider.meta = Some(ProviderMeta {
             provider_type: Some("model_router".to_string()),
-            model_router: Some(ModelRouterConfig { routes }),
+            model_router: Some(ModelRouterConfig {
+                routes,
+                ..Default::default()
+            }),
             ..Default::default()
         });
         provider
@@ -198,6 +201,7 @@ mod tests {
                     fallbacks: Vec::new(),
                 },
             ],
+            ..Default::default()
         };
 
         let rule = select_rule(&config, "claude-sonnet-4-6").expect("rule");
