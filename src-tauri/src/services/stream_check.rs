@@ -1392,6 +1392,16 @@ impl StreamCheckService {
         provider: &Provider,
         config: &StreamCheckConfig,
     ) -> String {
+        if let Some(runtime_model) = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.runtime_upstream_model.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return runtime_model.to_string();
+        }
+
         match app_type {
             AppType::Claude | AppType::ClaudeDesktop => {
                 Self::extract_env_model(provider, "ANTHROPIC_MODEL")
@@ -1607,6 +1617,25 @@ mod tests {
             settings_config,
             None,
         )
+    }
+
+    #[test]
+    fn runtime_upstream_model_overrides_configured_test_model() {
+        let mut provider = make_provider(serde_json::json!({
+            "env": {
+                "ANTHROPIC_MODEL": "client-route-model"
+            }
+        }));
+        provider.meta = Some(crate::provider::ProviderMeta {
+            runtime_upstream_model: Some("target-upstream-model".to_string()),
+            ..Default::default()
+        });
+        let config = StreamCheckConfig::default();
+
+        assert_eq!(
+            StreamCheckService::resolve_effective_test_model(&AppType::Claude, &provider, &config),
+            "target-upstream-model"
+        );
     }
 
     #[test]

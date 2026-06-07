@@ -2,7 +2,9 @@
 
 use crate::app_config::AppType;
 use crate::commands::copilot::CopilotAuthState;
+use crate::database::Database;
 use crate::error::AppError;
+use crate::provider::Provider;
 use crate::services::stream_check::{
     HealthStatus, StreamCheckConfig, StreamCheckResult, StreamCheckService,
 };
@@ -25,23 +27,12 @@ pub async fn stream_check_provider(
         .get(&provider_id)
         .ok_or_else(|| AppError::Message(format!("供应商 {provider_id} 不存在")))?;
 
-    let auth_override = resolve_copilot_auth_override(provider, &copilot_state).await?;
-    let base_url_override = resolve_copilot_base_url_override(provider, &copilot_state).await?;
-    let claude_api_format_override = resolve_claude_api_format_override(
-        &app_type,
-        provider,
-        &config,
+    let result = check_provider_with_model_router_targets(
+        state.db.as_ref(),
         &copilot_state,
-        auth_override.as_ref(),
-    )
-    .await?;
-    let result = StreamCheckService::check_with_retry(
         &app_type,
         provider,
         &config,
-        auth_override,
-        base_url_override,
-        claude_api_format_override,
     )
     .await?;
 
@@ -88,32 +79,12 @@ pub async fn stream_check_all_providers(
             }
         }
 
-        let auth_override = resolve_copilot_auth_override(&provider, &copilot_state).await?;
-        let base_url_override =
-            resolve_copilot_base_url_override(&provider, &copilot_state).await?;
-        let claude_api_format_override = resolve_claude_api_format_override(
-            &app_type,
-            &provider,
-            &config,
+        let result = check_provider_with_model_router_targets(
+            state.db.as_ref(),
             &copilot_state,
-            auth_override.as_ref(),
-        )
-        .await
-        .unwrap_or_else(|e| {
-            log::warn!(
-                "[StreamCheck] Failed to resolve Claude API format override for {}: {}",
-                provider.id,
-                e
-            );
-            None
-        });
-        let result = StreamCheckService::check_with_retry(
             &app_type,
             &provider,
             &config,
-            auth_override,
-            base_url_override,
-            claude_api_format_override,
         )
         .await
         .unwrap_or_else(|e| {
@@ -160,6 +131,148 @@ pub fn save_stream_check_config(
     config: StreamCheckConfig,
 ) -> Result<(), AppError> {
     state.db.save_stream_check_config(&config)
+}
+
+fn resolve_model_router_targets_for_check(
+    db: &Database,
+    app_type: &AppType,
+    provider: &Provider,
+    config: &StreamCheckConfig,
+) -> Result<Vec<Provider>, AppError> {
+    if !provider.is_model_router() {
+        return Ok(vec![provider.clone()]);
+    }
+
+    let request_model = resolve_model_router_test_model(provider)
+        .unwrap_or_else(|| StreamCheckService::resolve_effective_test_model(app_type, provider, config));
+    crate::proxy::model_router::resolve_provider_chain(
+        db,
+        app_type.as_str(),
+        provider,
+        &request_model,
+    )
+}
+
+fn resolve_model_router_test_model(provider: &Provider) -> Option<String> {
+    let config = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.model_router.as_ref())?;
+
+    for route in &config.routes {
+        match route.match_type {
+            crate::provider::ModelRouterMatchType::Exact => {
+                if let Some(match_value) = route.match_value.as_deref() {
+                    let match_value = match_value.trim();
+                    if !match_value.is_empty() {
+                        return Some(match_value.to_string());
+                    }
+                }
+            }
+            crate::provider::ModelRouterMatchType::Role => match route
+                .match_value
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("haiku") => return Some("claude-haiku-4-5".to_string()),
+                Some("sonnet") => return Some("claude-sonnet-4-6".to_string()),
+                Some("opus") => return Some("claude-opus-4-8".to_string()),
+                _ => {}
+            },
+            crate::provider::ModelRouterMatchType::Default => {
+                return Some("cc-switch-default".to_string());
+            }
+        }
+    }
+
+    None
+}
+
+async fn check_provider_with_model_router_targets(
+    db: &Database,
+    copilot_state: &State<'_, CopilotAuthState>,
+    app_type: &AppType,
+    provider: &Provider,
+    config: &StreamCheckConfig,
+) -> Result<StreamCheckResult, AppError> {
+    if !provider.is_model_router() {
+        let auth_override = resolve_copilot_auth_override(provider, copilot_state).await?;
+        let base_url_override = resolve_copilot_base_url_override(provider, copilot_state).await?;
+        let claude_api_format_override = resolve_claude_api_format_override(
+            app_type,
+            provider,
+            config,
+            copilot_state,
+            auth_override.as_ref(),
+        )
+        .await?;
+
+        return StreamCheckService::check_with_retry(
+            app_type,
+            provider,
+            config,
+            auth_override,
+            base_url_override,
+            claude_api_format_override,
+        )
+        .await;
+    }
+
+    let targets = resolve_model_router_targets_for_check(db, app_type, provider, config)?;
+    let max_targets = targets.len().saturating_sub(1) as u32;
+    let mut last_error: Option<AppError> = None;
+    let mut last_result: Option<StreamCheckResult> = None;
+
+    for (index, target) in targets.iter().enumerate() {
+        let auth_override = resolve_copilot_auth_override(target, copilot_state).await?;
+        let base_url_override = resolve_copilot_base_url_override(target, copilot_state).await?;
+        let claude_api_format_override = resolve_claude_api_format_override(
+            app_type,
+            target,
+            config,
+            copilot_state,
+            auth_override.as_ref(),
+        )
+        .await?;
+
+        match StreamCheckService::check_with_retry(
+            app_type,
+            target,
+            config,
+            auth_override,
+            base_url_override,
+            claude_api_format_override,
+        )
+        .await
+        {
+            Ok(result) if result.success => {
+                return Ok(StreamCheckResult {
+                    retry_count: index as u32,
+                    ..result
+                });
+            }
+            Ok(result) => {
+                last_result = Some(StreamCheckResult {
+                    retry_count: index as u32,
+                    ..result
+                });
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    if let Some(result) = last_result {
+        return Ok(StreamCheckResult {
+            retry_count: result.retry_count.min(max_targets),
+            ..result
+        });
+    }
+
+    Err(last_error.unwrap_or_else(|| AppError::NoProvidersConfigured))
 }
 
 async fn resolve_copilot_auth_override(
@@ -288,9 +401,108 @@ async fn resolve_claude_api_format_override(
 
 #[cfg(test)]
 mod tests {
-    use super::is_copilot_provider;
-    use crate::provider::{Provider, ProviderMeta};
+    use super::{
+        is_copilot_provider, resolve_model_router_targets_for_check, resolve_model_router_test_model,
+    };
+    use crate::app_config::AppType;
+    use crate::database::Database;
+    use crate::provider::{
+        ModelRouterConfig, ModelRouterMatchType, ModelRouterProviderRef, ModelRouterRule, Provider,
+        ProviderMeta,
+    };
+    use crate::services::stream_check::StreamCheckConfig;
     use serde_json::json;
+
+    #[test]
+    fn model_router_stream_check_uses_client_route_model() {
+        let mut provider = Provider::with_id(
+            "router".to_string(),
+            "Router".to_string(),
+            json!({ "env": {} }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some("model_router".to_string()),
+            model_router: Some(ModelRouterConfig {
+                routes: vec![ModelRouterRule {
+                    match_type: ModelRouterMatchType::Role,
+                    match_value: Some("opus".to_string()),
+                    target: None,
+                    provider_chain: Vec::new(),
+                    fallbacks: Vec::new(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            resolve_model_router_test_model(&provider).as_deref(),
+            Some("claude-opus-4-8")
+        );
+    }
+
+    #[test]
+    fn model_router_stream_check_resolves_target_provider_with_upstream_model() {
+        let db = Database::memory().expect("memory database");
+        let target = Provider::with_id(
+            "target".to_string(),
+            "Target".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.example.com",
+                    "ANTHROPIC_AUTH_TOKEN": "token",
+                    "ANTHROPIC_MODEL": "configured-model"
+                }
+            }),
+            None,
+        );
+        db.save_provider(AppType::Claude.as_str(), &target)
+            .expect("save target provider");
+
+        let mut router = Provider::with_id(
+            "router".to_string(),
+            "Router".to_string(),
+            json!({ "env": {} }),
+            None,
+        );
+        router.meta = Some(ProviderMeta {
+            provider_type: Some("model_router".to_string()),
+            model_router: Some(ModelRouterConfig {
+                routes: vec![ModelRouterRule {
+                    match_type: ModelRouterMatchType::Role,
+                    match_value: Some("sonnet".to_string()),
+                    target: Some(ModelRouterProviderRef {
+                        provider_id: "target".to_string(),
+                        upstream_model: Some("target-upstream-model".to_string()),
+                        label: None,
+                    }),
+                    provider_chain: Vec::new(),
+                    fallbacks: Vec::new(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let resolved = resolve_model_router_targets_for_check(
+            &db,
+            &AppType::Claude,
+            &router,
+            &StreamCheckConfig::default(),
+        )
+        .expect("router should resolve to target provider");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, "target");
+        assert_eq!(
+            resolved[0]
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.runtime_upstream_model.as_deref()),
+            Some("target-upstream-model")
+        );
+    }
 
     #[test]
     fn copilot_provider_detection_accepts_provider_type_or_base_url() {

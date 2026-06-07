@@ -59,7 +59,7 @@ mod tests {
     use crate::claude_desktop_config::PROFILE_ID;
     use crate::config::{get_claude_settings_path, read_json_file, write_json_file};
     use crate::database::Database;
-    use crate::provider::ProviderMeta;
+    use crate::provider::{ModelRouterConfig, ProviderMeta};
     #[cfg(any(target_os = "macos", windows))]
     use crate::provider::{ClaudeDesktopMode, ClaudeDesktopModelRoute};
     use crate::proxy::types::ProxyConfig;
@@ -298,6 +298,24 @@ mod tests {
             err.to_string().contains("auth"),
             "expected auth error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn validate_provider_settings_accepts_model_router_shell_for_codex() {
+        let mut provider = Provider::with_id(
+            "codex-router".into(),
+            "Codex Router".into(),
+            json!({ "env": {} }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some("model_router".to_string()),
+            model_router: Some(ModelRouterConfig::default()),
+            ..ProviderMeta::default()
+        });
+
+        ProviderService::validate_provider_settings(&AppType::Codex, &provider)
+            .expect("model_router shell should not require Codex auth");
     }
 
     #[test]
@@ -2262,93 +2280,103 @@ impl ProviderService {
     }
 
     fn validate_provider_settings(app_type: &AppType, provider: &Provider) -> Result<(), AppError> {
-        match app_type {
-            AppType::Claude => {
-                if !provider.settings_config.is_object() {
-                    return Err(AppError::localized(
-                        "provider.claude.settings.not_object",
-                        "Claude 配置必须是 JSON 对象",
-                        "Claude configuration must be a JSON object",
-                    ));
-                }
+        if provider.is_model_router() {
+            if !provider.settings_config.is_object() {
+                return Err(AppError::localized(
+                    "provider.model_router.settings.not_object",
+                    "Model Router 配置必须是 JSON 对象",
+                    "Model Router configuration must be a JSON object",
+                ));
             }
-            AppType::ClaudeDesktop => {
-                crate::claude_desktop_config::validate_provider(provider)?;
-            }
-            AppType::Codex => {
-                let settings = provider.settings_config.as_object().ok_or_else(|| {
-                    AppError::localized(
-                        "provider.codex.settings.not_object",
-                        "Codex 配置必须是 JSON 对象",
-                        "Codex configuration must be a JSON object",
-                    )
-                })?;
-
-                let auth = settings.get("auth").ok_or_else(|| {
-                    AppError::localized(
-                        "provider.codex.auth.missing",
-                        format!("供应商 {} 缺少 auth 配置", provider.id),
-                        format!("Provider {} is missing auth configuration", provider.id),
-                    )
-                })?;
-                if !auth.is_object() {
-                    return Err(AppError::localized(
-                        "provider.codex.auth.not_object",
-                        format!("供应商 {} 的 auth 配置必须是 JSON 对象", provider.id),
-                        format!(
-                            "Provider {} auth configuration must be a JSON object",
-                            provider.id
-                        ),
-                    ));
-                }
-
-                if let Some(config_value) = settings.get("config") {
-                    if !(config_value.is_string() || config_value.is_null()) {
+        } else {
+            match app_type {
+                AppType::Claude => {
+                    if !provider.settings_config.is_object() {
                         return Err(AppError::localized(
-                            "provider.codex.config.invalid_type",
-                            "Codex config 字段必须是字符串",
-                            "Codex config field must be a string",
+                            "provider.claude.settings.not_object",
+                            "Claude 配置必须是 JSON 对象",
+                            "Claude configuration must be a JSON object",
                         ));
                     }
-                    if let Some(cfg_text) = config_value.as_str() {
-                        crate::codex_config::validate_config_toml(cfg_text)?;
+                }
+                AppType::ClaudeDesktop => {
+                    crate::claude_desktop_config::validate_provider(provider)?;
+                }
+                AppType::Codex => {
+                    let settings = provider.settings_config.as_object().ok_or_else(|| {
+                        AppError::localized(
+                            "provider.codex.settings.not_object",
+                            "Codex 配置必须是 JSON 对象",
+                            "Codex configuration must be a JSON object",
+                        )
+                    })?;
+
+                    let auth = settings.get("auth").ok_or_else(|| {
+                        AppError::localized(
+                            "provider.codex.auth.missing",
+                            format!("供应商 {} 缺少 auth 配置", provider.id),
+                            format!("Provider {} is missing auth configuration", provider.id),
+                        )
+                    })?;
+                    if !auth.is_object() {
+                        return Err(AppError::localized(
+                            "provider.codex.auth.not_object",
+                            format!("供应商 {} 的 auth 配置必须是 JSON 对象", provider.id),
+                            format!(
+                                "Provider {} auth configuration must be a JSON object",
+                                provider.id
+                            ),
+                        ));
+                    }
+
+                    if let Some(config_value) = settings.get("config") {
+                        if !(config_value.is_string() || config_value.is_null()) {
+                            return Err(AppError::localized(
+                                "provider.codex.config.invalid_type",
+                                "Codex config 字段必须是字符串",
+                                "Codex config field must be a string",
+                            ));
+                        }
+                        if let Some(cfg_text) = config_value.as_str() {
+                            crate::codex_config::validate_config_toml(cfg_text)?;
+                        }
                     }
                 }
-            }
-            AppType::Gemini => {
-                use crate::gemini_config::validate_gemini_settings;
-                validate_gemini_settings(&provider.settings_config)?
-            }
-            AppType::OpenCode => {
-                // OpenCode uses a different config structure: { npm, options, models }
-                // Basic validation - must be an object
-                if !provider.settings_config.is_object() {
-                    return Err(AppError::localized(
-                        "provider.opencode.settings.not_object",
-                        "OpenCode 配置必须是 JSON 对象",
-                        "OpenCode configuration must be a JSON object",
-                    ));
+                AppType::Gemini => {
+                    use crate::gemini_config::validate_gemini_settings;
+                    validate_gemini_settings(&provider.settings_config)?
                 }
-            }
-            AppType::OpenClaw => {
-                // OpenClaw uses config structure: { baseUrl, apiKey, api, models }
-                // Basic validation - must be an object
-                if !provider.settings_config.is_object() {
-                    return Err(AppError::localized(
-                        "provider.openclaw.settings.not_object",
-                        "OpenClaw 配置必须是 JSON 对象",
-                        "OpenClaw configuration must be a JSON object",
-                    ));
+                AppType::OpenCode => {
+                    // OpenCode uses a different config structure: { npm, options, models }
+                    // Basic validation - must be an object
+                    if !provider.settings_config.is_object() {
+                        return Err(AppError::localized(
+                            "provider.opencode.settings.not_object",
+                            "OpenCode 配置必须是 JSON 对象",
+                            "OpenCode configuration must be a JSON object",
+                        ));
+                    }
                 }
-            }
-            AppType::Hermes => {
-                // Hermes: accept any JSON object for now
-                if !provider.settings_config.is_object() {
-                    return Err(AppError::localized(
-                        "provider.hermes.settings.not_object",
-                        "Hermes 配置必须是 JSON 对象",
-                        "Hermes configuration must be a JSON object",
-                    ));
+                AppType::OpenClaw => {
+                    // OpenClaw uses config structure: { baseUrl, apiKey, api, models }
+                    // Basic validation - must be an object
+                    if !provider.settings_config.is_object() {
+                        return Err(AppError::localized(
+                            "provider.openclaw.settings.not_object",
+                            "OpenClaw 配置必须是 JSON 对象",
+                            "OpenClaw configuration must be a JSON object",
+                        ));
+                    }
+                }
+                AppType::Hermes => {
+                    // Hermes: accept any JSON object for now
+                    if !provider.settings_config.is_object() {
+                        return Err(AppError::localized(
+                            "provider.hermes.settings.not_object",
+                            "Hermes 配置必须是 JSON 对象",
+                            "Hermes configuration must be a JSON object",
+                        ));
+                    }
                 }
             }
         }
