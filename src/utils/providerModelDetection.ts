@@ -130,13 +130,9 @@ export const getModelFetchDescriptor = (
   provider: Provider,
   appId: AppId,
 ): ModelFetchDescriptor => {
-  const storedModels = getStoredModels(provider, appId);
-  if (storedModels.length > 0) {
-    return { source: "stored", models: storedModels };
-  }
-
   const config = provider.settingsConfig ?? {};
   const env = getEnv(provider);
+  const storedModels = getStoredModels(provider, appId);
 
   let baseUrl = "";
   let apiKey = "";
@@ -146,7 +142,23 @@ export const getModelFetchDescriptor = (
     baseUrl = asString(env.ANTHROPIC_BASE_URL);
     apiKey = asString(env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN);
     modelsUrl = asString(env.ANTHROPIC_MODELS_URL);
-  } else if (appId === "gemini") {
+
+    if (baseUrl && apiKey) {
+      return {
+        source: "network",
+        baseUrl,
+        apiKey,
+        ...(provider.meta?.isFullUrl ? { isFullUrl: true } : {}),
+        ...(modelsUrl ? { modelsUrl } : {}),
+      };
+    }
+  }
+
+  if (storedModels.length > 0) {
+    return { source: "stored", models: storedModels };
+  }
+
+  if (appId === "gemini") {
     baseUrl = asString(env.GOOGLE_GEMINI_BASE_URL);
     apiKey = asString(env.GEMINI_API_KEY);
   } else if (appId === "opencode") {
@@ -166,7 +178,7 @@ export const getModelFetchDescriptor = (
       extractCodexBaseUrl(asString(config.config)) ||
       "";
     apiKey = asString(auth.OPENAI_API_KEY || config.apiKey);
-  } else {
+  } else if (appId !== "claude") {
     return { source: "unavailable", reason: "unsupported" };
   }
 

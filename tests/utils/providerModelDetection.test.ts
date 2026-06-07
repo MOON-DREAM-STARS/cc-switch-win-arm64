@@ -83,6 +83,29 @@ describe("providerModelDetection", () => {
     });
   });
 
+  it("prefers Claude network detection when stored env models and credentials are available", () => {
+    const descriptor = getModelFetchDescriptor(
+      provider({
+        settingsConfig: {
+          env: {
+            ANTHROPIC_MODEL: "stored-default",
+            ANTHROPIC_BASE_URL: "https://api.example.com/v1",
+            ANTHROPIC_API_KEY: "sk-test",
+            ANTHROPIC_MODELS_URL: "https://api.example.com/v1/models",
+          },
+        },
+      }),
+      "claude",
+    );
+
+    expect(descriptor).toEqual({
+      source: "network",
+      baseUrl: "https://api.example.com/v1",
+      apiKey: "sk-test",
+      modelsUrl: "https://api.example.com/v1/models",
+    });
+  });
+
   it("builds a Codex network descriptor from TOML config base_url", () => {
     const descriptor = getModelFetchDescriptor(
       provider({
