@@ -1,11 +1,28 @@
 import { useEffect, useMemo, useState } from "react";
-import { Save } from "lucide-react";
+import { ArrowLeft, Save } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
+import { IconPicker } from "@/components/IconPicker";
+import { ProviderIcon } from "@/components/ProviderIcon";
+import { getIconMetadata } from "@/icons/extracted/metadata";
 import type { Provider, ProviderModelRouterRule } from "@/types";
 import type { AppId } from "@/lib/api";
 import { fetchModelsForConfig, type FetchedModel } from "@/lib/api/model-fetch";
@@ -34,6 +51,8 @@ type DetectionState = Record<
     message?: string;
   }
 >;
+
+const NO_PROVIDER_VALUE = "__none__";
 
 const emptyMappings = (): CompositeMappings => ({
   default: { providerId: "", upstreamModel: "" },
@@ -82,6 +101,12 @@ export function CompositeProviderEditor({
   onSubmit,
 }: CompositeProviderEditorProps) {
   const { t } = useTranslation();
+  const [name, setName] = useState("");
+  const [notes, setNotes] = useState("");
+  const [websiteUrl, setWebsiteUrl] = useState("");
+  const [icon, setIcon] = useState("");
+  const [iconColor, setIconColor] = useState("");
+  const [iconDialogOpen, setIconDialogOpen] = useState(false);
   const [mappings, setMappings] = useState<CompositeMappings>(emptyMappings);
   const [detection, setDetection] = useState<DetectionState>({});
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -93,6 +118,12 @@ export function CompositeProviderEditor({
 
   useEffect(() => {
     if (!open || !provider) return;
+    setName(provider.name ?? "");
+    setNotes(provider.notes ?? "");
+    setWebsiteUrl(provider.websiteUrl ?? "");
+    setIcon(provider.icon ?? "");
+    setIconColor(provider.iconColor ?? "");
+    setIconDialogOpen(false);
     setMappings(routeToMappings(provider.meta?.modelRouter?.routes ?? []));
   }, [open, provider]);
 
@@ -162,6 +193,17 @@ export function CompositeProviderEditor({
     };
   }, [appId, open, ordinaryProviders]);
 
+  const effectiveIconColor = icon
+    ? iconColor || getIconMetadata(icon)?.defaultColor
+    : undefined;
+  const iconButtonLabel = icon
+    ? t("providerIcon.clickToChange", {
+        defaultValue: "点击更换图标",
+      })
+    : t("providerIcon.clickToSelect", {
+        defaultValue: "点击选择图标",
+      });
+
   const updateMapping = (
     role: CompositeRole,
     patch: Partial<{ providerId: string; upstreamModel: string }>,
@@ -173,6 +215,12 @@ export function CompositeProviderEditor({
         ...patch,
       },
     }));
+  };
+
+  const handleIconSelect = (selectedIcon: string) => {
+    const meta = getIconMetadata(selectedIcon);
+    setIcon(selectedIcon);
+    setIconColor(meta?.defaultColor ?? "");
   };
 
   const handleSubmit = async () => {
@@ -191,9 +239,20 @@ export function CompositeProviderEditor({
 
     const routes = buildCompositeRoutes(provider.meta?.modelRouter?.routes ?? [], mappings);
     const { model_router: _modelRouterAlias, ...meta } = provider.meta ?? {};
+    const trimmedName = name.trim();
+    const trimmedNotes = notes.trim();
+    const trimmedWebsiteUrl = websiteUrl.trim();
+    const trimmedIcon = icon.trim();
+    const trimmedIconColor = iconColor.trim();
     const updatedProvider: Provider = {
       ...provider,
-      name: provider.name || t("combinedProvider.name", { defaultValue: "组合provider" }),
+      name:
+        trimmedName ||
+        t("combinedProvider.name", { defaultValue: "组合provider" }),
+      notes: trimmedNotes || undefined,
+      websiteUrl: trimmedWebsiteUrl || undefined,
+      icon: trimmedIcon || undefined,
+      iconColor: trimmedIconColor || undefined,
       meta: {
         ...meta,
         providerType: "model_router",
@@ -220,21 +279,137 @@ export function CompositeProviderEditor({
       title={t("combinedProvider.editTitle", { defaultValue: "编辑组合provider" })}
       onClose={() => onOpenChange(false)}
       footer={
-        <Button type="button" onClick={handleSubmit} disabled={isSubmitting || !provider}>
+        <Button
+          type="submit"
+          form="composite-provider-form"
+          disabled={isSubmitting || !provider}
+        >
           <Save className="h-4 w-4 mr-2" />
           {t("common.save", { defaultValue: "保存" })}
         </Button>
       }
     >
-      <div className="space-y-6">
-        <section className="rounded-xl border border-border bg-card/50 p-4 space-y-2">
-          <h3 className="text-sm font-semibold">
-            {t("combinedProvider.description", {
-              defaultValue: "按请求模型把流量路由到当前应用中的普通 Provider。",
-            })}
-          </h3>
+      <form
+        id="composite-provider-form"
+        className="space-y-6 glass rounded-xl p-6 border border-white/10"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void handleSubmit();
+        }}
+      >
+        <div className="flex justify-center mb-6">
+          <Dialog open={iconDialogOpen} onOpenChange={setIconDialogOpen}>
+            <DialogTrigger asChild>
+              <button
+                type="button"
+                className="w-20 h-20 p-3 rounded-xl border-2 border-muted hover:border-primary transition-colors cursor-pointer bg-muted/30 hover:bg-muted/50 flex items-center justify-center"
+                title={iconButtonLabel}
+                aria-label={iconButtonLabel}
+              >
+                <ProviderIcon
+                  icon={icon}
+                  name={name || "Provider"}
+                  color={effectiveIconColor}
+                  size={48}
+                />
+              </button>
+            </DialogTrigger>
+            <DialogContent
+              variant="fullscreen"
+              zIndex="top"
+              overlayClassName="bg-[hsl(var(--background))] backdrop-blur-0"
+              className="p-0 sm:rounded-none"
+            >
+              <div className="flex h-full flex-col">
+                <div className="flex-shrink-0 py-4 border-b border-border-default bg-muted/40">
+                  <div className="px-6 flex items-center gap-4">
+                    <DialogClose asChild>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        aria-label={t("common.back", { defaultValue: "返回" })}
+                      >
+                        <ArrowLeft className="h-4 w-4" />
+                      </Button>
+                    </DialogClose>
+                    <DialogTitle className="text-lg font-semibold leading-tight">
+                      {t("providerIcon.selectIcon", {
+                        defaultValue: "选择图标",
+                      })}
+                    </DialogTitle>
+                  </div>
+                </div>
+                <div className="flex-1 overflow-y-auto">
+                  <div className="space-y-2 px-6 py-6 w-full">
+                    <IconPicker
+                      value={icon}
+                      onValueChange={handleIconSelect}
+                      color={effectiveIconColor}
+                    />
+                    <div className="flex justify-end gap-2">
+                      <DialogClose asChild>
+                        <Button type="button" variant="outline">
+                          {t("common.done", { defaultValue: "完成" })}
+                        </Button>
+                      </DialogClose>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </DialogContent>
+          </Dialog>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <Label htmlFor="composite-provider-name">{t("provider.name")}</Label>
+            <Input
+              id="composite-provider-name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              placeholder={t("provider.namePlaceholder")}
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="composite-provider-notes">{t("provider.notes")}</Label>
+            <Input
+              id="composite-provider-notes"
+              value={notes}
+              onChange={(event) => setNotes(event.target.value)}
+              placeholder={t("provider.notesPlaceholder")}
+            />
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <Label htmlFor="composite-provider-website-url">
+            {t("provider.websiteUrl")}
+          </Label>
+          <Input
+            id="composite-provider-website-url"
+            value={websiteUrl}
+            onChange={(event) => setWebsiteUrl(event.target.value)}
+            placeholder={t("providerForm.websiteUrlPlaceholder")}
+          />
+        </div>
+
+        <section className="space-y-3">
+          <div className="space-y-1">
+            <h3 className="text-sm font-medium">
+              {t("combinedProvider.description", {
+                defaultValue: "按请求模型把流量路由到当前应用中的普通 Provider。",
+              })}
+            </h3>
+            <p className="text-xs text-muted-foreground">
+              {t("combinedProvider.providerStatusHint", {
+                defaultValue: "下方显示可用于组合路由的普通 Provider 及其模型探测状态。",
+              })}
+            </p>
+          </div>
           {ordinaryProviders.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
+            <p className="text-xs text-muted-foreground">
               {t("combinedProvider.noOrdinaryProviders", {
                 defaultValue: "当前应用还没有可用于组合的普通 Provider。",
               })}
@@ -246,26 +421,24 @@ export function CompositeProviderEditor({
                 return (
                   <div
                     key={ordinaryProvider.id}
-                    className="flex items-center justify-between rounded-lg border border-border/60 bg-background p-3"
+                    className="rounded-lg border border-border/50 bg-muted/20 p-3"
                   >
-                    <div>
-                      <p className="text-sm font-medium">{ordinaryProvider.name}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {state?.status === "ready"
-                          ? `${state.models.length} models`
-                          : state?.status === "detecting"
-                            ? t("combinedProvider.detectingModels", {
-                                defaultValue: "正在探测模型…",
+                    <p className="text-sm font-medium">{ordinaryProvider.name}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {state?.status === "ready"
+                        ? `${state.models.length} models`
+                        : state?.status === "detecting"
+                          ? t("combinedProvider.detectingModels", {
+                              defaultValue: "正在探测模型…",
+                            })
+                          : state?.status === "failed"
+                            ? t("combinedProvider.detectModelsFailed", {
+                                defaultValue: "模型探测失败，可手动填写。",
                               })
-                            : state?.status === "failed"
-                              ? t("combinedProvider.detectModelsFailed", {
-                                  defaultValue: "模型探测失败，可手动填写。",
-                                })
-                              : state?.status === "unavailable"
-                                ? state.message
-                                : ""}
-                      </p>
-                    </div>
+                            : state?.status === "unavailable"
+                              ? state.message
+                              : ""}
+                    </p>
                   </div>
                 );
               })}
@@ -273,10 +446,32 @@ export function CompositeProviderEditor({
           )}
         </section>
 
-        <section className="rounded-xl border border-border bg-card/50 p-4 space-y-4">
-          <h3 className="text-sm font-semibold">
-            {t("combinedProvider.mapping.title", { defaultValue: "模型映射" })}
-          </h3>
+        <section className="space-y-3">
+          <div className="space-y-1 border-t border-border/50 pt-4">
+            <h3 className="text-sm font-medium">
+              {t("combinedProvider.mapping.title", { defaultValue: "模型映射" })}
+            </h3>
+            <p className="text-xs text-muted-foreground">
+              {t("combinedProvider.mapping.hint", {
+                defaultValue: "为每个 Claude 模型角色选择普通 Provider，并指定要请求的上游模型。",
+              })}
+            </p>
+          </div>
+
+          <div className="hidden grid-cols-[120px_minmax(0,1fr)_minmax(0,1fr)] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
+            <span>
+              {t("providerForm.modelRoleLabel", {
+                defaultValue: "模型角色",
+              })}
+            </span>
+            <span>Provider</span>
+            <span>
+              {t("providerForm.requestModelLabel", {
+                defaultValue: "实际请求模型",
+              })}
+            </span>
+          </div>
+
           {roleLabels.map(({ role, key, defaultLabel }) => {
             const label = t(key, { defaultValue: defaultLabel });
             const selectedProvider = providers[mappings[role].providerId];
@@ -285,36 +480,60 @@ export function CompositeProviderEditor({
               : [];
 
             return (
-              <div key={role} className="grid gap-3 md:grid-cols-[160px_1fr_1fr] md:items-end">
-                <div className="text-sm font-medium">{label}</div>
-                <div className="space-y-2">
-                  <Label htmlFor={`combined-${role}-provider`}>{label} Provider</Label>
-                  <select
-                    id={`combined-${role}-provider`}
-                    aria-label={`${label} Provider`}
-                    value={mappings[role].providerId}
-                    onChange={(event) =>
+              <div
+                key={role}
+                className="grid grid-cols-1 gap-2 md:grid-cols-[120px_minmax(0,1fr)_minmax(0,1fr)]"
+              >
+                <div className="flex h-9 items-center rounded-md border border-input bg-muted px-3 text-sm font-medium text-muted-foreground">
+                  {label}
+                </div>
+                <div className="space-y-2 md:space-y-0">
+                  <Label
+                    htmlFor={`combined-${role}-provider`}
+                    className="md:hidden"
+                  >
+                    {label} Provider
+                  </Label>
+                  <Select
+                    value={mappings[role].providerId || NO_PROVIDER_VALUE}
+                    onValueChange={(value) =>
                       updateMapping(role, {
-                        providerId: event.target.value,
+                        providerId: value === NO_PROVIDER_VALUE ? "" : value,
                         upstreamModel: "",
                       })
                     }
-                    className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
                   >
-                    <option value="">
-                      {t("combinedProvider.selectProvider", {
-                        defaultValue: "选择 Provider",
-                      })}
-                    </option>
-                    {ordinaryProviders.map((ordinaryProvider) => (
-                      <option key={ordinaryProvider.id} value={ordinaryProvider.id}>
-                        {ordinaryProvider.name}
-                      </option>
-                    ))}
-                  </select>
+                    <SelectTrigger
+                      id={`combined-${role}-provider`}
+                      aria-label={`${label} Provider`}
+                    >
+                      <SelectValue
+                        placeholder={t("combinedProvider.selectProvider", {
+                          defaultValue: "选择 Provider",
+                        })}
+                      />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={NO_PROVIDER_VALUE}>
+                        {t("combinedProvider.selectProvider", {
+                          defaultValue: "选择 Provider",
+                        })}
+                      </SelectItem>
+                      {ordinaryProviders.map((ordinaryProvider) => (
+                        <SelectItem
+                          key={ordinaryProvider.id}
+                          value={ordinaryProvider.id}
+                        >
+                          {ordinaryProvider.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
-                <div className="space-y-2">
-                  <Label htmlFor={`combined-${role}-model`}>{label} Model</Label>
+                <div className="space-y-2 md:space-y-0">
+                  <Label htmlFor={`combined-${role}-model`} className="md:hidden">
+                    {label} Model
+                  </Label>
                   <Input
                     id={`combined-${role}-model`}
                     aria-label={`${label} Model`}
@@ -337,7 +556,7 @@ export function CompositeProviderEditor({
             );
           })}
         </section>
-      </div>
+      </form>
     </FullScreenPanel>
   );
 }
