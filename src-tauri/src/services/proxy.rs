@@ -217,14 +217,21 @@ impl ProxyService {
             .and_then(|meta| meta.model_router.as_ref())?;
 
         let mut default_model = None;
+        let mut default_display_name = None;
         let mut haiku_model = None;
+        let mut haiku_display_name = None;
         let mut sonnet_model = None;
+        let mut sonnet_display_name = None;
         let mut opus_model = None;
+        let mut opus_display_name = None;
 
         for route in &config.routes {
             match route.match_type {
                 crate::provider::ModelRouterMatchType::Default => {
                     default_model.get_or_insert("cc-switch-default".to_string());
+                    if default_display_name.is_none() {
+                        default_display_name = Self::model_router_route_display_name(route);
+                    }
                 }
                 crate::provider::ModelRouterMatchType::Role => match route
                     .match_value
@@ -235,12 +242,21 @@ impl ProxyService {
                 {
                     Some("haiku") => {
                         haiku_model.get_or_insert(CLAUDE_TAKEOVER_HAIKU_MODEL.to_string());
+                        if haiku_display_name.is_none() {
+                            haiku_display_name = Self::model_router_route_display_name(route);
+                        }
                     }
                     Some("sonnet") => {
                         sonnet_model.get_or_insert(CLAUDE_TAKEOVER_SONNET_MODEL.to_string());
+                        if sonnet_display_name.is_none() {
+                            sonnet_display_name = Self::model_router_route_display_name(route);
+                        }
                     }
                     Some("opus") => {
                         opus_model.get_or_insert(CLAUDE_TAKEOVER_OPUS_MODEL.to_string());
+                        if opus_display_name.is_none() {
+                            opus_display_name = Self::model_router_route_display_name(route);
+                        }
                     }
                     _ => {}
                 },
@@ -251,6 +267,7 @@ impl ProxyService {
         if haiku_model.is_none() && sonnet_model.is_none() && opus_model.is_none() {
             if let Some(model) = default_model.clone() {
                 sonnet_model = Some(model);
+                sonnet_display_name = default_display_name;
             }
         }
 
@@ -259,21 +276,21 @@ impl ProxyService {
             fields.push(("ANTHROPIC_DEFAULT_HAIKU_MODEL", model));
             fields.push((
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
-                "组合 Haiku".to_string(),
+                haiku_display_name.unwrap_or_else(|| "组合 Haiku".to_string()),
             ));
         }
         if let Some(model) = sonnet_model {
             fields.push(("ANTHROPIC_DEFAULT_SONNET_MODEL", model));
             fields.push((
                 "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
-                "组合 Sonnet".to_string(),
+                sonnet_display_name.unwrap_or_else(|| "组合 Sonnet".to_string()),
             ));
         }
         if let Some(model) = opus_model {
             fields.push(("ANTHROPIC_DEFAULT_OPUS_MODEL", model));
             fields.push((
                 "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
-                "组合 Opus".to_string(),
+                opus_display_name.unwrap_or_else(|| "组合 Opus".to_string()),
             ));
         }
 
@@ -353,6 +370,18 @@ impl ProxyService {
         if !display_name.is_empty() {
             fields.push((name_key, display_name));
         }
+    }
+
+    fn model_router_route_display_name(
+        route: &crate::provider::ModelRouterRule,
+    ) -> Option<String> {
+        route
+            .target
+            .as_ref()
+            .and_then(|target| target.upstream_model.as_deref())
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
     }
 
     fn claude_env_string<'a>(env: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -2629,7 +2658,7 @@ impl ProxyService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ProviderMeta;
+    use crate::provider::{ModelRouterProviderRef, ProviderMeta};
     use serial_test::serial;
     use std::env;
     use tempfile::TempDir;
@@ -2718,15 +2747,34 @@ mod tests {
                 routes: vec![
                     crate::provider::ModelRouterRule {
                         match_type: crate::provider::ModelRouterMatchType::Role,
+                        match_value: Some("haiku".to_string()),
+                        target: Some(ModelRouterProviderRef {
+                            provider_id: "haiku-provider".to_string(),
+                            upstream_model: Some("provider-haiku-model".to_string()),
+                            label: None,
+                        }),
+                        provider_chain: Vec::new(),
+                        fallbacks: Vec::new(),
+                    },
+                    crate::provider::ModelRouterRule {
+                        match_type: crate::provider::ModelRouterMatchType::Role,
                         match_value: Some("sonnet".to_string()),
-                        target: None,
+                        target: Some(ModelRouterProviderRef {
+                            provider_id: "sonnet-provider".to_string(),
+                            upstream_model: Some("provider-sonnet-model[1M]".to_string()),
+                            label: None,
+                        }),
                         provider_chain: Vec::new(),
                         fallbacks: Vec::new(),
                     },
                     crate::provider::ModelRouterRule {
                         match_type: crate::provider::ModelRouterMatchType::Role,
                         match_value: Some("opus".to_string()),
-                        target: None,
+                        target: Some(ModelRouterProviderRef {
+                            provider_id: "opus-provider".to_string(),
+                            upstream_model: Some("provider-opus-model [1M]".to_string()),
+                            label: None,
+                        }),
                         provider_chain: Vec::new(),
                         fallbacks: Vec::new(),
                     },
@@ -2753,10 +2801,66 @@ mod tests {
             .get("env")
             .and_then(|value| value.as_object())
             .expect("env should exist");
+        assert_env_str(env, "ANTHROPIC_DEFAULT_HAIKU_MODEL", Some("claude-haiku-4-5"));
+        assert_env_str(
+            env,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+            Some("provider-haiku-model"),
+        );
+        assert_env_str(env, "ANTHROPIC_DEFAULT_SONNET_MODEL", Some("claude-sonnet-4-6"));
+        assert_env_str(
+            env,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+            Some("provider-sonnet-model[1M]"),
+        );
+        assert_env_str(env, "ANTHROPIC_DEFAULT_OPUS_MODEL", Some("claude-opus-4-8"));
+        assert_env_str(
+            env,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+            Some("provider-opus-model [1M]"),
+        );
+    }
+
+    #[test]
+    fn model_router_claude_takeover_keeps_combo_label_without_upstream_model() {
+        let mut provider = Provider::with_id(
+            "router".to_string(),
+            "组合provider".to_string(),
+            json!({ "env": {} }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some("model_router".to_string()),
+            model_router: Some(crate::provider::ModelRouterConfig {
+                routes: vec![crate::provider::ModelRouterRule {
+                    match_type: crate::provider::ModelRouterMatchType::Role,
+                    match_value: Some("sonnet".to_string()),
+                    target: Some(ModelRouterProviderRef {
+                        provider_id: "sonnet-provider".to_string(),
+                        upstream_model: None,
+                        label: None,
+                    }),
+                    provider_chain: Vec::new(),
+                    fallbacks: Vec::new(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let mut live_config = json!({ "env": {} });
+        ProxyService::apply_claude_takeover_fields_for_provider(
+            &mut live_config,
+            "http://127.0.0.1:15721",
+            &provider,
+        );
+
+        let env = live_config
+            .get("env")
+            .and_then(|value| value.as_object())
+            .expect("env should exist");
         assert_env_str(env, "ANTHROPIC_DEFAULT_SONNET_MODEL", Some("claude-sonnet-4-6"));
         assert_env_str(env, "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME", Some("组合 Sonnet"));
-        assert_env_str(env, "ANTHROPIC_DEFAULT_OPUS_MODEL", Some("claude-opus-4-8"));
-        assert_env_str(env, "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME", Some("组合 Opus"));
     }
 
     #[test]
