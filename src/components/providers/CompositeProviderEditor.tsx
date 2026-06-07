@@ -3,6 +3,7 @@ import { ArrowLeft, Save } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogClose,
@@ -23,6 +24,11 @@ import { FullScreenPanel } from "@/components/common/FullScreenPanel";
 import { IconPicker } from "@/components/IconPicker";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { ModelInputWithFetch } from "@/components/providers/forms/shared";
+import {
+  hasClaudeOneMMarker,
+  setClaudeOneMMarker,
+  stripClaudeOneMMarker,
+} from "@/components/providers/forms/hooks/useModelState";
 import { getIconMetadata } from "@/icons/extracted/metadata";
 import type { Provider, ProviderModelRouterRule } from "@/types";
 import type { AppId } from "@/lib/api";
@@ -68,6 +74,33 @@ const roleLabels: Array<{ role: CompositeRole; key: string; defaultLabel: string
   { role: "sonnet", key: "combinedProvider.mapping.sonnet", defaultLabel: "Sonnet" },
   { role: "opus", key: "combinedProvider.mapping.opus", defaultLabel: "Opus" },
 ];
+
+const supportsClaudeOneM = (appId: AppId, role: CompositeRole): boolean =>
+  appId === "claude" && role !== "haiku";
+
+const getVisibleModelValue = (appId: AppId, upstreamModel: string): string =>
+  appId === "claude" ? stripClaudeOneMMarker(upstreamModel) : upstreamModel;
+
+const mappingGridClassName = (appId: AppId): string =>
+  appId === "claude"
+    ? "md:grid-cols-[120px_minmax(0,1fr)_minmax(0,1fr)_120px]"
+    : "md:grid-cols-[120px_minmax(0,1fr)_minmax(0,1fr)]";
+
+const getStoredModelValue = (
+  appId: AppId,
+  role: CompositeRole,
+  currentUpstreamModel: string,
+  nextVisibleModel: string,
+): string => {
+  if (appId !== "claude") return nextVisibleModel;
+  if (supportsClaudeOneM(appId, role)) {
+    return setClaudeOneMMarker(
+      nextVisibleModel,
+      hasClaudeOneMMarker(currentUpstreamModel),
+    );
+  }
+  return stripClaudeOneMMarker(nextVisibleModel);
+};
 
 const routeToMappings = (routes: ProviderModelRouterRule[]): CompositeMappings => {
   const mappings = emptyMappings();
@@ -459,7 +492,7 @@ export function CompositeProviderEditor({
             </p>
           </div>
 
-          <div className="hidden grid-cols-[120px_minmax(0,1fr)_minmax(0,1fr)] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
+          <div className={`hidden grid-cols-1 gap-2 px-1 text-xs font-medium text-muted-foreground md:grid ${mappingGridClassName(appId)}`}>
             <span>
               {t("providerForm.modelRoleLabel", {
                 defaultValue: "模型角色",
@@ -471,18 +504,28 @@ export function CompositeProviderEditor({
                 defaultValue: "实际请求模型",
               })}
             </span>
+            {appId === "claude" ? (
+              <span>
+                {t("providerForm.modelOneMHeader", {
+                  defaultValue: "声明支持 1M",
+                })}
+              </span>
+            ) : null}
           </div>
 
           {roleLabels.map(({ role, key, defaultLabel }) => {
             const label = t(key, { defaultValue: defaultLabel });
-            const selectedProvider = providers[mappings[role].providerId];
+            const mapping = mappings[role];
+            const selectedProvider = providers[mapping.providerId];
             const state = selectedProvider ? detection[selectedProvider.id] : undefined;
             const models = state?.models ?? [];
+            const oneMSupported = supportsClaudeOneM(appId, role);
+            const oneMChecked = hasClaudeOneMMarker(mapping.upstreamModel);
 
             return (
               <div
                 key={role}
-                className="grid grid-cols-1 gap-2 md:grid-cols-[120px_minmax(0,1fr)_minmax(0,1fr)]"
+                className={`grid grid-cols-1 gap-2 ${mappingGridClassName(appId)}`}
               >
                 <div className="flex h-9 items-center rounded-md border border-input bg-muted px-3 text-sm font-medium text-muted-foreground">
                   {label}
@@ -495,7 +538,7 @@ export function CompositeProviderEditor({
                     {label} Provider
                   </Label>
                   <Select
-                    value={mappings[role].providerId || NO_PROVIDER_VALUE}
+                    value={mapping.providerId || NO_PROVIDER_VALUE}
                     onValueChange={(value) =>
                       updateMapping(role, {
                         providerId: value === NO_PROVIDER_VALUE ? "" : value,
@@ -536,8 +579,17 @@ export function CompositeProviderEditor({
                   </Label>
                   <ModelInputWithFetch
                     id={`combined-${role}-model`}
-                    value={mappings[role].upstreamModel}
-                    onChange={(value) => updateMapping(role, { upstreamModel: value })}
+                    value={getVisibleModelValue(appId, mapping.upstreamModel)}
+                    onChange={(value) =>
+                      updateMapping(role, {
+                        upstreamModel: getStoredModelValue(
+                          appId,
+                          role,
+                          mapping.upstreamModel,
+                          value,
+                        ),
+                      })
+                    }
                     placeholder={t("combinedProvider.manualModelPlaceholder", {
                       defaultValue: "选择或手动输入模型",
                     })}
@@ -547,6 +599,32 @@ export function CompositeProviderEditor({
                     dropdownAriaLabel={`${label} Model options`}
                   />
                 </div>
+                {appId === "claude" ? (
+                  <div className="flex h-9 items-center gap-2">
+                    {oneMSupported ? (
+                      <>
+                        <Checkbox
+                          id={`combined-${role}-one-m`}
+                          checked={oneMChecked}
+                          onCheckedChange={(checked) =>
+                            updateMapping(role, {
+                              upstreamModel: setClaudeOneMMarker(
+                                mapping.upstreamModel,
+                                checked === true,
+                              ),
+                            })
+                          }
+                        />
+                        <Label
+                          htmlFor={`combined-${role}-one-m`}
+                          className="cursor-pointer text-sm font-normal"
+                        >
+                          {label} {t("providerForm.modelOneMLabel", { defaultValue: "1M" })}
+                        </Label>
+                      </>
+                    ) : null}
+                  </div>
+                ) : null}
               </div>
             );
           })}

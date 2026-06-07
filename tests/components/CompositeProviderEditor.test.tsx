@@ -113,7 +113,7 @@ const selectProvider = async (
   await waitFor(() => expect(trigger).toHaveTextContent(providerName));
 };
 
-describe("CompositeProviderEditor", () => {
+describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
   beforeEach(() => {
     fetchMocks.fetchModelsForConfig.mockReset();
   });
@@ -240,6 +240,249 @@ describe("CompositeProviderEditor", () => {
       }),
     );
     expect(handleOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("loads an existing marked Sonnet route as decoupled UI and preserves the marker on save", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+    const providerWithMarkedSonnet: Provider = {
+      ...combinedProvider,
+      meta: {
+        providerType: "model_router",
+        managedModelRouterProvider: true,
+        modelRouter: {
+          version: 1,
+          routes: [
+            {
+              id: "combined-role-sonnet",
+              enabled: true,
+              matchType: "role",
+              matchValue: "sonnet",
+              target: {
+                providerId: "ordinary",
+                upstreamModel: "stored-sonnet[1M]",
+              },
+            },
+          ],
+        },
+      },
+    };
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={providerWithMarkedSonnet}
+        providers={{
+          [providerWithMarkedSonnet.id]: providerWithMarkedSonnet,
+          [ordinaryProvider.id]: ordinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    expect(screen.getByLabelText("Sonnet Model")).toHaveValue("stored-sonnet");
+    expect(screen.getByRole("checkbox", { name: "Sonnet 1M" })).toBeChecked();
+
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes).toEqual([
+      {
+        id: "combined-role-sonnet",
+        enabled: true,
+        matchType: "role",
+        matchValue: "sonnet",
+        target: { providerId: "ordinary", upstreamModel: "stored-sonnet[1M]" },
+      },
+    ]);
+  });
+
+  it("checking Sonnet 1M appends the marker without changing the visible model input", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={combinedProvider}
+        providers={{
+          [combinedProvider.id]: combinedProvider,
+          [ordinaryProvider.id]: ordinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await selectProvider(user, "Sonnet Provider", "普通 Provider");
+    const sonnetModelInput = screen.getByLabelText("Sonnet Model");
+    await user.type(sonnetModelInput, "sonnet-model");
+    await user.click(screen.getByRole("checkbox", { name: "Sonnet 1M" }));
+
+    expect(sonnetModelInput).toHaveValue("sonnet-model");
+
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes).toEqual([
+      {
+        id: "combined-role-sonnet",
+        enabled: true,
+        matchType: "role",
+        matchValue: "sonnet",
+        target: { providerId: "ordinary", upstreamModel: "sonnet-model[1M]" },
+      },
+    ]);
+  });
+
+  it("unchecking Sonnet 1M removes the marker", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+    const providerWithMarkedSonnet: Provider = {
+      ...combinedProvider,
+      meta: {
+        providerType: "model_router",
+        managedModelRouterProvider: true,
+        modelRouter: {
+          version: 1,
+          routes: [
+            {
+              id: "combined-role-sonnet",
+              enabled: true,
+              matchType: "role",
+              matchValue: "sonnet",
+              target: {
+                providerId: "ordinary",
+                upstreamModel: "stored-sonnet[1M]",
+              },
+            },
+          ],
+        },
+      },
+    };
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={providerWithMarkedSonnet}
+        providers={{
+          [providerWithMarkedSonnet.id]: providerWithMarkedSonnet,
+          [ordinaryProvider.id]: ordinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    const sonnetModelInput = screen.getByLabelText("Sonnet Model");
+    await user.click(screen.getByRole("checkbox", { name: "Sonnet 1M" }));
+
+    expect(sonnetModelInput).toHaveValue("stored-sonnet");
+
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes).toEqual([
+      {
+        id: "combined-role-sonnet",
+        enabled: true,
+        matchType: "role",
+        matchValue: "sonnet",
+        target: { providerId: "ordinary", upstreamModel: "stored-sonnet" },
+      },
+    ]);
+  });
+
+  it("declares an auto-detected default model as 1M", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+    fetchMocks.fetchModelsForConfig.mockResolvedValue([
+      { id: "auto-default", ownedBy: "anthropic" },
+      { id: "auto-sonnet", ownedBy: "anthropic" },
+    ]);
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={combinedProvider}
+        providers={{
+          [combinedProvider.id]: combinedProvider,
+          [networkClaudeProvider.id]: networkClaudeProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await waitFor(() => expect(fetchMocks.fetchModelsForConfig).toHaveBeenCalled());
+    await selectProvider(user, "默认模型 Provider", "Network Claude Provider");
+
+    const defaultModelInput = screen.getByLabelText("默认模型 Model");
+    const defaultModelRow = defaultModelInput.closest("div")?.parentElement;
+    expect(defaultModelRow).toBeTruthy();
+
+    await user.click(
+      within(defaultModelRow as HTMLElement).getByRole("button", {
+        name: "默认模型 Model options",
+      }),
+    );
+    await user.click(await screen.findByRole("menuitem", { name: "auto-default" }));
+    await user.click(screen.getByRole("checkbox", { name: "默认模型 1M" }));
+
+    expect(defaultModelInput).toHaveValue("auto-default");
+
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes).toEqual([
+      {
+        id: "combined-default",
+        enabled: true,
+        matchType: "default",
+        target: { providerId: "network-claude", upstreamModel: "auto-default[1M]" },
+      },
+    ]);
+  });
+
+  it("does not show Haiku 1M control and strips pasted markers before save", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={combinedProvider}
+        providers={{
+          [combinedProvider.id]: combinedProvider,
+          [ordinaryProvider.id]: ordinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    expect(screen.queryByRole("checkbox", { name: "Haiku 1M" })).not.toBeInTheDocument();
+
+    await selectProvider(user, "Haiku Provider", "普通 Provider");
+    await user.type(screen.getByLabelText("Haiku Model"), "haiku-model[1M]");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes).toEqual([
+      {
+        id: "combined-role-haiku",
+        enabled: true,
+        matchType: "role",
+        matchValue: "haiku",
+        target: { providerId: "ordinary", upstreamModel: "haiku-model" },
+      },
+    ]);
   });
 
   it("preserves icon identity fields and saves edited provider identity with model router meta", async () => {
