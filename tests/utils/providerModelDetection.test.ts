@@ -174,6 +174,15 @@ describe("providerModelDetection", () => {
             matchValue: "sonnet",
             target: { providerId: "stale", upstreamModel: "stale" },
           },
+          {
+            matchType: "role",
+            matchValue: "haiku",
+            target: { providerId: "stale", upstreamModel: "stale" },
+          },
+          {
+            matchType: "default",
+            target: { providerId: "stale", upstreamModel: "stale" },
+          },
         ],
         {
           default: { providerId: "p1", upstreamModel: "default-model" },
