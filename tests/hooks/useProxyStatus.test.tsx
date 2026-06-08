@@ -7,12 +7,25 @@ import { createTestQueryClient } from "../utils/testQueryClient";
 
 const toastSuccessMock = vi.fn();
 const toastErrorMock = vi.fn();
+const toastWarningMock = vi.fn();
 const invokeMock = vi.fn();
+const providersApiGetCurrentMock = vi.fn();
+const providersApiGetAllMock = vi.fn();
+const providersApiSwitchMock = vi.fn();
 
 vi.mock("sonner", () => ({
   toast: {
     success: (...args: unknown[]) => toastSuccessMock(...args),
     error: (...args: unknown[]) => toastErrorMock(...args),
+    warning: (...args: unknown[]) => toastWarningMock(...args),
+  },
+}));
+
+vi.mock("@/lib/api", () => ({
+  providersApi: {
+    getCurrent: (...args: unknown[]) => providersApiGetCurrentMock(...args),
+    getAll: (...args: unknown[]) => providersApiGetAllMock(...args),
+    switch: (...args: unknown[]) => providersApiSwitchMock(...args),
   },
 }));
 
@@ -55,6 +68,14 @@ describe("useProxyStatus", () => {
     invokeMock.mockReset();
     toastSuccessMock.mockReset();
     toastErrorMock.mockReset();
+    toastWarningMock.mockReset();
+    providersApiGetCurrentMock.mockReset();
+    providersApiGetAllMock.mockReset();
+    providersApiSwitchMock.mockReset();
+
+    providersApiGetCurrentMock.mockResolvedValue(null);
+    providersApiGetAllMock.mockResolvedValue({});
+    providersApiSwitchMock.mockResolvedValue({ warnings: [] });
 
     invokeMock.mockImplementation((command: string) => {
       if (command === "get_proxy_status") {
@@ -114,5 +135,72 @@ describe("useProxyStatus", () => {
       "代理服务已启动 - 127.0.0.1:15721",
       { closeButton: true },
     );
+  });
+
+  it("switches Claude away from managed combined provider when disabling local route", async () => {
+    const { wrapper, queryClient } = createWrapper();
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    providersApiGetCurrentMock.mockResolvedValueOnce(
+      "cc-switch-combined-provider",
+    );
+    providersApiGetAllMock.mockResolvedValueOnce({
+      "cc-switch-combined-provider": {
+        id: "cc-switch-combined-provider",
+        name: "组合provider",
+        settingsConfig: {},
+        category: "custom",
+        sortIndex: 0,
+        createdAt: 1,
+        meta: {
+          providerType: "model_router",
+          managedModelRouterProvider: true,
+          modelRouter: { version: 1, routes: [] },
+        },
+      },
+      alpha: {
+        id: "alpha",
+        name: "Alpha",
+        settingsConfig: {},
+        category: "custom",
+        sortIndex: 5,
+        createdAt: 1,
+      },
+      beta: {
+        id: "beta",
+        name: "Beta",
+        settingsConfig: {},
+        category: "custom",
+        sortIndex: 1,
+        createdAt: 9,
+      },
+      aardvark: {
+        id: "aardvark",
+        name: "Aardvark",
+        settingsConfig: {},
+        category: "custom",
+        createdAt: 0,
+      },
+    });
+
+    const { result } = renderHook(() => useProxyStatus(), { wrapper });
+
+    await waitFor(() => {
+      expect(result.current.isLoading).toBe(false);
+    });
+
+    await act(async () => {
+      await result.current.setTakeoverForApp({
+        appType: "claude",
+        enabled: false,
+      });
+    });
+
+    expect(providersApiSwitchMock).toHaveBeenCalledWith("beta", "claude");
+    expect(toastWarningMock).toHaveBeenCalledWith(
+      "[警告]组合provider只在本地路由开启的时候有效，已自动重定向到优先级最高的非组合provider",
+    );
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ["providers", "claude"],
+    });
   });
 });

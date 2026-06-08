@@ -2,6 +2,7 @@
  * 代理服务状态管理 Hook
  */
 
+import { useCallback } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
@@ -11,6 +12,10 @@ import type {
   ProxyServerInfo,
   ProxyTakeoverStatus,
 } from "@/types/proxy";
+import type { Provider } from "@/types";
+import { providersApi, type AppId } from "@/lib/api";
+import { sortProviders } from "@/lib/query/queries";
+import { isManagedCombinedProvider } from "@/utils/combinedProviderUtils";
 import { extractErrorMessage } from "@/utils/errorUtils";
 
 /**
@@ -120,11 +125,49 @@ export function useProxyStatus() {
     },
   });
 
+  const switchManagedCombinedProviderIfLocalRouteDisabled = useCallback(
+    async (appId: AppId) => {
+      try {
+        const currentProviderId = await providersApi.getCurrent(appId);
+        if (!currentProviderId) return;
+
+        const allProviders = await providersApi.getAll(appId);
+        const currentProvider = allProviders[currentProviderId];
+        if (!isManagedCombinedProvider(currentProvider)) return;
+
+        const fallbackProvider = Object.values(
+          sortProviders(allProviders),
+        ).find((provider: Provider) => !isManagedCombinedProvider(provider));
+        if (!fallbackProvider) return;
+
+        await providersApi.switch(fallbackProvider.id, appId);
+        await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
+        toast.warning(
+          t("notifications.modelRouterLocalRouteDisabledRedirect", {
+            defaultValue:
+              "[警告]组合provider只在本地路由开启的时候有效，已自动重定向到优先级最高的非组合provider",
+          }),
+        );
+      } catch (error) {
+        console.warn(
+          `[useProxyStatus] Failed to switch ${appId} away from managed combined provider`,
+          error,
+        );
+        toast.error(
+          t("notifications.modelRouterFallbackSwitchFailed", {
+            defaultValue: "组合 Provider 已关闭，但自动切换当前供应商失败",
+          }),
+        );
+      }
+    },
+    [queryClient, t],
+  );
+
   // 按应用开启/关闭接管
   const setTakeoverForAppMutation = useMutation({
     mutationFn: ({ appType, enabled }: { appType: string; enabled: boolean }) =>
       invoke("set_proxy_takeover_for_app", { appType, enabled }),
-    onSuccess: (_data, variables) => {
+    onSuccess: async (_data, variables) => {
       const appLabel =
         variables.appType === "claude"
           ? "Claude"
@@ -146,6 +189,12 @@ export function useProxyStatus() {
             }),
         { closeButton: true },
       );
+
+      if (!variables.enabled) {
+        await switchManagedCombinedProviderIfLocalRouteDisabled(
+          variables.appType as AppId,
+        );
+      }
 
       queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
       queryClient.invalidateQueries({ queryKey: ["proxyTakeoverStatus"] });
