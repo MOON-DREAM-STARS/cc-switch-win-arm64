@@ -58,7 +58,10 @@ export function useManagedCombinedProvider({
         try {
           await providersApi.updateTrayMenu();
         } catch (error) {
-          console.error("Failed to update tray menu after combined provider sync", error);
+          console.error(
+            "Failed to update tray menu after combined provider sync",
+            error,
+          );
         }
       } catch (error) {
         console.error("Failed to sync managed combined provider", error);
@@ -69,10 +72,21 @@ export function useManagedCombinedProvider({
     void persist();
   }, [appId, enabled, isLoading, providers, queryClient]);
 
-  const visibleProviders = useMemo(
-    () => filterManagedCombinedProvider(providers, enabled),
-    [enabled, providers],
-  );
+  const visibleProviders = useMemo(() => {
+    if (!enabled) {
+      return filterManagedCombinedProvider(providers, false);
+    }
+
+    const existing = providers[COMBINED_PROVIDER_ID];
+    const managed = existing
+      ? normalizeManagedCombinedProvider(existing)
+      : createManagedCombinedProvider();
+
+    return {
+      ...providers,
+      [COMBINED_PROVIDER_ID]: managed,
+    };
+  }, [enabled, providers]);
 
   return { visibleProviders };
 }

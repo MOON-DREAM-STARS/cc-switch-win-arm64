@@ -23,6 +23,17 @@ import {
   extractCodexWireApi,
   isCodexChatWireApi,
 } from "@/utils/providerConfigUtils";
+import { isManagedCombinedProvider } from "@/utils/combinedProviderUtils";
+
+const APP_LABELS: Record<AppId, string> = {
+  claude: "Claude",
+  "claude-desktop": "Claude Desktop",
+  codex: "Codex",
+  gemini: "Gemini",
+  opencode: "OpenCode",
+  openclaw: "OpenClaw",
+  hermes: "Hermes",
+};
 
 /**
  * Hook for managing provider actions (add, update, delete, switch)
@@ -31,7 +42,7 @@ import {
 export function useProviderActions(
   activeApp: AppId,
   isProxyRunning?: boolean,
-  isProxyTakeover?: boolean,
+  isLocalRouteActive?: boolean,
 ) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -151,6 +162,17 @@ export function useProviderActions(
   // 切换供应商
   const switchProvider = useCallback(
     async (provider: Provider) => {
+      if (isManagedCombinedProvider(provider) && !isLocalRouteActive) {
+        const appLabel = APP_LABELS[activeApp] ?? activeApp;
+        toast.warning(
+          t("notifications.localRouteRequiredForEnable", {
+            app: appLabel,
+            defaultValue: `请启用${appLabel}的本地路由`,
+          }),
+        );
+        return;
+      }
+
       const isCopilotProvider =
         activeApp === "claude" &&
         provider.meta?.providerType === "github_copilot";
@@ -217,8 +239,12 @@ export function useProviderActions(
         );
       }
 
-      // Block official providers when proxy takeover is active
-      if (isProxyTakeover && provider.category === "official") {
+      // Block official providers when local routing is active
+      if (
+        isLocalRouteActive &&
+        provider.category === "official" &&
+        !isManagedCombinedProvider(provider)
+      ) {
         toast.error(
           t("notifications.officialBlockedByProxy", {
             defaultValue:
@@ -277,7 +303,7 @@ export function useProviderActions(
       syncClaudePlugin,
       activeApp,
       isProxyRunning,
-      isProxyTakeover,
+      isLocalRouteActive,
       t,
     ],
   );
