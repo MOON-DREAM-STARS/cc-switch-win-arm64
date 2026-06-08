@@ -75,8 +75,8 @@ const roleLabels: Array<{ role: CompositeRole; key: string; defaultLabel: string
   { role: "opus", key: "combinedProvider.mapping.opus", defaultLabel: "Opus" },
 ];
 
-const supportsClaudeOneM = (appId: AppId, role: CompositeRole): boolean =>
-  appId === "claude" && role !== "haiku";
+const supportsClaudeOneM = (appId: AppId, _role: CompositeRole): boolean =>
+  appId === "claude";
 
 const getVisibleModelValue = (appId: AppId, upstreamModel: string): string =>
   appId === "claude" ? stripClaudeOneMMarker(upstreamModel) : upstreamModel;

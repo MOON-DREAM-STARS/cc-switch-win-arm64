@@ -137,10 +137,17 @@ describe("providerModelDetection", () => {
       buildCompositeRoutes([], {
         default: { providerId: "", upstreamModel: "" },
         sonnet: { providerId: "p1", upstreamModel: "sonnet-model[1M]" },
-        haiku: { providerId: "", upstreamModel: "" },
+        haiku: { providerId: "p2", upstreamModel: "haiku-model[1M]" },
         opus: { providerId: "", upstreamModel: "" },
       }),
     ).toEqual([
+      {
+        id: "combined-role-haiku",
+        enabled: true,
+        matchType: "role",
+        matchValue: "haiku",
+        target: { providerId: "p2", upstreamModel: "haiku-model[1M]" },
+      },
       {
         id: "combined-role-sonnet",
         enabled: true,

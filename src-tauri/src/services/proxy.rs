@@ -241,19 +241,28 @@ impl ProxyService {
                     .as_deref()
                 {
                     Some("haiku") => {
-                        haiku_model.get_or_insert(CLAUDE_TAKEOVER_HAIKU_MODEL.to_string());
+                        haiku_model.get_or_insert(Self::model_router_takeover_model(
+                            CLAUDE_TAKEOVER_HAIKU_MODEL,
+                            route,
+                        ));
                         if haiku_display_name.is_none() {
                             haiku_display_name = Self::model_router_route_display_name(route);
                         }
                     }
                     Some("sonnet") => {
-                        sonnet_model.get_or_insert(CLAUDE_TAKEOVER_SONNET_MODEL.to_string());
+                        sonnet_model.get_or_insert(Self::model_router_takeover_model(
+                            CLAUDE_TAKEOVER_SONNET_MODEL,
+                            route,
+                        ));
                         if sonnet_display_name.is_none() {
                             sonnet_display_name = Self::model_router_route_display_name(route);
                         }
                     }
                     Some("opus") => {
-                        opus_model.get_or_insert(CLAUDE_TAKEOVER_OPUS_MODEL.to_string());
+                        opus_model.get_or_insert(Self::model_router_takeover_model(
+                            CLAUDE_TAKEOVER_OPUS_MODEL,
+                            route,
+                        ));
                         if opus_display_name.is_none() {
                             opus_display_name = Self::model_router_route_display_name(route);
                         }
@@ -321,7 +330,7 @@ impl ProxyService {
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
             "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
             CLAUDE_TAKEOVER_HAIKU_MODEL,
-            false,
+            true,
             haiku_model,
         );
         Self::push_claude_takeover_role_fields(
@@ -370,6 +379,22 @@ impl ProxyService {
         if !display_name.is_empty() {
             fields.push((name_key, display_name));
         }
+    }
+
+    fn model_router_takeover_model(
+        takeover_model: &'static str,
+        route: &crate::provider::ModelRouterRule,
+    ) -> String {
+        let mut client_model = takeover_model.to_string();
+        if route
+            .target
+            .as_ref()
+            .and_then(|target| target.upstream_model.as_deref())
+            .is_some_and(Self::has_claude_one_m_marker)
+        {
+            client_model.push_str(CLAUDE_ONE_M_MARKER_FOR_CLIENT);
+        }
+        client_model
     }
 
     fn model_router_route_display_name(
@@ -2750,7 +2775,7 @@ mod tests {
                         match_value: Some("haiku".to_string()),
                         target: Some(ModelRouterProviderRef {
                             provider_id: "haiku-provider".to_string(),
-                            upstream_model: Some("provider-haiku-model".to_string()),
+                            upstream_model: Some("provider-haiku-model[1M]".to_string()),
                             label: None,
                         }),
                         provider_chain: Vec::new(),
@@ -2801,19 +2826,31 @@ mod tests {
             .get("env")
             .and_then(|value| value.as_object())
             .expect("env should exist");
-        assert_env_str(env, "ANTHROPIC_DEFAULT_HAIKU_MODEL", Some("claude-haiku-4-5"));
+        assert_env_str(
+            env,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            Some("claude-haiku-4-5[1M]"),
+        );
         assert_env_str(
             env,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
-            Some("provider-haiku-model"),
+            Some("provider-haiku-model[1M]"),
         );
-        assert_env_str(env, "ANTHROPIC_DEFAULT_SONNET_MODEL", Some("claude-sonnet-4-6"));
+        assert_env_str(
+            env,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            Some("claude-sonnet-4-6[1M]"),
+        );
         assert_env_str(
             env,
             "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
             Some("provider-sonnet-model[1M]"),
         );
-        assert_env_str(env, "ANTHROPIC_DEFAULT_OPUS_MODEL", Some("claude-opus-4-8"));
+        assert_env_str(
+            env,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            Some("claude-opus-4-8[1M]"),
+        );
         assert_env_str(
             env,
             "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
@@ -2987,7 +3024,7 @@ mod tests {
                 "env": {
                     "ANTHROPIC_BASE_URL": "https://chatgpt.com/backend-api/codex",
                     "ANTHROPIC_MODEL": "gpt-5.4",
-                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.4-mini",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.4-mini[1M]",
                     "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.4",
                     "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-5.4"
                 }
@@ -3026,7 +3063,7 @@ mod tests {
         assert_env_str(
             env,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-            Some("claude-haiku-4-5"),
+            Some("claude-haiku-4-5[1M]"),
         );
         assert_env_str(
             env,
