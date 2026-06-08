@@ -38,6 +38,21 @@ const MANAGED_ROUTE_IDS = new Set([
   "combined-role-opus",
 ]);
 
+const MANAGED_ROUTE_ROLES = new Set<CompositeRole>([
+  "default",
+  "haiku",
+  "sonnet",
+  "opus",
+]);
+
+const isManagedCompositeRoute = (route: ProviderModelRouterRule): boolean => {
+  if (route.id && MANAGED_ROUTE_IDS.has(route.id)) return true;
+  if (route.matchType === "default") return true;
+  if (route.matchType !== "role") return false;
+  const role = asString(route.matchValue).toLowerCase() as CompositeRole;
+  return MANAGED_ROUTE_ROLES.has(role);
+};
+
 const asRecord = (value: unknown): Record<string, any> =>
   value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, any>)
@@ -225,7 +240,7 @@ export const buildCompositeRoutes = (
   mappings: CompositeMappings,
 ): ProviderModelRouterRule[] => {
   const preserved = existingRoutes.filter(
-    (route) => !route.id || !MANAGED_ROUTE_IDS.has(route.id),
+    (route) => !isManagedCompositeRoute(route),
   );
   const managed = (["default", "haiku", "sonnet", "opus"] as const)
     .map((role) => makeManagedRoute(role, mappings[role]))
