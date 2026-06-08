@@ -449,7 +449,7 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     ]);
   });
 
-  it("does not show Haiku 1M control and strips pasted markers before save", async () => {
+  it("shows Haiku 1M control and preserves the marker on save", async () => {
     const user = userEvent.setup();
     const handleSubmit = vi.fn().mockResolvedValue(undefined);
 
@@ -467,10 +467,13 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
       />,
     );
 
-    expect(screen.queryByRole("checkbox", { name: "Haiku 1M" })).not.toBeInTheDocument();
-
     await selectProvider(user, "Haiku Provider", "普通 Provider");
-    await user.type(screen.getByLabelText("Haiku Model"), "haiku-model[1M]");
+    const haikuModelInput = screen.getByLabelText("Haiku Model");
+    await user.type(haikuModelInput, "haiku-model");
+    await user.click(screen.getByRole("checkbox", { name: "Haiku 1M" }));
+
+    expect(haikuModelInput).toHaveValue("haiku-model");
+
     await user.click(screen.getByRole("button", { name: "保存" }));
 
     await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
@@ -480,7 +483,64 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
         enabled: true,
         matchType: "role",
         matchValue: "haiku",
-        target: { providerId: "ordinary", upstreamModel: "haiku-model" },
+        target: { providerId: "ordinary", upstreamModel: "haiku-model[1M]" },
+      },
+    ]);
+  });
+
+  it("loads an existing marked Haiku route as decoupled UI and preserves the marker on save", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+    const providerWithMarkedHaiku: Provider = {
+      ...combinedProvider,
+      meta: {
+        providerType: "model_router",
+        managedModelRouterProvider: true,
+        modelRouter: {
+          version: 1,
+          routes: [
+            {
+              id: "combined-role-haiku",
+              enabled: true,
+              matchType: "role",
+              matchValue: "haiku",
+              target: {
+                providerId: "ordinary",
+                upstreamModel: "stored-haiku[1M]",
+              },
+            },
+          ],
+        },
+      },
+    };
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={providerWithMarkedHaiku}
+        providers={{
+          [providerWithMarkedHaiku.id]: providerWithMarkedHaiku,
+          [ordinaryProvider.id]: ordinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    expect(screen.getByLabelText("Haiku Model")).toHaveValue("stored-haiku");
+    expect(screen.getByRole("checkbox", { name: "Haiku 1M" })).toBeChecked();
+
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes).toEqual([
+      {
+        id: "combined-role-haiku",
+        enabled: true,
+        matchType: "role",
+        matchValue: "haiku",
+        target: { providerId: "ordinary", upstreamModel: "stored-haiku[1M]" },
       },
     ]);
   });
