@@ -106,6 +106,20 @@ function createProvider(overrides: Partial<Provider> = {}): Provider {
   };
 }
 
+function createManagedCombinedProvider(
+  overrides: Partial<Provider> = {},
+): Provider {
+  return createProvider({
+    id: "cc-switch-combined-provider",
+    name: "组合provider",
+    meta: {
+      providerType: "model_router",
+      managedModelRouterProvider: true,
+    },
+    ...overrides,
+  });
+}
+
 beforeEach(() => {
   addProviderMutateAsync.mockReset();
   updateProviderMutateAsync.mockReset();
@@ -240,6 +254,61 @@ describe("useProviderActions", () => {
 
     expect(toastWarningMock).toHaveBeenCalledTimes(1);
     expect(switchProviderMutateAsync).toHaveBeenCalledWith(provider.id);
+  });
+
+  it("warns and does not switch managed combined provider when local route is inactive", async () => {
+    switchProviderMutateAsync.mockResolvedValueOnce(undefined);
+    const { wrapper } = createWrapper();
+    const provider = createManagedCombinedProvider();
+
+    const { result } = renderHook(
+      () => useProviderActions("codex", true, false),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await result.current.switchProvider(provider);
+    });
+
+    expect(toastWarningMock).toHaveBeenCalledTimes(1);
+    expect(toastWarningMock).toHaveBeenCalledWith("请启用Codex的本地路由");
+    expect(switchProviderMutateAsync).not.toHaveBeenCalled();
+  });
+
+  it("switches managed combined provider when local route is active", async () => {
+    switchProviderMutateAsync.mockResolvedValueOnce(undefined);
+    const { wrapper } = createWrapper();
+    const provider = createManagedCombinedProvider();
+
+    const { result } = renderHook(
+      () => useProviderActions("codex", true, true),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await result.current.switchProvider(provider);
+    });
+
+    expect(switchProviderMutateAsync).toHaveBeenCalledWith(provider.id);
+    expect(toastWarningMock).not.toHaveBeenCalled();
+  });
+
+  it("blocks ordinary official provider when local route is active", async () => {
+    switchProviderMutateAsync.mockResolvedValueOnce(undefined);
+    const { wrapper } = createWrapper();
+    const provider = createProvider({ category: "official" });
+
+    const { result } = renderHook(
+      () => useProviderActions("claude", true, true),
+      { wrapper },
+    );
+
+    await act(async () => {
+      await result.current.switchProvider(provider);
+    });
+
+    expect(toastErrorMock).toHaveBeenCalledTimes(1);
+    expect(switchProviderMutateAsync).not.toHaveBeenCalled();
   });
 
   it("should sync plugin config when switching Claude provider with integration enabled", async () => {
