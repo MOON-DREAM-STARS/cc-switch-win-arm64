@@ -19,7 +19,7 @@ import type {
 } from "@/types";
 import { usageKeys } from "@/lib/query/usage";
 
-const sortProviders = (
+export const sortProviders = (
   providers: Record<string, Provider>,
 ): Record<string, Provider> => {
   const sortedEntries = Object.values(providers)

@@ -2,10 +2,15 @@ import { useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
-import { providersApi, settingsApi } from "@/lib/api";
+import { providersApi, settingsApi, type AppId } from "@/lib/api";
 import { syncCurrentProvidersLiveSafe } from "@/utils/postChangeSync";
-import { useSettingsQuery, useSaveSettingsMutation } from "@/lib/query";
-import type { Settings } from "@/types";
+import {
+  sortProviders,
+  useSettingsQuery,
+  useSaveSettingsMutation,
+} from "@/lib/query";
+import type { Provider, Settings } from "@/types";
+import { isManagedCombinedProvider } from "@/utils/combinedProviderUtils";
 import { useSettingsForm, type SettingsFormState } from "./useSettingsForm";
 import {
   useDirectorySettings,
@@ -51,6 +56,16 @@ const sanitizeDir = (value?: string | null): string | undefined => {
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
 };
+
+const MODEL_ROUTER_PROVIDER_APPS: AppId[] = [
+  "claude",
+  "claude-desktop",
+  "codex",
+  "gemini",
+  "opencode",
+  "openclaw",
+  "hermes",
+];
 
 /**
  * useSettings - 组合层
@@ -124,10 +139,49 @@ export function useSettings(): UseSettingsResult {
     setRequiresRestart,
   ]);
 
-  // 同步 Claude 插件集成配置到 ~/.claude/settings.json
-  // 返回 true 表示已执行过 syncCurrentProvidersLiveSafe，调用方可跳过重复同步
-  // prevEnabled 必须由调用方在 saveMutation 之前从实时缓存（queryClient.getQueryData）捕获，
-  // 避免 useCallback closure 中 data 因未 re-render 而滞后导致的快速连切 race。
+  // 关闭组合 Provider 时，如果当前供应商仍是托管组合 Provider，则切换到普通 Provider 列表首项。
+  const switchManagedCombinedProvidersIfRouterDisabled = useCallback(
+    async (
+      enabled: boolean | undefined,
+      prevEnabled: boolean | undefined,
+    ): Promise<void> => {
+      if (enabled !== false || prevEnabled !== true) return;
+
+      await Promise.all(
+        MODEL_ROUTER_PROVIDER_APPS.map(async (appId) => {
+          try {
+            const currentProviderId = await providersApi.getCurrent(appId);
+            if (!currentProviderId) return;
+
+            const allProviders = await providersApi.getAll(appId);
+            const currentProvider = allProviders[currentProviderId];
+            if (!isManagedCombinedProvider(currentProvider)) return;
+
+            const fallbackProvider = Object.values(
+              sortProviders(allProviders),
+            ).find(
+              (provider: Provider) => !isManagedCombinedProvider(provider),
+            );
+            if (!fallbackProvider) return;
+
+            await providersApi.switch(fallbackProvider.id, appId);
+          } catch (error) {
+            console.warn(
+              `[useSettings] Failed to switch ${appId} away from managed combined provider`,
+              error,
+            );
+            toast.error(
+              t("notifications.modelRouterFallbackSwitchFailed", {
+                defaultValue: "组合 Provider 已关闭，但自动切换当前供应商失败",
+              }),
+            );
+          }
+        }),
+      );
+    },
+    [t],
+  );
+
   const syncClaudePluginIfChanged = useCallback(
     async (
       enabled: boolean | undefined,
@@ -208,12 +262,19 @@ export function useSettings(): UseSettingsResult {
 
         // 在 mutate 之前从实时缓存捕获上一次持久化的插件集成状态，
         // 避免 closure 里的 data 因 React 尚未 re-render 而滞后
-        const prevPluginEnabled = queryClient.getQueryData<Settings>([
-          "settings",
-        ])?.enableClaudePluginIntegration;
+        const prevSettings = queryClient.getQueryData<Settings>(["settings"]);
+        const prevPluginEnabled = prevSettings?.enableClaudePluginIntegration;
+        const prevModelRouterEnabled =
+          prevSettings?.enableModelRouterProvider ??
+          data?.enableModelRouterProvider;
 
         // 保存到配置文件
         await saveMutation.mutateAsync(payload);
+
+        await switchManagedCombinedProvidersIfRouterDisabled(
+          payload.enableModelRouterProvider,
+          prevModelRouterEnabled,
+        );
 
         // 如果开机自启状态改变，调用系统 API
         if (
@@ -298,7 +359,15 @@ export function useSettings(): UseSettingsResult {
         throw error;
       }
     },
-    [data, queryClient, saveMutation, settings, syncClaudePluginIfChanged, t],
+    [
+      data,
+      queryClient,
+      saveMutation,
+      settings,
+      switchManagedCombinedProvidersIfRouterDisabled,
+      syncClaudePluginIfChanged,
+      t,
+    ],
   );
 
   // 完整保存设置（用于 Advanced 标签页的手动保存）
@@ -342,11 +411,18 @@ export function useSettings(): UseSettingsResult {
 
         // 在 mutate 之前从实时缓存捕获上一次持久化的插件集成状态，
         // 避免 closure 里的 data 因 React 尚未 re-render 而滞后
-        const prevPluginEnabled = queryClient.getQueryData<Settings>([
-          "settings",
-        ])?.enableClaudePluginIntegration;
+        const prevSettings = queryClient.getQueryData<Settings>(["settings"]);
+        const prevPluginEnabled = prevSettings?.enableClaudePluginIntegration;
+        const prevModelRouterEnabled =
+          prevSettings?.enableModelRouterProvider ??
+          data?.enableModelRouterProvider;
 
         await saveMutation.mutateAsync(payload);
+
+        await switchManagedCombinedProvidersIfRouterDisabled(
+          payload.enableModelRouterProvider,
+          prevModelRouterEnabled,
+        );
 
         await settingsApi.setAppConfigDirOverride(sanitizedAppDir ?? null);
 
@@ -472,6 +548,7 @@ export function useSettings(): UseSettingsResult {
       saveMutation,
       settings,
       setRequiresRestart,
+      switchManagedCombinedProvidersIfRouterDisabled,
       syncClaudePluginIfChanged,
       t,
     ],

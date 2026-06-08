@@ -1,7 +1,7 @@
 import { renderHook, act } from "@testing-library/react";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { useSettings } from "@/hooks/useSettings";
-import type { Settings } from "@/types";
+import type { Provider, Settings } from "@/types";
 
 const mutateAsyncMock = vi.fn();
 const useSettingsQueryMock = vi.fn();
@@ -11,6 +11,7 @@ const applyClaudeOnboardingSkipMock = vi.fn();
 const clearClaudeOnboardingSkipMock = vi.fn();
 const syncCurrentProvidersLiveMock = vi.fn();
 const updateTrayMenuMock = vi.fn();
+const switchProviderMock = vi.fn();
 const getCurrentMock = vi.fn();
 const getAllMock = vi.fn();
 const getQueryDataMock = vi.fn();
@@ -42,6 +43,21 @@ vi.mock("@/hooks/useSettingsMetadata", () => ({
 }));
 
 vi.mock("@/lib/query", () => ({
+  sortProviders: (providers: Record<string, any>) =>
+    Object.fromEntries(
+      Object.values(providers)
+        .sort((a, b) => {
+          const indexA = a.sortIndex ?? Number.MAX_SAFE_INTEGER;
+          const indexB = b.sortIndex ?? Number.MAX_SAFE_INTEGER;
+          if (indexA !== indexB) return indexA - indexB;
+
+          const timeA = a.createdAt ?? 0;
+          const timeB = b.createdAt ?? 0;
+          if (timeA === timeB) return a.name.localeCompare(b.name, "zh-CN");
+          return timeA - timeB;
+        })
+        .map((provider) => [provider.id, provider]),
+    ),
   useSettingsQuery: (...args: unknown[]) => useSettingsQueryMock(...args),
   useSaveSettingsMutation: () => ({
     mutateAsync: mutateAsyncMock,
@@ -76,6 +92,7 @@ vi.mock("@/lib/api", () => ({
   },
   providersApi: {
     updateTrayMenu: (...args: unknown[]) => updateTrayMenuMock(...args),
+    switch: (...args: unknown[]) => switchProviderMock(...args),
     getCurrent: (...args: unknown[]) => getCurrentMock(...args),
     getAll: (...args: unknown[]) => getAllMock(...args),
   },
@@ -135,6 +152,14 @@ const createMetadataMock = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
+const createProvider = (
+  overrides: Partial<Provider> & Pick<Provider, "id" | "name">,
+): Provider => ({
+  category: "third_party",
+  settingsConfig: { env: {} },
+  ...overrides,
+});
+
 describe("useSettings hook", () => {
   beforeEach(() => {
     mutateAsyncMock.mockReset();
@@ -144,6 +169,7 @@ describe("useSettings hook", () => {
     applyClaudeOnboardingSkipMock.mockReset();
     clearClaudeOnboardingSkipMock.mockReset();
     syncCurrentProvidersLiveMock.mockReset();
+    switchProviderMock.mockReset();
     getCurrentMock.mockReset();
     getAllMock.mockReset();
     getQueryDataMock.mockReset();
@@ -184,6 +210,7 @@ describe("useSettings hook", () => {
     applyClaudeOnboardingSkipMock.mockResolvedValue(true);
     clearClaudeOnboardingSkipMock.mockResolvedValue(true);
     syncCurrentProvidersLiveMock.mockResolvedValue({ ok: true });
+    switchProviderMock.mockResolvedValue({ warnings: [] });
     getCurrentMock.mockResolvedValue(null);
     getAllMock.mockResolvedValue({});
     // 默认将 queryClient 缓存对齐到 serverSettings，既有断言的 "prev === data" 语义保持不变
@@ -305,6 +332,68 @@ describe("useSettings hook", () => {
     expect(syncCurrentProvidersLiveMock).toHaveBeenCalledTimes(1);
   });
 
+  it("switches away from managed combined provider when auto-saving router toggle off", async () => {
+    serverSettings = {
+      ...serverSettings,
+      enableModelRouterProvider: true,
+    };
+    useSettingsQueryMock.mockReturnValue({
+      data: serverSettings,
+      isLoading: false,
+    });
+
+    settingsFormMock = createSettingsFormMock({
+      settings: {
+        ...serverSettings,
+        enableModelRouterProvider: true,
+        language: "zh",
+      },
+    });
+
+    getQueryDataMock.mockImplementation(() => serverSettings);
+    getCurrentMock.mockResolvedValueOnce("cc-switch-combined-provider");
+    getAllMock.mockResolvedValueOnce({
+      "cc-switch-combined-provider": createProvider({
+        id: "cc-switch-combined-provider",
+        name: "组合provider",
+        sortIndex: 0,
+        createdAt: 1,
+        meta: {
+          providerType: "model_router",
+          managedModelRouterProvider: true,
+          modelRouter: { version: 1, routes: [] },
+        },
+      }),
+      alpha: createProvider({
+        id: "alpha",
+        name: "Alpha",
+        sortIndex: 5,
+        createdAt: 1,
+      }),
+      beta: createProvider({
+        id: "beta",
+        name: "Beta",
+        sortIndex: 1,
+        createdAt: 9,
+      }),
+      aardvark: createProvider({
+        id: "aardvark",
+        name: "Aardvark",
+        createdAt: 0,
+      }),
+    });
+
+    const { result } = renderHook(() => useSettings());
+
+    await act(async () => {
+      await result.current.autoSaveSettings({
+        enableModelRouterProvider: false,
+      });
+    });
+
+    expect(switchProviderMock).toHaveBeenCalledWith("beta", "claude");
+  });
+
   it("saves settings without restart when directory unchanged", async () => {
     // 确保服务器和本地状态一致，不触发 API 调用
     serverSettings = {
@@ -420,7 +509,9 @@ describe("useSettings hook", () => {
     });
 
     // 修复生效：读的是缓存实时值 true，payload=false，差异触发 clear_claude_config
-    expect(applyClaudePluginConfigMock).toHaveBeenCalledWith({ official: true });
+    expect(applyClaudePluginConfigMock).toHaveBeenCalledWith({
+      official: true,
+    });
     expect(syncCurrentProvidersLiveMock).toHaveBeenCalled();
   });
 
