@@ -64,9 +64,23 @@ describe("useManagedCombinedProvider", () => {
         }),
       {
         wrapper,
-        initialProps: { providers: { [ordinaryProvider.id]: ordinaryProvider } },
+        initialProps: {
+          providers: { [ordinaryProvider.id]: ordinaryProvider },
+        },
       },
     );
+
+    expect(result.current.visibleProviders).toEqual({
+      [ordinaryProvider.id]: ordinaryProvider,
+      [COMBINED_PROVIDER_ID]: expect.objectContaining({
+        id: COMBINED_PROVIDER_ID,
+        name: "组合provider",
+        meta: expect.objectContaining({
+          providerType: "model_router",
+          managedModelRouterProvider: true,
+        }),
+      }),
+    });
 
     await waitFor(() => expect(apiMocks.add).toHaveBeenCalledTimes(1));
     expect(apiMocks.add).toHaveBeenCalledWith(
@@ -87,6 +101,14 @@ describe("useManagedCombinedProvider", () => {
     expect(apiMocks.add).toHaveBeenCalledTimes(1);
     expect(result.current.visibleProviders).toEqual({
       [ordinaryProvider.id]: ordinaryProvider,
+      [COMBINED_PROVIDER_ID]: expect.objectContaining({
+        id: COMBINED_PROVIDER_ID,
+        name: "组合provider",
+        meta: expect.objectContaining({
+          providerType: "model_router",
+          managedModelRouterProvider: true,
+        }),
+      }),
     });
   });
 
@@ -109,11 +131,15 @@ describe("useManagedCombinedProvider", () => {
       { wrapper, initialProps: { enabled: true } },
     );
 
-    expect(result.current.visibleProviders[COMBINED_PROVIDER_ID]).toEqual(managed);
+    expect(result.current.visibleProviders[COMBINED_PROVIDER_ID]).toEqual(
+      managed,
+    );
 
     rerender({ enabled: false });
 
-    expect(result.current.visibleProviders[COMBINED_PROVIDER_ID]).toBeUndefined();
+    expect(
+      result.current.visibleProviders[COMBINED_PROVIDER_ID],
+    ).toBeUndefined();
     expect(result.current.visibleProviders[ordinaryProvider.id]).toEqual(
       ordinaryProvider,
     );
