@@ -126,6 +126,26 @@ jobs:
           "CLANG_PATH=$(Join-Path $llvmBin 'clang.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
+      - name: Install WiX Toolset for Windows ARM64
+        if: runner.os == 'Windows' && matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install wixtoolset --version=3.14.1.20250415 --yes --no-progress
+
+          $wixBin = Get-ChildItem -Path "${env:ProgramFiles(x86)}" -Filter candle.exe -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty DirectoryName
+          if (-not $wixBin) {
+            throw 'WiX Toolset was installed, but candle.exe was not found'
+          }
+          foreach ($tool in @('candle.exe', 'light.exe')) {
+            if (-not (Test-Path (Join-Path $wixBin $tool))) {
+              throw "WiX Toolset is missing $tool in $wixBin"
+            }
+          }
+
+          $wixBin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
