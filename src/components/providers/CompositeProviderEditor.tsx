@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { ArrowLeft, Save } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowLeft, Download, Loader2, Package, Save, Wand2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -22,6 +22,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
+import JsonEditor from "@/components/JsonEditor";
 import { IconPicker } from "@/components/IconPicker";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { ModelInputWithFetch } from "@/components/providers/forms/shared";
@@ -30,6 +31,7 @@ import {
   setClaudeOneMMarker,
   stripClaudeOneMMarker,
 } from "@/components/providers/forms/hooks/useModelState";
+import { useCommonConfigSnippet } from "@/components/providers/forms/hooks/useCommonConfigSnippet";
 import { getIconMetadata } from "@/icons/extracted/metadata";
 import type {
   Provider,
@@ -68,8 +70,73 @@ type DetectionState = Record<
   }
 >;
 
+type DetectionRefreshSummary = {
+  total: number;
+  ready: number;
+  failed: number;
+  unavailable: number;
+};
+
 const NO_PROVIDER_VALUE = "__none__";
 const MODEL_DETECTION_CONCURRENCY = 4;
+const COMPOSITE_ROLE_ORDER: CompositeRole[] = [
+  "default",
+  "sonnet",
+  "opus",
+  "haiku",
+];
+
+const COMPOSITE_CONFIG_FORBIDDEN_TOP_LEVEL_KEYS = new Set([
+  "models",
+  "modelcatalog",
+  "defaultmodel",
+  "modelrouter",
+  "routes",
+  "providerid",
+  "upstreammodel",
+  "baseurl",
+  "url",
+  "modelsurl",
+  "apikey",
+  "auth",
+]);
+
+const COMPOSITE_CONFIG_FORBIDDEN_ROUTE_KEYS = new Set([
+  "modelrouter",
+  "routes",
+  "providerid",
+  "upstreammodel",
+]);
+
+const COMPOSITE_CONFIG_FORBIDDEN_ENV_KEYS = new Set([
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_MODELS_URL",
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "OPENAI_BASE_URL",
+  "OPENAI_API_KEY",
+  "OPENAI_API_BASE",
+  "CODEX_API_KEY",
+  "CODEX_BASE_URL",
+  "GOOGLE_GEMINI_BASE_URL",
+  "GOOGLE_API_KEY",
+  "GEMINI_API_KEY",
+  "GEMINI_MODEL",
+  "BASE_URL",
+  "API_KEY",
+]);
+
+const COMPOSITE_CONFIG_FORBIDDEN_ENV_PATTERNS = [
+  /(^|_)MODEL(S)?$/i,
+  /(^|_)BASE_?URL($|_)/i,
+  /(^|_)MODELS_?URL($|_)/i,
+  /(^|_)API_?KEY($|_)/i,
+  /(^|_)AUTH_?TOKEN($|_)/i,
+];
 
 const emptyMappings = (): CompositeMappings => ({
   default: { providerId: "", upstreamModel: "" },
@@ -133,6 +200,116 @@ const getStoredModelValue = (
   return stripClaudeOneMMarker(nextVisibleModel);
 };
 
+const isPlainObject = (value: unknown): value is Record<string, any> =>
+  Boolean(value) && typeof value === "object" && !Array.isArray(value);
+
+const formatCompositeCommonConfig = (value: unknown): string =>
+  JSON.stringify(sanitizeCompositeCommonConfig(value), null, 2);
+
+const getNormalizedConfigKey = (key: string): string =>
+  key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+
+const getConfigPath = (path: string[], key: string): string =>
+  [...path, key].join(".");
+
+const isEnvObjectPath = (path: string[]): boolean => {
+  const last = path[path.length - 1];
+  return last ? getNormalizedConfigKey(last) === "env" : false;
+};
+
+const isRouteConfigPath = (path: string[]): boolean =>
+  path.some((segment) =>
+    ["modelrouter", "modelrouterrules", "routes", "routing"].includes(
+      getNormalizedConfigKey(segment),
+    ),
+  );
+
+const isForbiddenCompositeEnvKey = (key: string): boolean =>
+  COMPOSITE_CONFIG_FORBIDDEN_ENV_KEYS.has(key.toUpperCase()) ||
+  COMPOSITE_CONFIG_FORBIDDEN_ENV_PATTERNS.some((pattern) =>
+    pattern.test(key),
+  );
+
+const isForbiddenCompositeConfigPath = (
+  path: string[],
+  key: string,
+): boolean => {
+  const normalizedKey = getNormalizedConfigKey(key);
+  if (isEnvObjectPath(path)) return isForbiddenCompositeEnvKey(key);
+  if (path.length === 0) {
+    return COMPOSITE_CONFIG_FORBIDDEN_TOP_LEVEL_KEYS.has(normalizedKey);
+  }
+  if (isRouteConfigPath(path)) {
+    return COMPOSITE_CONFIG_FORBIDDEN_ROUTE_KEYS.has(normalizedKey);
+  }
+  return false;
+};
+
+const sanitizeCompositeCommonConfigValue = (
+  value: unknown,
+  path: string[] = [],
+): unknown => {
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeCompositeCommonConfigValue(item, path));
+  }
+
+  if (!isPlainObject(value)) return value;
+
+  const sanitized: Record<string, any> = {};
+  for (const [key, nestedValue] of Object.entries(value)) {
+    if (isForbiddenCompositeConfigPath(path, key)) continue;
+    sanitized[key] = sanitizeCompositeCommonConfigValue(nestedValue, [
+      ...path,
+      key,
+    ]);
+  }
+  return sanitized;
+};
+
+const sanitizeCompositeCommonConfig = (value: unknown): Record<string, any> => {
+  if (!isPlainObject(value)) return {};
+  return sanitizeCompositeCommonConfigValue(value) as Record<string, any>;
+};
+
+const collectForbiddenCompositeConfigPaths = (
+  value: unknown,
+  path: string[] = [],
+): string[] => {
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) =>
+      collectForbiddenCompositeConfigPaths(item, [...path, String(index)]),
+    );
+  }
+
+  if (!isPlainObject(value)) return [];
+
+  const forbiddenPaths: string[] = [];
+  for (const [key, nestedValue] of Object.entries(value)) {
+    const nextPath = getConfigPath(path, key);
+    if (isForbiddenCompositeConfigPath(path, key)) {
+      forbiddenPaths.push(nextPath);
+      continue;
+    }
+    forbiddenPaths.push(
+      ...collectForbiddenCompositeConfigPaths(nestedValue, [...path, key]),
+    );
+  }
+  return forbiddenPaths;
+};
+
+const validateCompositeCommonConfigText = (
+  text: string,
+): { config: Record<string, any>; forbiddenPaths: string[] } => {
+  const trimmed = text.trim();
+  const parsed = trimmed ? JSON.parse(trimmed) : {};
+  if (!isPlainObject(parsed)) {
+    throw new Error("root-must-be-object");
+  }
+
+  const forbiddenPaths = collectForbiddenCompositeConfigPaths(parsed);
+  return { config: parsed, forbiddenPaths };
+};
+
 const routeToMappings = (
   routes: ProviderModelRouterRule[],
 ): CompositeMappings => {
@@ -177,13 +354,55 @@ export function CompositeProviderEditor({
   const [mappings, setMappings] = useState<CompositeMappings>(emptyMappings);
   const [modelRouterTestConfig, setModelRouterTestConfig] =
     useState<ProviderModelRouterTestConfig>(defaultModelRouterTestConfig);
+  const [settingsConfigText, setSettingsConfigText] = useState("{}");
+  const [settingsConfigError, setSettingsConfigError] = useState("");
+  const [settingsConfigDirty, setSettingsConfigDirty] = useState(false);
   const [detection, setDetection] = useState<DetectionState>({});
+  const [isRefreshingModels, setIsRefreshingModels] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isDarkMode, setIsDarkMode] = useState(false);
+  const [isCommonConfigModalOpen, setIsCommonConfigModalOpen] = useState(false);
+
+  const handleSettingsConfigChange = useCallback((value: string) => {
+    setSettingsConfigText(value);
+    setSettingsConfigDirty(true);
+    if (settingsConfigError) setSettingsConfigError("");
+  }, [settingsConfigError]);
+
+  const {
+    useCommonConfig,
+    commonConfigSnippet,
+    commonConfigError: commonSnippetError,
+    handleCommonConfigToggle,
+    handleCommonConfigSnippetChange,
+    handleExtract: handleCommonExtract,
+    isExtracting: isCommonExtracting,
+  } = useCommonConfigSnippet({
+    settingsConfig: settingsConfigText,
+    onConfigChange: handleSettingsConfigChange,
+  });
+
+  const detectionRunRef = useRef(0);
 
   const ordinaryProviders = useMemo(
     () => getDetectableOrdinaryProviders(providers, provider?.id ?? ""),
     [providers, provider?.id],
   );
+
+  useEffect(() => {
+    setIsDarkMode(document.documentElement.classList.contains("dark"));
+
+    const observer = new MutationObserver(() => {
+      setIsDarkMode(document.documentElement.classList.contains("dark"));
+    });
+
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["class"],
+    });
+
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     if (!open || !provider) return;
@@ -198,50 +417,67 @@ export function CompositeProviderEditor({
       ...defaultModelRouterTestConfig(),
       ...(provider.meta?.modelRouterTestConfig ?? {}),
     });
+    setSettingsConfigText(formatCompositeCommonConfig(provider.settingsConfig));
+    setSettingsConfigError("");
+    setSettingsConfigDirty(false);
   }, [open, provider]);
 
-  useEffect(() => {
-    if (!open) {
-      setDetection({});
-      return;
-    }
-    let cancelled = false;
+  const refreshModelDetection = useCallback(
+    async (providerIds?: string[]): Promise<DetectionRefreshSummary> => {
+      const runId = ++detectionRunRef.current;
+      const providerIdSet = providerIds?.length
+        ? new Set(providerIds)
+        : undefined;
+      const targetProviders = providerIdSet
+        ? ordinaryProviders.filter((ordinaryProvider) =>
+            providerIdSet.has(ordinaryProvider.id),
+          )
+        : ordinaryProviders;
 
-    const initialDetection: DetectionState = {};
-    const networkTasks: Array<{
-      providerId: string;
-      descriptor: Extract<ModelFetchDescriptor, { source: "network" }>;
-    }> = [];
-
-    for (const ordinaryProvider of ordinaryProviders) {
-      const descriptor = getModelFetchDescriptor(ordinaryProvider, appId);
-      if (descriptor.source === "stored") {
-        initialDetection[ordinaryProvider.id] = {
-          status: "ready",
-          models: descriptor.models,
-        };
-        continue;
-      }
-
-      if (descriptor.source === "unavailable") {
-        initialDetection[ordinaryProvider.id] = {
-          status: "unavailable",
-          models: [],
-          message: descriptor.reason,
-        };
-        continue;
-      }
-
-      initialDetection[ordinaryProvider.id] = {
-        status: "detecting",
-        models: [],
+      const summary: DetectionRefreshSummary = {
+        total: targetProviders.length,
+        ready: 0,
+        failed: 0,
+        unavailable: 0,
       };
-      networkTasks.push({ providerId: ordinaryProvider.id, descriptor });
-    }
+      const initialDetection: DetectionState = {};
+      const networkTasks: Array<{
+        providerId: string;
+        descriptor: Extract<ModelFetchDescriptor, { source: "network" }>;
+      }> = [];
 
-    setDetection(initialDetection);
+      for (const ordinaryProvider of targetProviders) {
+        const descriptor = getModelFetchDescriptor(ordinaryProvider, appId);
+        if (descriptor.source === "stored") {
+          initialDetection[ordinaryProvider.id] = {
+            status: "ready",
+            models: descriptor.models,
+          };
+          summary.ready += 1;
+          continue;
+        }
 
-    const detect = async () => {
+        if (descriptor.source === "unavailable") {
+          initialDetection[ordinaryProvider.id] = {
+            status: "unavailable",
+            models: [],
+            message: descriptor.reason,
+          };
+          summary.unavailable += 1;
+          continue;
+        }
+
+        initialDetection[ordinaryProvider.id] = {
+          status: "detecting",
+          models: [],
+        };
+        networkTasks.push({ providerId: ordinaryProvider.id, descriptor });
+      }
+
+      setDetection((prev) =>
+        providerIdSet ? { ...prev, ...initialDetection } : initialDetection,
+      );
+
       for (
         let offset = 0;
         offset < networkTasks.length;
@@ -262,35 +498,49 @@ export function CompositeProviderEditor({
           ),
         );
 
-        if (cancelled) return;
-        setDetection((prev) => {
-          const next = { ...prev };
-          results.forEach((result, index) => {
-            const providerId = batch[index].providerId;
-            if (result.status === "fulfilled") {
-              next[providerId] = { status: "ready", models: result.value };
-              return;
-            }
-
-            next[providerId] = {
-              status: "failed",
-              models: [],
-              message:
-                result.reason instanceof Error
-                  ? result.reason.message
-                  : String(result.reason),
+        if (runId !== detectionRunRef.current) return summary;
+        const batchUpdates: DetectionState = {};
+        results.forEach((result, index) => {
+          const providerId = batch[index].providerId;
+          if (result.status === "fulfilled") {
+            batchUpdates[providerId] = {
+              status: "ready",
+              models: result.value,
             };
-          });
-          return next;
-        });
-      }
-    };
+            summary.ready += 1;
+            return;
+          }
 
-    void detect();
+          batchUpdates[providerId] = {
+            status: "failed",
+            models: [],
+            message:
+              result.reason instanceof Error
+                ? result.reason.message
+                : String(result.reason),
+          };
+          summary.failed += 1;
+        });
+        setDetection((prev) => ({ ...prev, ...batchUpdates }));
+      }
+
+      return summary;
+    },
+    [appId, ordinaryProviders],
+  );
+
+  useEffect(() => {
+    if (!open) {
+      detectionRunRef.current += 1;
+      setDetection({});
+      return;
+    }
+
+    void refreshModelDetection();
     return () => {
-      cancelled = true;
+      detectionRunRef.current += 1;
     };
-  }, [appId, open, ordinaryProviders, provider?.id]);
+  }, [open, refreshModelDetection]);
 
   const effectiveIconColor = icon
     ? iconColor || getIconMetadata(icon)?.defaultColor
@@ -302,6 +552,141 @@ export function CompositeProviderEditor({
     : t("providerIcon.clickToSelect", {
         defaultValue: "点击选择图标",
       });
+  const quickSetSourceRole = COMPOSITE_ROLE_ORDER.find((role) => {
+    const mapping = mappings[role];
+    return mapping.providerId.trim() && mapping.upstreamModel.trim();
+  });
+
+  const compositeConfigToggles = useMemo(() => {
+    try {
+      const config = JSON.parse(settingsConfigText);
+      return {
+        hideAttribution:
+          config?.attribution?.commit === "" && config?.attribution?.pr === "",
+        teammates:
+          config?.env?.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === "1" ||
+          config?.env?.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS === 1,
+        enableToolSearch:
+          config?.env?.ENABLE_TOOL_SEARCH === "true" ||
+          config?.env?.ENABLE_TOOL_SEARCH === "1",
+        effortMax: config?.env?.CLAUDE_CODE_EFFORT_LEVEL === "max",
+        disableAutoUpgrade:
+          config?.env?.DISABLE_AUTOUPDATER === "1" ||
+          config?.env?.DISABLE_AUTOUPDATER === 1,
+      };
+    } catch {
+      return { hideAttribution: false, teammates: false, enableToolSearch: false, effortMax: false, disableAutoUpgrade: false };
+    }
+  }, [settingsConfigText]);
+
+  const handleCompositeConfigToggle = useCallback(
+    (toggleKey: string, checked: boolean) => {
+      try {
+        const config = JSON.parse(settingsConfigText || "{}");
+        switch (toggleKey) {
+          case "hideAttribution":
+            if (checked) config.attribution = { commit: "", pr: "" };
+            else delete config.attribution;
+            break;
+          case "teammates":
+            if (!config.env) config.env = {};
+            if (checked) config.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = "1";
+            else {
+              delete config.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS;
+              if (Object.keys(config.env).length === 0) delete config.env;
+            }
+            break;
+          case "enableToolSearch":
+            if (!config.env) config.env = {};
+            if (checked) config.env.ENABLE_TOOL_SEARCH = "true";
+            else {
+              delete config.env.ENABLE_TOOL_SEARCH;
+              if (Object.keys(config.env).length === 0) delete config.env;
+            }
+            break;
+          case "effortMax":
+            if (!config.env) config.env = {};
+            if (checked) config.env.CLAUDE_CODE_EFFORT_LEVEL = "max";
+            else {
+              delete config.env.CLAUDE_CODE_EFFORT_LEVEL;
+              if (Object.keys(config.env).length === 0) delete config.env;
+            }
+            break;
+          case "disableAutoUpgrade":
+            if (!config.env) config.env = {};
+            if (checked) config.env.DISABLE_AUTOUPDATER = "1";
+            else {
+              delete config.env.DISABLE_AUTOUPDATER;
+              if (Object.keys(config.env).length === 0) delete config.env;
+            }
+            break;
+        }
+        const newText = JSON.stringify(config, null, 2);
+        setSettingsConfigText(newText);
+        setSettingsConfigDirty(true);
+        if (settingsConfigError) setSettingsConfigError("");
+      } catch {
+        // Don't modify if JSON is invalid
+      }
+    },
+    [settingsConfigText, settingsConfigError],
+  );
+
+  const handleQuickSetMappings = () => {
+    if (!quickSetSourceRole) return;
+    const source = mappings[quickSetSourceRole];
+    setMappings(
+      COMPOSITE_ROLE_ORDER.reduce((next, role) => {
+        next[role] = {
+          providerId: source.providerId,
+          upstreamModel: source.upstreamModel,
+        };
+        return next;
+      }, {} as CompositeMappings),
+    );
+    toast.success(
+      t("combinedProvider.mapping.quickSetSuccess", {
+        defaultValue: "已应用到全部模型角色",
+      }),
+    );
+  };
+
+  const handleRefreshSelectedModels = async () => {
+    const selectedProviderIds = Array.from(
+      new Set(
+        COMPOSITE_ROLE_ORDER.map((role) => mappings[role].providerId).filter(
+          Boolean,
+        ),
+      ),
+    );
+    setIsRefreshingModels(true);
+    try {
+      const summary = await refreshModelDetection(
+        selectedProviderIds.length > 0 ? selectedProviderIds : undefined,
+      );
+      if (summary.ready > 0) {
+        toast.success(
+          t("combinedProvider.mapping.fetchModelsSuccess", {
+            defaultValue: "模型列表已刷新",
+          }),
+        );
+      } else if (summary.failed > 0) {
+        toast.error(
+          t("combinedProvider.mapping.fetchModelsFailed", {
+            defaultValue: "模型列表刷新失败，可手动填写。",
+          }),
+        );
+      } else if (summary.unavailable > 0) {
+        toast.info(
+          t("combinedProvider.mapping.fetchModelsUnavailable", {
+            defaultValue: "没有可刷新的模型列表，可手动填写。",
+          }),
+        );
+      }
+    } finally {
+      setIsRefreshingModels(false);
+    }
+  };
 
   const updateMapping = (
     role: CompositeRole,
@@ -336,6 +721,35 @@ export function CompositeProviderEditor({
       }
     }
 
+    let commonSettingsConfig = provider.settingsConfig ?? {};
+    if (settingsConfigDirty) {
+      try {
+        const result = validateCompositeCommonConfigText(settingsConfigText);
+        if (result.forbiddenPaths.length > 0) {
+          const message = t("combinedProvider.configJson.forbiddenKeys", {
+            keys: result.forbiddenPaths.join(", "),
+            defaultValue: `配置 JSON 不能包含模型、URL、认证或路由字段：${result.forbiddenPaths.join(", ")}`,
+          });
+          setSettingsConfigError(message);
+          toast.error(message);
+          return;
+        }
+        commonSettingsConfig = result.config;
+      } catch (error) {
+        const message =
+          error instanceof Error && error.message === "root-must-be-object"
+            ? t("jsonEditor.mustBeObject", {
+                defaultValue: "JSON 必须是对象",
+              })
+            : t("combinedProvider.configJson.invalidJson", {
+                defaultValue: "配置 JSON 格式无效",
+              });
+        setSettingsConfigError(message);
+        toast.error(message);
+        return;
+      }
+    }
+
     const routes = buildCompositeRoutes(
       provider.meta?.modelRouter?.routes ?? [],
       mappings,
@@ -355,6 +769,7 @@ export function CompositeProviderEditor({
       websiteUrl: trimmedWebsiteUrl || undefined,
       icon: trimmedIcon || undefined,
       iconColor: trimmedIconColor || undefined,
+      settingsConfig: commonSettingsConfig,
       meta: {
         ...meta,
         providerType: "model_router",
@@ -566,165 +981,53 @@ export function CompositeProviderEditor({
 
         <section className="space-y-3">
           <div className="space-y-1 border-t border-border/50 pt-4">
-            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
               <div className="space-y-1">
                 <h3 className="text-sm font-medium">
-                  {t("combinedProvider.testConfig.title", {
-                    defaultValue: "组合测试配置",
+                  {t("combinedProvider.mapping.title", {
+                    defaultValue: "模型映射",
                   })}
                 </h3>
                 <p className="text-xs text-muted-foreground">
-                  {t("combinedProvider.testConfig.hint", {
+                  {t("combinedProvider.mapping.hint", {
                     defaultValue:
-                      "开启后会按模型映射中已配置路由逐条巡检；巡检请求会自动去掉 thinking 参数和 [1M] 本地标记，避免上游误判。",
+                      "为每个 Claude 模型角色选择普通 Provider，并指定要请求的上游模型。",
                   })}
                 </p>
               </div>
-              <div className="flex items-center gap-2">
-                <Label
-                  htmlFor="combined-test-config-enabled"
-                  className="text-sm text-muted-foreground"
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="gap-2"
+                  onClick={handleQuickSetMappings}
+                  disabled={!quickSetSourceRole}
                 >
-                  {t("combinedProvider.testConfig.enabled", {
-                    defaultValue: "使用单独配置",
+                  <Wand2 className="h-4 w-4" />
+                  {t("providerForm.quickSetModels", {
+                    defaultValue: "一键设置",
                   })}
-                </Label>
-                <Switch
-                  id="combined-test-config-enabled"
-                  checked={modelRouterTestConfig.enabled}
-                  onCheckedChange={(checked) =>
-                    setModelRouterTestConfig((prev) => ({
-                      ...prev,
-                      enabled: checked,
-                    }))
-                  }
-                />
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="gap-2"
+                  onClick={() => void handleRefreshSelectedModels()}
+                  disabled={isRefreshingModels || ordinaryProviders.length === 0}
+                >
+                  {isRefreshingModels ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Download className="h-4 w-4" />
+                  )}
+                  {t("providerForm.fetchModels", {
+                    defaultValue: "获取模型列表",
+                  })}
+                </Button>
               </div>
             </div>
-          </div>
-
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            <div className="space-y-2">
-              <Label htmlFor="combined-test-mode">
-                {t("combinedProvider.testConfig.mode", {
-                  defaultValue: "巡检模式",
-                })}
-              </Label>
-              <Input
-                id="combined-test-mode"
-                value={t("combinedProvider.testConfig.mode.allRoutes", {
-                  defaultValue: "全量巡检（按已配置路由）",
-                })}
-                disabled
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="combined-test-timeout">
-                {t("providerAdvanced.timeoutSecs", {
-                  defaultValue: "超时时间（秒）",
-                })}
-              </Label>
-              <Input
-                id="combined-test-timeout"
-                type="number"
-                min={1}
-                max={300}
-                value={modelRouterTestConfig.timeoutSecs || ""}
-                onChange={(event) =>
-                  setModelRouterTestConfig((prev) => ({
-                    ...prev,
-                    timeoutSecs: event.target.value
-                      ? parseInt(event.target.value, 10)
-                      : undefined,
-                  }))
-                }
-                placeholder="45"
-                disabled={!modelRouterTestConfig.enabled}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="combined-test-prompt">
-                {t("providerAdvanced.testPrompt", {
-                  defaultValue: "测试提示词",
-                })}
-              </Label>
-              <Input
-                id="combined-test-prompt"
-                value={modelRouterTestConfig.testPrompt || ""}
-                onChange={(event) =>
-                  setModelRouterTestConfig((prev) => ({
-                    ...prev,
-                    testPrompt: event.target.value || undefined,
-                  }))
-                }
-                placeholder="Who are you?"
-                disabled={!modelRouterTestConfig.enabled}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="combined-degraded-threshold">
-                {t("providerAdvanced.degradedThreshold", {
-                  defaultValue: "降级阈值（毫秒）",
-                })}
-              </Label>
-              <Input
-                id="combined-degraded-threshold"
-                type="number"
-                min={100}
-                max={60000}
-                value={modelRouterTestConfig.degradedThresholdMs || ""}
-                onChange={(event) =>
-                  setModelRouterTestConfig((prev) => ({
-                    ...prev,
-                    degradedThresholdMs: event.target.value
-                      ? parseInt(event.target.value, 10)
-                      : undefined,
-                  }))
-                }
-                placeholder="6000"
-                disabled={!modelRouterTestConfig.enabled}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="combined-max-retries">
-                {t("providerAdvanced.maxRetries", {
-                  defaultValue: "最大重试次数",
-                })}
-              </Label>
-              <Input
-                id="combined-max-retries"
-                type="number"
-                min={0}
-                max={10}
-                value={modelRouterTestConfig.maxRetries ?? ""}
-                onChange={(event) =>
-                  setModelRouterTestConfig((prev) => ({
-                    ...prev,
-                    maxRetries: event.target.value
-                      ? parseInt(event.target.value, 10)
-                      : undefined,
-                  }))
-                }
-                placeholder="2"
-                disabled={!modelRouterTestConfig.enabled}
-              />
-            </div>
-          </div>
-        </section>
-
-        <section className="space-y-3">
-          <div className="space-y-1 border-t border-border/50 pt-4">
-            <h3 className="text-sm font-medium">
-              {t("combinedProvider.mapping.title", {
-                defaultValue: "模型映射",
-              })}
-            </h3>
-            <p className="text-xs text-muted-foreground">
-              {t("combinedProvider.mapping.hint", {
-                defaultValue:
-                  "为每个 Claude 模型角色选择普通 Provider，并指定要请求的上游模型。",
-              })}
-            </p>
           </div>
 
           <div
@@ -873,6 +1176,330 @@ export function CompositeProviderEditor({
               </div>
             );
           })}
+        </section>
+
+        <section className="space-y-3">
+          <div className="space-y-1 border-t border-border/50 pt-4">
+            <div className="flex items-center justify-between">
+              <Label htmlFor="composite-settings-config" className="text-sm font-medium">
+                {t("combinedProvider.configJson.title", { defaultValue: "配置 JSON" })}
+              </Label>
+              <div className="flex items-center gap-2">
+                <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={useCommonConfig}
+                    onChange={(e) => handleCommonConfigToggle(e.target.checked)}
+                    className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
+                  />
+                  <span>{t("claudeConfig.writeCommonConfig", { defaultValue: "写入通用配置" })}</span>
+                </label>
+              </div>
+            </div>
+            <div className="flex items-center justify-end">
+              <button
+                type="button"
+                onClick={() => setIsCommonConfigModalOpen(true)}
+                className="text-xs text-blue-400 dark:text-blue-500 hover:text-blue-500 dark:hover:text-blue-400 transition-colors"
+              >
+                {t("claudeConfig.editCommonConfig", { defaultValue: "编辑通用配置" })}
+              </button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {t("combinedProvider.configJson.hint", {
+                defaultValue:
+                  "这里只编辑组合 Provider 的通用配置；模型、Provider、URL 和 API Key 请在模型映射或普通 Provider 中配置。",
+              })}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+            <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
+              <input
+                type="checkbox"
+                checked={compositeConfigToggles.hideAttribution}
+                onChange={(e) => handleCompositeConfigToggle("hideAttribution", e.target.checked)}
+                className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
+              />
+              <span>{t("claudeConfig.hideAttribution")}</span>
+            </label>
+            <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
+              <input
+                type="checkbox"
+                checked={compositeConfigToggles.teammates}
+                onChange={(e) => handleCompositeConfigToggle("teammates", e.target.checked)}
+                className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
+              />
+              <span>{t("claudeConfig.enableTeammates")}</span>
+            </label>
+            <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
+              <input
+                type="checkbox"
+                checked={compositeConfigToggles.enableToolSearch}
+                onChange={(e) => handleCompositeConfigToggle("enableToolSearch", e.target.checked)}
+                className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
+              />
+              <span>{t("claudeConfig.enableToolSearch")}</span>
+            </label>
+            <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
+              <input
+                type="checkbox"
+                checked={compositeConfigToggles.effortMax}
+                onChange={(e) => handleCompositeConfigToggle("effortMax", e.target.checked)}
+                className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
+              />
+              <span>{t("claudeConfig.effortMax")}</span>
+            </label>
+            <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
+              <input
+                type="checkbox"
+                checked={compositeConfigToggles.disableAutoUpgrade}
+                onChange={(e) => handleCompositeConfigToggle("disableAutoUpgrade", e.target.checked)}
+                className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
+              />
+              <span>{t("claudeConfig.disableAutoUpgrade")}</span>
+            </label>
+          </div>
+          {(settingsConfigError || commonSnippetError) ? (
+            <p className="text-xs text-red-500 dark:text-red-400">
+              {settingsConfigError || commonSnippetError}
+            </p>
+          ) : null}
+          <JsonEditor
+            id="composite-settings-config"
+            value={settingsConfigText}
+            onChange={handleSettingsConfigChange}
+            placeholder={`{
+  "env": {
+    "ENABLE_TOOL_SEARCH": "true",
+    "DISABLE_AUTOUPDATER": "1"
+  },
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  }
+}`}
+            darkMode={isDarkMode}
+            rows={10}
+            showValidation={true}
+            language="json"
+          />
+          <FullScreenPanel
+            isOpen={isCommonConfigModalOpen}
+            title={t("claudeConfig.editCommonConfigTitle", { defaultValue: "编辑通用配置片段" })}
+            onClose={() => setIsCommonConfigModalOpen(false)}
+            footer={
+              <>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={handleCommonExtract}
+                  disabled={isCommonExtracting}
+                  className="gap-2"
+                >
+                  {isCommonExtracting ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Download className="w-4 h-4" />
+                  )}
+                  {t("claudeConfig.extractFromCurrent", { defaultValue: "从编辑内容提取" })}
+                </Button>
+                <Button type="button" variant="outline" onClick={() => setIsCommonConfigModalOpen(false)}>
+                  {t("common.cancel")}
+                </Button>
+                <Button type="button" onClick={() => setIsCommonConfigModalOpen(false)} className="gap-2">
+                  <Save className="w-4 h-4" />
+                  {t("common.save")}
+                </Button>
+              </>
+            }
+          >
+            <div className="space-y-4">
+              <div className="rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-950/30 p-3 space-y-1.5">
+                <p className="text-sm font-medium text-blue-800 dark:text-blue-300">
+                  {t("commonConfig.guideTitle")}
+                </p>
+                <p className="text-xs text-blue-700/80 dark:text-blue-400/80">
+                  {t("commonConfig.guidePurpose")}
+                </p>
+                <p className="text-xs text-blue-700/80 dark:text-blue-400/80">
+                  {t("commonConfig.guideUsage")}
+                </p>
+                <p className="text-xs text-blue-700/80 dark:text-blue-400/80">
+                  {t("commonConfig.guideReExtract")}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {t("commonConfig.guideReassurance")}
+                </p>
+              </div>
+              {(!commonConfigSnippet || commonConfigSnippet.trim() === "" || commonConfigSnippet.trim() === "{}") && (
+                <div className="flex flex-col items-center justify-center py-6 text-center text-muted-foreground">
+                  <Package className="h-8 w-8 mb-2 opacity-40" />
+                  <p className="text-sm font-medium">{t("commonConfig.emptyTitle")}</p>
+                  <p className="text-xs mt-1">{t("commonConfig.emptyHint")}</p>
+                </div>
+              )}
+              <JsonEditor
+                value={commonConfigSnippet}
+                onChange={handleCommonConfigSnippetChange}
+                placeholder={`{\n  "env": {\n    "ANTHROPIC_BASE_URL": "https://your-api-endpoint.com"\n  }\n}`}
+                darkMode={isDarkMode}
+                rows={16}
+                showValidation={true}
+                language="json"
+              />
+              {commonSnippetError && (
+                <p className="text-sm text-red-500 dark:text-red-400">{commonSnippetError}</p>
+              )}
+            </div>
+          </FullScreenPanel>
+        </section>
+
+        <section className="space-y-3">
+          <div className="space-y-1 border-t border-border/50 pt-4">
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <div className="space-y-1">
+                <h3 className="text-sm font-medium">
+                  {t("combinedProvider.testConfig.title", {
+                    defaultValue: "组合测试配置",
+                  })}
+                </h3>
+                <p className="text-xs text-muted-foreground">
+                  {t("combinedProvider.testConfig.hint", {
+                    defaultValue:
+                      "开启后会按模型映射中已配置路由逐条巡检；巡检请求会自动去掉 thinking 参数和 [1M] 本地标记，避免上游误判。",
+                  })}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <Label
+                  htmlFor="combined-test-config-enabled"
+                  className="text-sm text-muted-foreground"
+                >
+                  {t("combinedProvider.testConfig.enabled", {
+                    defaultValue: "使用单独配置",
+                  })}
+                </Label>
+                <Switch
+                  id="combined-test-config-enabled"
+                  checked={modelRouterTestConfig.enabled}
+                  onCheckedChange={(checked) =>
+                    setModelRouterTestConfig((prev) => ({
+                      ...prev,
+                      enabled: checked,
+                    }))
+                  }
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="combined-test-mode">
+                {t("combinedProvider.testConfig.mode", {
+                  defaultValue: "巡检模式",
+                })}
+              </Label>
+              <Input
+                id="combined-test-mode"
+                value={t("combinedProvider.testConfig.mode.allRoutes", {
+                  defaultValue: "全量巡检（按已配置路由）",
+                })}
+                disabled
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="combined-test-timeout">
+                {t("providerAdvanced.timeoutSecs", {
+                  defaultValue: "超时时间（秒）",
+                })}
+              </Label>
+              <Input
+                id="combined-test-timeout"
+                type="number"
+                min={1}
+                max={300}
+                value={modelRouterTestConfig.timeoutSecs || ""}
+                onChange={(event) =>
+                  setModelRouterTestConfig((prev) => ({
+                    ...prev,
+                    timeoutSecs: event.target.value
+                      ? parseInt(event.target.value, 10)
+                      : undefined,
+                  }))
+                }
+                placeholder="45"
+                disabled={!modelRouterTestConfig.enabled}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="combined-test-prompt">
+                {t("providerAdvanced.testPrompt", {
+                  defaultValue: "测试提示词",
+                })}
+              </Label>
+              <Input
+                id="combined-test-prompt"
+                value={modelRouterTestConfig.testPrompt || ""}
+                onChange={(event) =>
+                  setModelRouterTestConfig((prev) => ({
+                    ...prev,
+                    testPrompt: event.target.value || undefined,
+                  }))
+                }
+                placeholder="Who are you?"
+                disabled={!modelRouterTestConfig.enabled}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="combined-degraded-threshold">
+                {t("providerAdvanced.degradedThreshold", {
+                  defaultValue: "降级阈值（毫秒）",
+                })}
+              </Label>
+              <Input
+                id="combined-degraded-threshold"
+                type="number"
+                min={100}
+                max={60000}
+                value={modelRouterTestConfig.degradedThresholdMs || ""}
+                onChange={(event) =>
+                  setModelRouterTestConfig((prev) => ({
+                    ...prev,
+                    degradedThresholdMs: event.target.value
+                      ? parseInt(event.target.value, 10)
+                      : undefined,
+                  }))
+                }
+                placeholder="6000"
+                disabled={!modelRouterTestConfig.enabled}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="combined-max-retries">
+                {t("providerAdvanced.maxRetries", {
+                  defaultValue: "最大重试次数",
+                })}
+              </Label>
+              <Input
+                id="combined-max-retries"
+                type="number"
+                min={0}
+                max={10}
+                value={modelRouterTestConfig.maxRetries ?? ""}
+                onChange={(event) =>
+                  setModelRouterTestConfig((prev) => ({
+                    ...prev,
+                    maxRetries: event.target.value
+                      ? parseInt(event.target.value, 10)
+                      : undefined,
+                  }))
+                }
+                placeholder="2"
+                disabled={!modelRouterTestConfig.enabled}
+              />
+            </div>
+          </div>
         </section>
       </form>
     </FullScreenPanel>

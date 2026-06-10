@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Provider } from "@/types";
@@ -34,6 +34,28 @@ const fetchMocks = vi.hoisted(() => ({
 vi.mock("@/lib/api/model-fetch", () => ({
   fetchModelsForConfig: (...args: unknown[]) =>
     fetchMocks.fetchModelsForConfig(...args),
+}));
+
+vi.mock("@/components/JsonEditor", () => ({
+  default: ({
+    id,
+    value,
+    onChange,
+    placeholder,
+  }: {
+    id?: string;
+    value: string;
+    onChange: (value: string) => void;
+    placeholder?: string;
+  }) => (
+    <textarea
+      id={id}
+      aria-label={id}
+      value={value}
+      placeholder={placeholder}
+      onChange={(event) => onChange(event.target.value)}
+    />
+  ),
 }));
 
 vi.mock("react-i18next", () => ({
@@ -780,6 +802,159 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
           },
         }),
       }),
+    );
+  });
+
+  it("quick sets all composite model mappings from the first complete row", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={combinedProvider}
+        providers={{
+          [combinedProvider.id]: combinedProvider,
+          [ordinaryProvider.id]: ordinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await selectProvider(user, "默认模型 Provider", "普通 Provider");
+    await user.type(screen.getByLabelText("默认模型 Model"), "stored-default");
+    await user.click(screen.getByRole("button", { name: "一键设置" }));
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(
+      handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes,
+    ).toEqual([
+      {
+        id: "combined-default",
+        enabled: true,
+        matchType: "default",
+        target: { providerId: "ordinary", upstreamModel: "stored-default" },
+      },
+      {
+        id: "combined-role-haiku",
+        enabled: true,
+        matchType: "role",
+        matchValue: "haiku",
+        target: { providerId: "ordinary", upstreamModel: "stored-default" },
+      },
+      {
+        id: "combined-role-sonnet",
+        enabled: true,
+        matchType: "role",
+        matchValue: "sonnet",
+        target: { providerId: "ordinary", upstreamModel: "stored-default" },
+      },
+      {
+        id: "combined-role-opus",
+        enabled: true,
+        matchType: "role",
+        matchValue: "opus",
+        target: { providerId: "ordinary", upstreamModel: "stored-default" },
+      },
+    ]);
+  });
+
+  it("saves edited composite config JSON as settingsConfig", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={combinedProvider}
+        providers={{ [combinedProvider.id]: combinedProvider }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("composite-settings-config"), {
+      target: {
+        value: JSON.stringify(
+          {
+            env: { ENABLE_TOOL_SEARCH: "true" },
+            attribution: { commit: "", pr: "" },
+          },
+          null,
+          2,
+        ),
+      },
+    });
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(handleSubmit.mock.calls[0][0].provider.settingsConfig).toEqual({
+      env: { ENABLE_TOOL_SEARCH: "true" },
+      attribution: { commit: "", pr: "" },
+    });
+  });
+
+  it("blocks model and endpoint fields in composite config JSON", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={combinedProvider}
+        providers={{ [combinedProvider.id]: combinedProvider }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("composite-settings-config"), {
+      target: {
+        value: JSON.stringify({
+          env: { ANTHROPIC_BASE_URL: "https://api.example.com" },
+          models: ["should-not-save"],
+        }),
+      },
+    });
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    expect(handleSubmit).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(/配置 JSON 不能包含模型、URL、认证或路由字段/),
+    ).toBeInTheDocument();
+  });
+
+  it("preserves legacy settingsConfig when JSON is not edited", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+    const providerWithLegacySettings: Provider = {
+      ...combinedProvider,
+      settingsConfig: {
+        env: { ANTHROPIC_BASE_URL: "https://legacy.example.com" },
+      },
+    };
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={providerWithLegacySettings}
+        providers={{ [providerWithLegacySettings.id]: providerWithLegacySettings }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(handleSubmit.mock.calls[0][0].provider.settingsConfig).toEqual(
+      providerWithLegacySettings.settingsConfig,
     );
   });
 
