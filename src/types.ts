@@ -123,6 +123,17 @@ export interface ProviderTestConfig {
   maxRetries?: number;
 }
 
+export type ProviderModelRouterTestMode = "all_routes";
+
+export interface ProviderModelRouterTestConfig {
+  enabled: boolean;
+  mode?: ProviderModelRouterTestMode;
+  timeoutSecs?: number;
+  testPrompt?: string;
+  degradedThresholdMs?: number;
+  maxRetries?: number;
+}
+
 export type AuthBindingSource = "provider_config" | "managed_account";
 
 export interface AuthBinding {
@@ -175,11 +186,7 @@ export interface CodexChatReasoning {
 
 export type ProviderModelRouterMatchType = "exact" | "role" | "default";
 
-export type ProviderModelRouterRole =
-  | "default"
-  | "haiku"
-  | "sonnet"
-  | "opus";
+export type ProviderModelRouterRole = "default" | "haiku" | "sonnet" | "opus";
 
 export interface ProviderModelRouterTargetRef {
   providerId?: string;
@@ -258,6 +265,8 @@ export interface ProviderMeta {
   // 组合 Provider / model_router 路由配置；前端仅做最小结构保真与透传
   modelRouter?: ProviderModelRouterConfig;
   model_router?: ProviderModelRouterConfig;
+  // 组合 Provider 的专属巡检配置
+  modelRouterTestConfig?: ProviderModelRouterTestConfig;
   // CC Switch 自动管理的组合 Provider 标记
   managedModelRouterProvider?: boolean;
 }

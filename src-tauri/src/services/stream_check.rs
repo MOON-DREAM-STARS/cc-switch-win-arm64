@@ -65,6 +65,18 @@ impl Default for StreamCheckConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRouterRouteCheckResult {
+    pub route_key: String,
+    pub request_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_provider_name: Option<String>,
+    pub result: StreamCheckResult,
+}
+
 /// 流式检查结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,6 +92,10 @@ pub struct StreamCheckResult {
     /// 细粒度错误分类（如 "modelNotFound"），前端据此渲染专门的文案
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_results: Option<Vec<ModelRouterRouteCheckResult>>,
 }
 
 /// 流式健康检查服务
@@ -97,15 +113,52 @@ impl StreamCheckService {
         base_url_override: Option<String>,
         claude_api_format_override: Option<String>,
     ) -> Result<StreamCheckResult, AppError> {
-        // 合并供应商单独配置和全局配置
         let effective_config = Self::merge_provider_config(provider, config);
+        Self::check_with_retry_effective(
+            app_type,
+            provider,
+            &effective_config,
+            auth_override,
+            base_url_override,
+            claude_api_format_override,
+        )
+        .await
+    }
+
+    pub(crate) async fn check_with_retry_without_provider_override(
+        app_type: &AppType,
+        provider: &Provider,
+        config: &StreamCheckConfig,
+        auth_override: Option<AuthInfo>,
+        base_url_override: Option<String>,
+        claude_api_format_override: Option<String>,
+    ) -> Result<StreamCheckResult, AppError> {
+        Self::check_with_retry_effective(
+            app_type,
+            provider,
+            config,
+            auth_override,
+            base_url_override,
+            claude_api_format_override,
+        )
+        .await
+    }
+
+    async fn check_with_retry_effective(
+        app_type: &AppType,
+        provider: &Provider,
+        effective_config: &StreamCheckConfig,
+        auth_override: Option<AuthInfo>,
+        base_url_override: Option<String>,
+        claude_api_format_override: Option<String>,
+    ) -> Result<StreamCheckResult, AppError> {
         let mut last_result = None;
 
         for attempt in 0..=effective_config.max_retries {
             let result = Self::check_once(
                 app_type,
                 provider,
-                &effective_config,
+                effective_config,
                 auth_override.clone(),
                 base_url_override.clone(),
                 claude_api_format_override.clone(),
@@ -120,7 +173,6 @@ impl StreamCheckService {
                     });
                 }
                 Ok(r) => {
-                    // 失败但非异常，判断是否重试
                     if Self::should_retry(&r.message) && attempt < effective_config.max_retries {
                         last_result = Some(r.clone());
                         continue;
@@ -150,6 +202,8 @@ impl StreamCheckService {
             tested_at: chrono::Utc::now().timestamp(),
             retry_count: effective_config.max_retries,
             error_category: None,
+            audit_mode: None,
+            route_results: None,
         }))
     }
 
@@ -185,6 +239,35 @@ impl StreamCheckService {
                     .test_model
                     .clone()
                     .unwrap_or_else(|| global_config.gemini_model.clone()),
+                test_prompt: tc
+                    .test_prompt
+                    .clone()
+                    .unwrap_or_else(|| global_config.test_prompt.clone()),
+            },
+            None => global_config.clone(),
+        }
+    }
+
+    pub(crate) fn merge_model_router_config(
+        provider: &Provider,
+        global_config: &StreamCheckConfig,
+    ) -> StreamCheckConfig {
+        let test_config = provider
+            .meta
+            .as_ref()
+            .and_then(|m| m.model_router_test_config.as_ref())
+            .filter(|tc| tc.enabled);
+
+        match test_config {
+            Some(tc) => StreamCheckConfig {
+                timeout_secs: tc.timeout_secs.unwrap_or(global_config.timeout_secs),
+                max_retries: tc.max_retries.unwrap_or(global_config.max_retries),
+                degraded_threshold_ms: tc
+                    .degraded_threshold_ms
+                    .unwrap_or(global_config.degraded_threshold_ms),
+                claude_model: global_config.claude_model.clone(),
+                codex_model: global_config.codex_model.clone(),
+                gemini_model: global_config.gemini_model.clone(),
                 test_prompt: tc
                     .test_prompt
                     .clone()
@@ -785,6 +868,8 @@ impl StreamCheckService {
                 tested_at,
                 retry_count: 0,
                 error_category: None,
+                audit_mode: None,
+                route_results: None,
             },
             Err(e) => {
                 let (http_status, message, error_category) = match &e {
@@ -808,6 +893,8 @@ impl StreamCheckService {
                     tested_at,
                     retry_count: 0,
                     error_category,
+                    audit_mode: None,
+                    route_results: None,
                 }
             }
         }

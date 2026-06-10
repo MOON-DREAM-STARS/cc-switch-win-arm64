@@ -23,6 +23,74 @@ export function useStreamCheck(appId: AppId) {
       try {
         const result = await streamCheckProvider(appId, providerId);
 
+        if (result.auditMode === "all_routes" && result.routeResults?.length) {
+          const totalRoutes = result.routeResults.length;
+          const passedRoutes = result.routeResults.filter(
+            (item) => item.result.success,
+          ).length;
+          const routeDetails = result.routeResults
+            .map((item) => {
+              const target =
+                item.targetProviderName || item.targetProviderId || "unknown";
+              if (!item.result.success) {
+                return `${item.routeKey} → ${target}: ${item.result.message}`;
+              }
+              if (item.result.status === "degraded") {
+                return `${item.routeKey} → ${target}: 较慢${item.result.responseTimeMs != null ? ` (${item.result.responseTimeMs}ms)` : ""}`;
+              }
+              return `${item.routeKey} → ${target}: 成功${item.result.responseTimeMs != null ? ` (${item.result.responseTimeMs}ms)` : ""}`;
+            })
+            .join("；");
+
+          if (result.status === "operational") {
+            toast.success(
+              t("streamCheck.auditOperational", {
+                providerName,
+                passedRoutes,
+                totalRoutes,
+                defaultValue: `${providerName} 组合巡检完成 (${passedRoutes}/${totalRoutes})`,
+              }),
+              {
+                description: routeDetails,
+                duration: 12000,
+                closeButton: true,
+              },
+            );
+            resetCircuitBreaker.mutate({ providerId, appType: appId });
+          } else if (result.status === "degraded") {
+            toast.warning(
+              t("streamCheck.auditDegraded", {
+                providerName,
+                passedRoutes,
+                totalRoutes,
+                defaultValue: `${providerName} 组合巡检完成，部分路由较慢 (${passedRoutes}/${totalRoutes})`,
+              }),
+              {
+                description: routeDetails,
+                duration: 12000,
+                closeButton: true,
+              },
+            );
+            resetCircuitBreaker.mutate({ providerId, appType: appId });
+          } else {
+            toast.error(
+              t("streamCheck.auditFailed", {
+                providerName,
+                passedRoutes,
+                totalRoutes,
+                defaultValue: `${providerName} 组合巡检失败 (${passedRoutes}/${totalRoutes})`,
+              }),
+              {
+                description: routeDetails,
+                duration: 12000,
+                closeButton: true,
+              },
+            );
+          }
+
+          return result;
+        }
+
         if (result.status === "operational") {
           toast.success(
             t("streamCheck.operational", {

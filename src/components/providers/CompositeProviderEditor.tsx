@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -30,7 +31,11 @@ import {
   stripClaudeOneMMarker,
 } from "@/components/providers/forms/hooks/useModelState";
 import { getIconMetadata } from "@/icons/extracted/metadata";
-import type { Provider, ProviderModelRouterRule } from "@/types";
+import type {
+  Provider,
+  ProviderModelRouterRule,
+  ProviderModelRouterTestConfig,
+} from "@/types";
 import type { AppId } from "@/lib/api";
 import { fetchModelsForConfig, type FetchedModel } from "@/lib/api/model-fetch";
 import {
@@ -71,6 +76,11 @@ const emptyMappings = (): CompositeMappings => ({
   haiku: { providerId: "", upstreamModel: "" },
   sonnet: { providerId: "", upstreamModel: "" },
   opus: { providerId: "", upstreamModel: "" },
+});
+
+const defaultModelRouterTestConfig = (): ProviderModelRouterTestConfig => ({
+  enabled: false,
+  mode: "all_routes",
 });
 
 const roleLabels: Array<{
@@ -165,6 +175,8 @@ export function CompositeProviderEditor({
   const [iconColor, setIconColor] = useState("");
   const [iconDialogOpen, setIconDialogOpen] = useState(false);
   const [mappings, setMappings] = useState<CompositeMappings>(emptyMappings);
+  const [modelRouterTestConfig, setModelRouterTestConfig] =
+    useState<ProviderModelRouterTestConfig>(defaultModelRouterTestConfig);
   const [detection, setDetection] = useState<DetectionState>({});
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -182,6 +194,10 @@ export function CompositeProviderEditor({
     setIconColor(provider.iconColor ?? "");
     setIconDialogOpen(false);
     setMappings(routeToMappings(provider.meta?.modelRouter?.routes ?? []));
+    setModelRouterTestConfig({
+      ...defaultModelRouterTestConfig(),
+      ...(provider.meta?.modelRouterTestConfig ?? {}),
+    });
   }, [open, provider]);
 
   useEffect(() => {
@@ -345,6 +361,9 @@ export function CompositeProviderEditor({
         managedModelRouterProvider:
           provider.meta?.managedModelRouterProvider ?? true,
         modelRouter: { version: 1, routes },
+        modelRouterTestConfig: modelRouterTestConfig.enabled
+          ? modelRouterTestConfig
+          : undefined,
       },
     };
 
@@ -543,6 +562,154 @@ export function CompositeProviderEditor({
               })}
             </div>
           )}
+        </section>
+
+        <section className="space-y-3">
+          <div className="space-y-1 border-t border-border/50 pt-4">
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <div className="space-y-1">
+                <h3 className="text-sm font-medium">
+                  {t("combinedProvider.testConfig.title", {
+                    defaultValue: "组合测试配置",
+                  })}
+                </h3>
+                <p className="text-xs text-muted-foreground">
+                  {t("combinedProvider.testConfig.hint", {
+                    defaultValue:
+                      "开启后会按模型映射中已配置路由逐条巡检；巡检请求会自动去掉 thinking 参数和 [1M] 本地标记，避免上游误判。",
+                  })}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <Label
+                  htmlFor="combined-test-config-enabled"
+                  className="text-sm text-muted-foreground"
+                >
+                  {t("combinedProvider.testConfig.enabled", {
+                    defaultValue: "使用单独配置",
+                  })}
+                </Label>
+                <Switch
+                  id="combined-test-config-enabled"
+                  checked={modelRouterTestConfig.enabled}
+                  onCheckedChange={(checked) =>
+                    setModelRouterTestConfig((prev) => ({
+                      ...prev,
+                      enabled: checked,
+                    }))
+                  }
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="combined-test-mode">
+                {t("combinedProvider.testConfig.mode", {
+                  defaultValue: "巡检模式",
+                })}
+              </Label>
+              <Input
+                id="combined-test-mode"
+                value={t("combinedProvider.testConfig.mode.allRoutes", {
+                  defaultValue: "全量巡检（按已配置路由）",
+                })}
+                disabled
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="combined-test-timeout">
+                {t("providerAdvanced.timeoutSecs", {
+                  defaultValue: "超时时间（秒）",
+                })}
+              </Label>
+              <Input
+                id="combined-test-timeout"
+                type="number"
+                min={1}
+                max={300}
+                value={modelRouterTestConfig.timeoutSecs || ""}
+                onChange={(event) =>
+                  setModelRouterTestConfig((prev) => ({
+                    ...prev,
+                    timeoutSecs: event.target.value
+                      ? parseInt(event.target.value, 10)
+                      : undefined,
+                  }))
+                }
+                placeholder="45"
+                disabled={!modelRouterTestConfig.enabled}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="combined-test-prompt">
+                {t("providerAdvanced.testPrompt", {
+                  defaultValue: "测试提示词",
+                })}
+              </Label>
+              <Input
+                id="combined-test-prompt"
+                value={modelRouterTestConfig.testPrompt || ""}
+                onChange={(event) =>
+                  setModelRouterTestConfig((prev) => ({
+                    ...prev,
+                    testPrompt: event.target.value || undefined,
+                  }))
+                }
+                placeholder="Who are you?"
+                disabled={!modelRouterTestConfig.enabled}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="combined-degraded-threshold">
+                {t("providerAdvanced.degradedThreshold", {
+                  defaultValue: "降级阈值（毫秒）",
+                })}
+              </Label>
+              <Input
+                id="combined-degraded-threshold"
+                type="number"
+                min={100}
+                max={60000}
+                value={modelRouterTestConfig.degradedThresholdMs || ""}
+                onChange={(event) =>
+                  setModelRouterTestConfig((prev) => ({
+                    ...prev,
+                    degradedThresholdMs: event.target.value
+                      ? parseInt(event.target.value, 10)
+                      : undefined,
+                  }))
+                }
+                placeholder="6000"
+                disabled={!modelRouterTestConfig.enabled}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="combined-max-retries">
+                {t("providerAdvanced.maxRetries", {
+                  defaultValue: "最大重试次数",
+                })}
+              </Label>
+              <Input
+                id="combined-max-retries"
+                type="number"
+                min={0}
+                max={10}
+                value={modelRouterTestConfig.maxRetries ?? ""}
+                onChange={(event) =>
+                  setModelRouterTestConfig((prev) => ({
+                    ...prev,
+                    maxRetries: event.target.value
+                      ? parseInt(event.target.value, 10)
+                      : undefined,
+                  }))
+                }
+                placeholder="2"
+                disabled={!modelRouterTestConfig.enabled}
+              />
+            </div>
+          </div>
         </section>
 
         <section className="space-y-3">

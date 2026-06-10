@@ -5,6 +5,14 @@ import type { AppId } from "./types";
 
 export type HealthStatus = "operational" | "degraded" | "failed";
 
+export interface ModelRouterRouteCheckResult {
+  routeKey: string;
+  requestModel: string;
+  targetProviderId?: string;
+  targetProviderName?: string;
+  result: StreamCheckResult;
+}
+
 export interface StreamCheckConfig {
   timeoutSecs: number;
   maxRetries: number;
@@ -26,6 +34,8 @@ export interface StreamCheckResult {
   retryCount: number;
   /** 细粒度错误分类，如 "modelNotFound" */
   errorCategory?: string;
+  auditMode?: string;
+  routeResults?: ModelRouterRouteCheckResult[];
 }
 
 // ===== 流式健康检查 API =====

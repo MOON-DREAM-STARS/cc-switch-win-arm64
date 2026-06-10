@@ -326,6 +326,34 @@ pub struct ProviderTestConfig {
     pub max_retries: Option<u32>,
 }
 
+/// 组合 Provider 专属巡检模式。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRouterTestMode {
+    #[default]
+    AllRoutes,
+}
+
+/// 组合 Provider 专属巡检配置。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelRouterTestConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ModelRouterTestMode>,
+    #[serde(rename = "timeoutSecs", skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    #[serde(rename = "testPrompt", skip_serializing_if = "Option::is_none")]
+    pub test_prompt: Option<String>,
+    #[serde(
+        rename = "degradedThresholdMs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub degraded_threshold_ms: Option<u64>,
+    #[serde(rename = "maxRetries", skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+}
+
 /// 认证绑定来源
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -681,6 +709,12 @@ pub struct ProviderMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub model_router: Option<ModelRouterConfig>,
+    /// 组合 Provider 的专属巡检配置。
+    #[serde(
+        rename = "modelRouterTestConfig",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_router_test_config: Option<ModelRouterTestConfig>,
     /// GitHub Copilot 关联账号 ID（仅 github_copilot 供应商使用）
     /// 用于多账号支持，关联到特定的 GitHub 账号
     #[serde(rename = "githubAccountId", skip_serializing_if = "Option::is_none")]

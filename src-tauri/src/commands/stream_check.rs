@@ -4,9 +4,11 @@ use crate::app_config::AppType;
 use crate::commands::copilot::CopilotAuthState;
 use crate::database::Database;
 use crate::error::AppError;
-use crate::provider::Provider;
+use crate::provider::{ModelRouterMatchType, ModelRouterRule, Provider};
+use crate::proxy::model_mapper::strip_one_m_suffix_for_upstream;
 use crate::services::stream_check::{
-    HealthStatus, StreamCheckConfig, StreamCheckResult, StreamCheckService,
+    HealthStatus, ModelRouterRouteCheckResult, StreamCheckConfig, StreamCheckResult,
+    StreamCheckService,
 };
 use crate::store::AppState;
 use std::collections::HashSet;
@@ -105,6 +107,8 @@ pub async fn stream_check_all_providers(
                 tested_at: chrono::Utc::now().timestamp(),
                 retry_count: 0,
                 error_category: None,
+                audit_mode: None,
+                route_results: None,
             }
         });
 
@@ -133,94 +137,106 @@ pub fn save_stream_check_config(
     state.db.save_stream_check_config(&config)
 }
 
-fn resolve_model_router_targets_for_check(
+fn resolve_model_router_targets_for_request_model(
     db: &Database,
     app_type: &AppType,
     provider: &Provider,
-    config: &StreamCheckConfig,
+    request_model: &str,
 ) -> Result<Vec<Provider>, AppError> {
     if !provider.is_model_router() {
         return Ok(vec![provider.clone()]);
     }
 
-    let request_model = resolve_model_router_test_model(provider)
-        .unwrap_or_else(|| StreamCheckService::resolve_effective_test_model(app_type, provider, config));
     crate::proxy::model_router::resolve_provider_chain(
         db,
         app_type.as_str(),
         provider,
-        &request_model,
+        request_model,
     )
 }
 
-fn resolve_model_router_test_model(provider: &Provider) -> Option<String> {
-    let config = provider
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.model_router.as_ref())?;
+fn managed_model_router_route_key(route: &ModelRouterRule) -> Option<String> {
+    match route.id.as_deref().map(str::trim) {
+        Some("combined-default") => return Some("default".to_string()),
+        Some("combined-role-haiku") => return Some("haiku".to_string()),
+        Some("combined-role-sonnet") => return Some("sonnet".to_string()),
+        Some("combined-role-opus") => return Some("opus".to_string()),
+        _ => {}
+    }
 
-    for route in &config.routes {
-        match route.match_type {
-            crate::provider::ModelRouterMatchType::Exact => {
-                if let Some(match_value) = route.match_value.as_deref() {
-                    let match_value = match_value.trim();
-                    if !match_value.is_empty() {
-                        return Some(match_value.to_string());
-                    }
-                }
-            }
-            crate::provider::ModelRouterMatchType::Role => match route
-                .match_value
-                .as_deref()
-                .map(str::trim)
-                .map(str::to_ascii_lowercase)
-                .as_deref()
-            {
-                Some("haiku") => return Some("claude-haiku-4-5".to_string()),
-                Some("sonnet") => return Some("claude-sonnet-4-6".to_string()),
-                Some("opus") => return Some("claude-opus-4-8".to_string()),
-                _ => {}
-            },
-            crate::provider::ModelRouterMatchType::Default => {
-                return Some("cc-switch-default".to_string());
+    match route.match_type {
+        ModelRouterMatchType::Default => Some("default".to_string()),
+        ModelRouterMatchType::Role => route
+            .match_value
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .filter(|value| matches!(value.as_str(), "haiku" | "sonnet" | "opus" | "default")),
+        ModelRouterMatchType::Exact => None,
+    }
+}
+
+fn request_model_for_managed_route(route_key: &str) -> &'static str {
+    match route_key {
+        "haiku" => "claude-haiku-4-5",
+        "sonnet" => "claude-sonnet-4-6",
+        "opus" => "claude-opus-4-8",
+        _ => "cc-switch-default",
+    }
+}
+
+fn sanitize_composite_audit_model(model: &str) -> String {
+    let without_one_m = strip_one_m_suffix_for_upstream(model).trim();
+    let without_effort = without_one_m
+        .find('@')
+        .or_else(|| without_one_m.find('#'))
+        .map(|pos| without_one_m[..pos].trim())
+        .unwrap_or(without_one_m);
+    without_effort.to_string()
+}
+
+fn sanitize_composite_audit_targets(mut targets: Vec<Provider>) -> Vec<Provider> {
+    for target in &mut targets {
+        if let Some(meta) = target.meta.as_mut() {
+            if let Some(runtime_model) = meta.runtime_upstream_model.as_deref() {
+                let sanitized = sanitize_composite_audit_model(runtime_model);
+                meta.runtime_upstream_model = (!sanitized.is_empty()).then_some(sanitized);
             }
         }
     }
-
-    None
+    targets
 }
 
-async fn check_provider_with_model_router_targets(
-    db: &Database,
+fn stream_check_result_from_error(error: &AppError, model_used: String) -> StreamCheckResult {
+    let (http_status, message) = match error {
+        AppError::HttpStatus { status, .. } => (
+            Some(*status),
+            StreamCheckService::classify_http_status(*status).to_string(),
+        ),
+        _ => (None, error.to_string()),
+    };
+
+    StreamCheckResult {
+        status: HealthStatus::Failed,
+        success: false,
+        message,
+        response_time_ms: None,
+        http_status,
+        model_used,
+        tested_at: chrono::Utc::now().timestamp(),
+        retry_count: 0,
+        error_category: None,
+        audit_mode: None,
+        route_results: None,
+    }
+}
+
+async fn check_resolved_target_chain(
     copilot_state: &State<'_, CopilotAuthState>,
     app_type: &AppType,
-    provider: &Provider,
+    targets: &[Provider],
     config: &StreamCheckConfig,
 ) -> Result<StreamCheckResult, AppError> {
-    if !provider.is_model_router() {
-        let auth_override = resolve_copilot_auth_override(provider, copilot_state).await?;
-        let base_url_override = resolve_copilot_base_url_override(provider, copilot_state).await?;
-        let claude_api_format_override = resolve_claude_api_format_override(
-            app_type,
-            provider,
-            config,
-            copilot_state,
-            auth_override.as_ref(),
-        )
-        .await?;
-
-        return StreamCheckService::check_with_retry(
-            app_type,
-            provider,
-            config,
-            auth_override,
-            base_url_override,
-            claude_api_format_override,
-        )
-        .await;
-    }
-
-    let targets = resolve_model_router_targets_for_check(db, app_type, provider, config)?;
     let max_targets = targets.len().saturating_sub(1) as u32;
     let mut last_error: Option<AppError> = None;
     let mut last_result: Option<StreamCheckResult> = None;
@@ -237,7 +253,7 @@ async fn check_provider_with_model_router_targets(
         )
         .await?;
 
-        match StreamCheckService::check_with_retry(
+        match StreamCheckService::check_with_retry_without_provider_override(
             app_type,
             target,
             config,
@@ -273,6 +289,151 @@ async fn check_provider_with_model_router_targets(
     }
 
     Err(last_error.unwrap_or_else(|| AppError::NoProvidersConfigured))
+}
+
+async fn check_model_router_provider(
+    db: &Database,
+    copilot_state: &State<'_, CopilotAuthState>,
+    app_type: &AppType,
+    provider: &Provider,
+    config: &StreamCheckConfig,
+) -> Result<StreamCheckResult, AppError> {
+    let router_config = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.model_router.as_ref())
+        .ok_or(AppError::NoProvidersConfigured)?;
+    let effective_config = StreamCheckService::merge_model_router_config(provider, config);
+    let mut route_results = Vec::new();
+
+    for route in &router_config.routes {
+        let Some(route_key) = managed_model_router_route_key(route) else {
+            continue;
+        };
+        if route.normalized_provider_chain().is_empty() {
+            continue;
+        }
+
+        let request_model = request_model_for_managed_route(&route_key).to_string();
+        match resolve_model_router_targets_for_request_model(db, app_type, provider, &request_model)
+        {
+            Ok(targets) if !targets.is_empty() => {
+                let targets = sanitize_composite_audit_targets(targets);
+                let primary_target = targets.first();
+                let result = match check_resolved_target_chain(
+                    copilot_state,
+                    app_type,
+                    &targets,
+                    &effective_config,
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => stream_check_result_from_error(&error, request_model.clone()),
+                };
+
+                route_results.push(ModelRouterRouteCheckResult {
+                    route_key,
+                    request_model,
+                    target_provider_id: primary_target.map(|target| target.id.clone()),
+                    target_provider_name: primary_target.map(|target| target.name.clone()),
+                    result,
+                });
+            }
+            Ok(_) => continue,
+            Err(error) => {
+                route_results.push(ModelRouterRouteCheckResult {
+                    route_key,
+                    request_model: request_model.clone(),
+                    target_provider_id: None,
+                    target_provider_name: None,
+                    result: stream_check_result_from_error(&error, request_model),
+                });
+            }
+        }
+    }
+
+    if route_results.is_empty() {
+        return Err(AppError::NoProvidersConfigured);
+    }
+
+    let success = route_results.iter().all(|item| item.result.success);
+    let status = if !success {
+        HealthStatus::Failed
+    } else if route_results
+        .iter()
+        .any(|item| item.result.status == HealthStatus::Degraded)
+    {
+        HealthStatus::Degraded
+    } else {
+        HealthStatus::Operational
+    };
+    let response_time_ms = route_results
+        .iter()
+        .filter_map(|item| item.result.response_time_ms)
+        .max();
+    let first_failure = route_results.iter().find(|item| !item.result.success);
+    let first_result = route_results.first().map(|item| &item.result);
+
+    Ok(StreamCheckResult {
+        status,
+        success,
+        message: if success {
+            format!("已完成 {} 条组合路由巡检", route_results.len())
+        } else {
+            format!(
+                "组合路由巡检失败：{} / {} 条通过",
+                route_results
+                    .iter()
+                    .filter(|item| item.result.success)
+                    .count(),
+                route_results.len()
+            )
+        },
+        response_time_ms,
+        http_status: first_failure.and_then(|item| item.result.http_status),
+        model_used: first_result
+            .map(|result| result.model_used.clone())
+            .unwrap_or_default(),
+        tested_at: chrono::Utc::now().timestamp(),
+        retry_count: 0,
+        error_category: first_failure.and_then(|item| item.result.error_category.clone()),
+        audit_mode: Some("all_routes".to_string()),
+        route_results: Some(route_results),
+    })
+}
+
+async fn check_provider_with_model_router_targets(
+    db: &Database,
+    copilot_state: &State<'_, CopilotAuthState>,
+    app_type: &AppType,
+    provider: &Provider,
+    config: &StreamCheckConfig,
+) -> Result<StreamCheckResult, AppError> {
+    if !provider.is_model_router() {
+        let auth_override = resolve_copilot_auth_override(provider, copilot_state).await?;
+        let base_url_override = resolve_copilot_base_url_override(provider, copilot_state).await?;
+        let claude_api_format_override = resolve_claude_api_format_override(
+            app_type,
+            provider,
+            config,
+            copilot_state,
+            auth_override.as_ref(),
+        )
+        .await?;
+
+        return StreamCheckService::check_with_retry(
+            app_type,
+            provider,
+            config,
+            auth_override,
+            base_url_override,
+            claude_api_format_override,
+        )
+        .await;
+    }
+
+    check_model_router_provider(db, copilot_state, app_type, provider, config).await
 }
 
 async fn resolve_copilot_auth_override(
@@ -402,7 +563,8 @@ async fn resolve_claude_api_format_override(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_copilot_provider, resolve_model_router_targets_for_check, resolve_model_router_test_model,
+        is_copilot_provider, managed_model_router_route_key, request_model_for_managed_route,
+        resolve_model_router_targets_for_request_model, sanitize_composite_audit_model,
     };
     use crate::app_config::AppType;
     use crate::database::Database;
@@ -410,37 +572,37 @@ mod tests {
         ModelRouterConfig, ModelRouterMatchType, ModelRouterProviderRef, ModelRouterRule, Provider,
         ProviderMeta,
     };
-    use crate::services::stream_check::StreamCheckConfig;
     use serde_json::json;
 
     #[test]
-    fn model_router_stream_check_uses_client_route_model() {
-        let mut provider = Provider::with_id(
-            "router".to_string(),
-            "Router".to_string(),
-            json!({ "env": {} }),
-            None,
+    fn sanitize_composite_audit_model_strips_effort_and_one_m_marker() {
+        assert_eq!(sanitize_composite_audit_model("gpt-5.5@low[1M]"), "gpt-5.5");
+        assert_eq!(
+            sanitize_composite_audit_model("deepseek-reasoner#high [1M]"),
+            "deepseek-reasoner"
         );
-        provider.meta = Some(ProviderMeta {
-            provider_type: Some("model_router".to_string()),
-            model_router: Some(ModelRouterConfig {
-                routes: vec![ModelRouterRule {
-                    id: None,
-                    match_type: ModelRouterMatchType::Role,
-                    match_value: Some("opus".to_string()),
-                    target: None,
-                    provider_chain: Vec::new(),
-                    fallbacks: Vec::new(),
-                }],
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
+        assert_eq!(
+            sanitize_composite_audit_model("claude-sonnet-4-5-20250929[1M]"),
+            "claude-sonnet-4-5-20250929"
+        );
+    }
+
+    #[test]
+    fn model_router_managed_route_uses_expected_request_model() {
+        let route = ModelRouterRule {
+            id: Some("combined-role-opus".to_string()),
+            match_type: ModelRouterMatchType::Role,
+            match_value: Some("opus".to_string()),
+            target: None,
+            provider_chain: Vec::new(),
+            fallbacks: Vec::new(),
+        };
 
         assert_eq!(
-            resolve_model_router_test_model(&provider).as_deref(),
-            Some("claude-opus-4-8")
+            managed_model_router_route_key(&route).as_deref(),
+            Some("opus")
         );
+        assert_eq!(request_model_for_managed_route("opus"), "claude-opus-4-8");
     }
 
     #[test]
@@ -487,11 +649,11 @@ mod tests {
             ..Default::default()
         });
 
-        let resolved = resolve_model_router_targets_for_check(
+        let resolved = resolve_model_router_targets_for_request_model(
             &db,
             &AppType::Claude,
             &router,
-            &StreamCheckConfig::default(),
+            "claude-sonnet-4-6",
         )
         .expect("router should resolve to target provider");
 
