@@ -238,4 +238,111 @@ describe("useManagedCombinedProvider", () => {
 
     expect(apiMocks.update).not.toHaveBeenCalled();
   });
+
+  it("does not update when only unmanaged identity fields change", async () => {
+    const managed: Provider = {
+      id: COMBINED_PROVIDER_ID,
+      name: "我的组合 Provider",
+      notes: "custom notes",
+      websiteUrl: "https://example.com/combined",
+      icon: "route",
+      iconColor: "#123456",
+      sortIndex: 1,
+      settingsConfig: { env: {} },
+      meta: {
+        providerType: "model_router",
+        managedModelRouterProvider: true,
+        modelRouter: { version: 1, routes: [] },
+      },
+    };
+    const { wrapper } = createWrapper();
+
+    const { rerender } = renderHook(
+      ({ combinedProvider }) =>
+        useManagedCombinedProvider({
+          appId: "claude",
+          providers: {
+            [ordinaryProvider.id]: ordinaryProvider,
+            [combinedProvider.id]: combinedProvider,
+          },
+          enabled: true,
+          isLoading: false,
+        }),
+      { wrapper, initialProps: { combinedProvider: managed } },
+    );
+
+    await act(async () => {});
+
+    rerender({
+      combinedProvider: {
+        ...managed,
+        notes: "changed notes",
+        websiteUrl: "https://changed.example.com",
+        icon: "anthropic",
+        iconColor: "#abcdef",
+        sortIndex: 99,
+      },
+    });
+    await act(async () => {});
+
+    expect(apiMocks.update).not.toHaveBeenCalled();
+  });
+
+  it("keeps modelRouter route changes in the managed sync signature", async () => {
+    const createLegacyManaged = (upstreamModel: string): Provider => ({
+      id: COMBINED_PROVIDER_ID,
+      name: "组合provider",
+      settingsConfig: { env: {} },
+      meta: {
+        providerType: "model_router",
+        managedModelRouterProvider: true,
+        model_router: {
+          routes: [
+            {
+              id: "combined-default",
+              matchType: "default",
+              target: { providerId: ordinaryProvider.id, upstreamModel },
+            },
+          ],
+        },
+      },
+    });
+    const { wrapper } = createWrapper();
+
+    const { rerender } = renderHook(
+      ({ combinedProvider }) =>
+        useManagedCombinedProvider({
+          appId: "claude",
+          providers: {
+            [ordinaryProvider.id]: ordinaryProvider,
+            [combinedProvider.id]: combinedProvider,
+          },
+          enabled: true,
+          isLoading: false,
+        }),
+      {
+        wrapper,
+        initialProps: {
+          combinedProvider: createLegacyManaged("first-model"),
+        },
+      },
+    );
+
+    await waitFor(() => expect(apiMocks.update).toHaveBeenCalledTimes(1));
+    apiMocks.update.mockClear();
+
+    rerender({ combinedProvider: createLegacyManaged("second-model") });
+
+    await waitFor(() => expect(apiMocks.update).toHaveBeenCalledTimes(1));
+    expect(apiMocks.update.mock.calls[0][0].meta.modelRouter.routes).toEqual([
+      {
+        id: "combined-default",
+        matchType: "default",
+        target: {
+          providerId: ordinaryProvider.id,
+          upstreamModel: "second-model",
+        },
+      },
+    ]);
+  });
 });

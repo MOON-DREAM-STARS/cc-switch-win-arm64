@@ -101,6 +101,7 @@ impl Database {
             if let Some(meta) = &mut provider.meta {
                 meta.custom_endpoints = custom_endpoints;
             }
+            provider.normalize_model_router_routes();
 
             providers.insert(id, provider);
         }
@@ -171,7 +172,10 @@ impl Database {
         );
 
         match result {
-            Ok(provider) => Ok(Some(provider)),
+            Ok(mut provider) => {
+                provider.normalize_model_router_routes();
+                Ok(Some(provider))
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(AppError::Database(e.to_string())),
         }
@@ -185,6 +189,7 @@ impl Database {
 
         let mut meta_clone = provider.meta.clone().unwrap_or_default();
         let endpoints = std::mem::take(&mut meta_clone.custom_endpoints);
+        meta_clone.normalize_model_router_routes();
 
         let existing: Option<(bool, bool)> = tx
             .query_row(
@@ -704,6 +709,202 @@ impl Database {
         self.save_provider(app_type_str, &provider)?;
 
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod model_router_normalization_tests {
+    use crate::database::Database;
+    use crate::provider::{
+        ModelRouterConfig, ModelRouterMatchType, ModelRouterProviderRef, ModelRouterRule, Provider,
+        ProviderMeta,
+    };
+    use rusqlite::params;
+    use serde_json::json;
+
+    fn target(provider_id: &str) -> ModelRouterProviderRef {
+        ModelRouterProviderRef {
+            provider_id: provider_id.to_string(),
+            upstream_model: None,
+            label: None,
+        }
+    }
+
+    fn role_route(id: Option<&str>, role: &str, provider_id: &str) -> ModelRouterRule {
+        ModelRouterRule {
+            id: id.map(str::to_string),
+            match_type: ModelRouterMatchType::Role,
+            match_value: Some(role.to_string()),
+            target: Some(target(provider_id)),
+            provider_chain: Vec::new(),
+            fallbacks: Vec::new(),
+        }
+    }
+
+    fn default_route(provider_id: &str) -> ModelRouterRule {
+        ModelRouterRule {
+            id: None,
+            match_type: ModelRouterMatchType::Default,
+            match_value: Some("default".to_string()),
+            target: Some(target(provider_id)),
+            provider_chain: Vec::new(),
+            fallbacks: Vec::new(),
+        }
+    }
+
+    fn router_meta(routes: Vec<ModelRouterRule>) -> ProviderMeta {
+        ProviderMeta {
+            provider_type: Some("model_router".to_string()),
+            model_router: Some(ModelRouterConfig {
+                routes,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn route_targets(meta: &ProviderMeta) -> Vec<String> {
+        meta.model_router
+            .as_ref()
+            .expect("model router")
+            .routes
+            .iter()
+            .map(|route| {
+                route
+                    .target
+                    .as_ref()
+                    .map(|target| target.provider_id.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn route_ids(meta: &ProviderMeta) -> Vec<Option<String>> {
+        meta.model_router
+            .as_ref()
+            .expect("model router")
+            .routes
+            .iter()
+            .map(|route| route.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn get_provider_normalizes_legacy_model_router_routes() {
+        let db = Database::memory().expect("memory db");
+        let config = ModelRouterConfig {
+            routes: vec![
+                ModelRouterRule {
+                    id: Some("custom-exact".to_string()),
+                    match_type: ModelRouterMatchType::Exact,
+                    match_value: Some("custom-model".to_string()),
+                    target: Some(target("custom")),
+                    provider_chain: Vec::new(),
+                    fallbacks: Vec::new(),
+                },
+                role_route(None, "sonnet", "old-sonnet"),
+                role_route(Some("combined-role-sonnet"), "sonnet", "new-sonnet"),
+                default_route("new-default"),
+            ],
+            ..Default::default()
+        };
+        let meta_json = json!({
+            "providerType": "model_router",
+            "model_router": config,
+        })
+        .to_string();
+        let conn = db.conn.lock().expect("lock conn");
+        conn.execute(
+            "INSERT INTO providers (
+                id, app_type, name, settings_config, website_url, category,
+                created_at, sort_index, notes, icon, icon_color, meta, is_current, in_failover_queue
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                "router",
+                "claude",
+                "Router",
+                "{}",
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<i64>::None,
+                Option::<usize>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                meta_json,
+                false,
+                false,
+            ],
+        )
+        .expect("insert provider");
+        drop(conn);
+
+        let provider = db
+            .get_provider_by_id("router", "claude")
+            .expect("query provider")
+            .expect("provider exists");
+        let meta = provider.meta.as_ref().expect("meta");
+        assert_eq!(
+            route_ids(meta),
+            vec![
+                Some("custom-exact".to_string()),
+                Some("combined-default".to_string()),
+                Some("combined-role-sonnet".to_string()),
+            ]
+        );
+        assert_eq!(
+            route_targets(meta),
+            vec!["custom", "new-default", "new-sonnet"]
+        );
+
+        let providers = db.get_all_providers("claude").expect("query providers");
+        let list_meta = providers
+            .get("router")
+            .and_then(|provider| provider.meta.as_ref())
+            .expect("listed provider meta");
+        assert_eq!(
+            route_targets(list_meta),
+            vec!["custom", "new-default", "new-sonnet"]
+        );
+    }
+
+    #[test]
+    fn save_provider_persists_normalized_model_router_routes() {
+        let db = Database::memory().expect("memory db");
+        let mut provider = Provider::with_id(
+            "router".to_string(),
+            "Router".to_string(),
+            json!({ "env": {} }),
+            None,
+        );
+        provider.meta = Some(router_meta(vec![
+            role_route(None, "haiku", "old-haiku"),
+            role_route(None, "haiku", "new-haiku"),
+            default_route("new-default"),
+        ]));
+
+        db.save_provider("claude", &provider)
+            .expect("save provider");
+
+        let conn = db.conn.lock().expect("lock conn");
+        let meta_json: String = conn
+            .query_row(
+                "SELECT meta FROM providers WHERE id = ?1 AND app_type = ?2",
+                params!["router", "claude"],
+                |row| row.get(0),
+            )
+            .expect("read meta");
+        drop(conn);
+        let meta: ProviderMeta = serde_json::from_str(&meta_json).expect("deserialize meta");
+
+        assert_eq!(
+            route_ids(&meta),
+            vec![
+                Some("combined-default".to_string()),
+                Some("combined-role-haiku".to_string()),
+            ]
+        );
+        assert_eq!(route_targets(&meta), vec!["new-default", "new-haiku"]);
     }
 }
 

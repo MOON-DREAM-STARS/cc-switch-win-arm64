@@ -425,6 +425,7 @@ mod tests {
             provider_type: Some("model_router".to_string()),
             model_router: Some(ModelRouterConfig {
                 routes: vec![ModelRouterRule {
+                    id: None,
                     match_type: ModelRouterMatchType::Role,
                     match_value: Some("opus".to_string()),
                     target: None,
@@ -470,6 +471,7 @@ mod tests {
             provider_type: Some("model_router".to_string()),
             model_router: Some(ModelRouterConfig {
                 routes: vec![ModelRouterRule {
+                    id: None,
                     match_type: ModelRouterMatchType::Role,
                     match_value: Some("sonnet".to_string()),
                     target: Some(ModelRouterProviderRef {

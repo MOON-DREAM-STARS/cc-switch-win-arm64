@@ -2771,6 +2771,7 @@ mod tests {
             model_router: Some(crate::provider::ModelRouterConfig {
                 routes: vec![
                     crate::provider::ModelRouterRule {
+                        id: None,
                         match_type: crate::provider::ModelRouterMatchType::Role,
                         match_value: Some("haiku".to_string()),
                         target: Some(ModelRouterProviderRef {
@@ -2782,6 +2783,7 @@ mod tests {
                         fallbacks: Vec::new(),
                     },
                     crate::provider::ModelRouterRule {
+                        id: None,
                         match_type: crate::provider::ModelRouterMatchType::Role,
                         match_value: Some("sonnet".to_string()),
                         target: Some(ModelRouterProviderRef {
@@ -2793,6 +2795,7 @@ mod tests {
                         fallbacks: Vec::new(),
                     },
                     crate::provider::ModelRouterRule {
+                        id: None,
                         match_type: crate::provider::ModelRouterMatchType::Role,
                         match_value: Some("opus".to_string()),
                         target: Some(ModelRouterProviderRef {
@@ -2870,6 +2873,7 @@ mod tests {
             provider_type: Some("model_router".to_string()),
             model_router: Some(crate::provider::ModelRouterConfig {
                 routes: vec![crate::provider::ModelRouterRule {
+                    id: None,
                     match_type: crate::provider::ModelRouterMatchType::Role,
                     match_value: Some("sonnet".to_string()),
                     target: Some(ModelRouterProviderRef {

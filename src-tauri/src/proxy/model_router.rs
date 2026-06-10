@@ -27,14 +27,15 @@ pub fn resolve_provider_chain(
             router_provider.id
         ))
     })?;
-    let config = meta.model_router.as_ref().ok_or_else(|| {
+    let mut config = meta.model_router.clone().ok_or_else(|| {
         AppError::InvalidInput(format!(
             "model_router provider '{}' is missing modelRouter config",
             router_provider.id
         ))
     })?;
+    config.normalize_managed_routes();
 
-    let rule = select_rule(config, request_model).ok_or_else(|| {
+    let rule = select_rule(&config, request_model).ok_or_else(|| {
         AppError::InvalidInput(format!(
             "model_router provider '{}' has no route for model '{}'",
             router_provider.id, request_model
@@ -187,6 +188,7 @@ mod tests {
         let config = ModelRouterConfig {
             routes: vec![
                 ModelRouterRule {
+                    id: None,
                     match_type: ModelRouterMatchType::Role,
                     match_value: Some("sonnet".to_string()),
                     target: Some(target("role", None)),
@@ -194,6 +196,7 @@ mod tests {
                     fallbacks: Vec::new(),
                 },
                 ModelRouterRule {
+                    id: None,
                     match_type: ModelRouterMatchType::Exact,
                     match_value: Some("claude-sonnet-4-6".to_string()),
                     target: Some(target("exact", None)),
@@ -223,6 +226,7 @@ mod tests {
         db.save_provider("claude", &provider_b).expect("save b");
 
         let router = router_with_routes(vec![ModelRouterRule {
+            id: None,
             match_type: ModelRouterMatchType::Role,
             match_value: Some("sonnet".to_string()),
             target: Some(target("a", Some("gpt-5.4"))),
@@ -265,6 +269,7 @@ mod tests {
         db.save_provider("claude", &nested).expect("save nested");
 
         let router = router_with_routes(vec![ModelRouterRule {
+            id: None,
             match_type: ModelRouterMatchType::Default,
             match_value: None,
             target: Some(target("missing", None)),

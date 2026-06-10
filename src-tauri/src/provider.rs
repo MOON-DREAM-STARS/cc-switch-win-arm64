@@ -74,6 +74,12 @@ impl Provider {
         self.provider_type() == Some("model_router")
     }
 
+    pub fn normalize_model_router_routes(&mut self) {
+        if let Some(meta) = &mut self.meta {
+            meta.normalize_model_router_routes();
+        }
+    }
+
     pub fn is_github_copilot(&self) -> bool {
         self.provider_type() == Some("github_copilot")
             || self.claude_base_url_contains("githubcopilot.com")
@@ -381,7 +387,7 @@ pub struct ModelRouterProviderRef {
 }
 
 /// Model Router 路由匹配类型。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelRouterMatchType {
     Exact,
@@ -391,7 +397,7 @@ pub enum ModelRouterMatchType {
 }
 
 /// Model Router 支持的角色关键词。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelRouterRole {
     Opus,
@@ -405,6 +411,8 @@ pub enum ModelRouterRole {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRouterRule {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     #[serde(alias = "match_type")]
     pub match_type: ModelRouterMatchType,
     #[serde(alias = "match_value")]
@@ -433,6 +441,64 @@ impl ModelRouterRule {
 
         chain
     }
+
+    fn managed_route_key(&self) -> Option<ModelRouterRole> {
+        match self.id.as_deref().map(str::trim) {
+            Some("combined-default") => return Some(ModelRouterRole::Default),
+            Some("combined-role-haiku") => return Some(ModelRouterRole::Haiku),
+            Some("combined-role-sonnet") => return Some(ModelRouterRole::Sonnet),
+            Some("combined-role-opus") => return Some(ModelRouterRole::Opus),
+            _ => {}
+        }
+
+        match self.match_type {
+            ModelRouterMatchType::Default => Some(ModelRouterRole::Default),
+            ModelRouterMatchType::Role => self
+                .match_value
+                .as_deref()
+                .and_then(ModelRouterRole::from_route_value),
+            ModelRouterMatchType::Exact => None,
+        }
+    }
+
+    fn normalize_managed_identity(mut self, role: ModelRouterRole) -> Self {
+        match role {
+            ModelRouterRole::Default => {
+                self.id = Some("combined-default".to_string());
+                self.match_type = ModelRouterMatchType::Default;
+                self.match_value = None;
+            }
+            ModelRouterRole::Haiku => {
+                self.id = Some("combined-role-haiku".to_string());
+                self.match_type = ModelRouterMatchType::Role;
+                self.match_value = Some("haiku".to_string());
+            }
+            ModelRouterRole::Sonnet => {
+                self.id = Some("combined-role-sonnet".to_string());
+                self.match_type = ModelRouterMatchType::Role;
+                self.match_value = Some("sonnet".to_string());
+            }
+            ModelRouterRole::Opus => {
+                self.id = Some("combined-role-opus".to_string());
+                self.match_type = ModelRouterMatchType::Role;
+                self.match_value = Some("opus".to_string());
+            }
+        }
+
+        self
+    }
+}
+
+impl ModelRouterRole {
+    fn from_route_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" => Some(Self::Default),
+            "haiku" => Some(Self::Haiku),
+            "sonnet" => Some(Self::Sonnet),
+            "opus" => Some(Self::Opus),
+            _ => None,
+        }
+    }
 }
 
 fn default_model_router_version() -> u32 {
@@ -455,6 +521,41 @@ impl Default for ModelRouterConfig {
             version: default_model_router_version(),
             routes: Vec::new(),
         }
+    }
+}
+
+impl ModelRouterConfig {
+    pub fn normalize_managed_routes(&mut self) {
+        let mut preserved = Vec::new();
+        let mut default_route = None;
+        let mut haiku_route = None;
+        let mut sonnet_route = None;
+        let mut opus_route = None;
+
+        for route in std::mem::take(&mut self.routes) {
+            match route.managed_route_key() {
+                Some(ModelRouterRole::Default) => {
+                    default_route =
+                        Some(route.normalize_managed_identity(ModelRouterRole::Default));
+                }
+                Some(ModelRouterRole::Haiku) => {
+                    haiku_route = Some(route.normalize_managed_identity(ModelRouterRole::Haiku));
+                }
+                Some(ModelRouterRole::Sonnet) => {
+                    sonnet_route = Some(route.normalize_managed_identity(ModelRouterRole::Sonnet));
+                }
+                Some(ModelRouterRole::Opus) => {
+                    opus_route = Some(route.normalize_managed_identity(ModelRouterRole::Opus));
+                }
+                None => preserved.push(route),
+            }
+        }
+
+        self.routes = preserved;
+        self.routes.extend(default_route);
+        self.routes.extend(haiku_route);
+        self.routes.extend(sonnet_route);
+        self.routes.extend(opus_route);
     }
 }
 
@@ -590,6 +691,12 @@ pub struct ProviderMeta {
 }
 
 impl ProviderMeta {
+    pub fn normalize_model_router_routes(&mut self) {
+        if let Some(config) = &mut self.model_router {
+            config.normalize_managed_routes();
+        }
+    }
+
     /// Codex OAuth FAST mode 是否启用。默认关闭，因为 `service_tier="priority"`
     /// 会按更高速率消耗 ChatGPT 订阅配额，用户需显式开启以换取更低延迟。
     pub fn codex_fast_mode_enabled(&self) -> bool {
@@ -1139,6 +1246,7 @@ mod tests {
             provider_type: Some("model_router".to_string()),
             model_router: Some(ModelRouterConfig {
                 routes: vec![ModelRouterRule {
+                    id: None,
                     match_type: ModelRouterMatchType::Role,
                     match_value: Some("sonnet".to_string()),
                     target: Some(ModelRouterProviderRef {
@@ -1164,6 +1272,134 @@ mod tests {
         assert!(value.get("modelRouter").is_some());
         assert!(value.get("runtimeUpstreamModel").is_none());
         assert!(value.get("runtime_upstream_model").is_none());
+    }
+
+    #[test]
+    fn model_router_config_normalizes_managed_routes_preferring_last() {
+        fn target(provider_id: &str) -> ModelRouterProviderRef {
+            ModelRouterProviderRef {
+                provider_id: provider_id.to_string(),
+                upstream_model: None,
+                label: None,
+            }
+        }
+
+        let mut config = ModelRouterConfig {
+            routes: vec![
+                ModelRouterRule {
+                    id: Some("custom-exact-a".to_string()),
+                    match_type: ModelRouterMatchType::Exact,
+                    match_value: Some("custom-a".to_string()),
+                    target: Some(target("custom-a")),
+                    provider_chain: Vec::new(),
+                    fallbacks: Vec::new(),
+                },
+                ModelRouterRule {
+                    id: None,
+                    match_type: ModelRouterMatchType::Role,
+                    match_value: Some("sonnet".to_string()),
+                    target: Some(target("old-sonnet")),
+                    provider_chain: Vec::new(),
+                    fallbacks: Vec::new(),
+                },
+                ModelRouterRule {
+                    id: None,
+                    match_type: ModelRouterMatchType::Role,
+                    match_value: Some("haiku".to_string()),
+                    target: Some(target("old-haiku")),
+                    provider_chain: Vec::new(),
+                    fallbacks: Vec::new(),
+                },
+                ModelRouterRule {
+                    id: Some("custom-exact-b".to_string()),
+                    match_type: ModelRouterMatchType::Exact,
+                    match_value: Some("custom-b".to_string()),
+                    target: Some(target("custom-b")),
+                    provider_chain: Vec::new(),
+                    fallbacks: Vec::new(),
+                },
+                ModelRouterRule {
+                    id: Some("combined-role-sonnet".to_string()),
+                    match_type: ModelRouterMatchType::Role,
+                    match_value: Some("sonnet".to_string()),
+                    target: Some(target("new-sonnet")),
+                    provider_chain: Vec::new(),
+                    fallbacks: Vec::new(),
+                },
+                ModelRouterRule {
+                    id: None,
+                    match_type: ModelRouterMatchType::Role,
+                    match_value: Some("haiku".to_string()),
+                    target: Some(target("new-haiku")),
+                    provider_chain: Vec::new(),
+                    fallbacks: Vec::new(),
+                },
+                ModelRouterRule {
+                    id: None,
+                    match_type: ModelRouterMatchType::Default,
+                    match_value: Some("default".to_string()),
+                    target: Some(target("new-default")),
+                    provider_chain: Vec::new(),
+                    fallbacks: Vec::new(),
+                },
+                ModelRouterRule {
+                    id: Some("combined-role-opus".to_string()),
+                    match_type: ModelRouterMatchType::Role,
+                    match_value: Some("opus".to_string()),
+                    target: Some(target("new-opus")),
+                    provider_chain: Vec::new(),
+                    fallbacks: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        config.normalize_managed_routes();
+
+        let route_ids: Vec<_> = config
+            .routes
+            .iter()
+            .map(|route| route.id.as_deref())
+            .collect();
+        assert_eq!(
+            route_ids,
+            vec![
+                Some("custom-exact-a"),
+                Some("custom-exact-b"),
+                Some("combined-default"),
+                Some("combined-role-haiku"),
+                Some("combined-role-sonnet"),
+                Some("combined-role-opus"),
+            ]
+        );
+
+        let provider_ids: Vec<_> = config
+            .routes
+            .iter()
+            .map(|route| {
+                route
+                    .target
+                    .as_ref()
+                    .map(|target| target.provider_id.as_str())
+                    .unwrap_or("")
+            })
+            .collect();
+        assert_eq!(
+            provider_ids,
+            vec![
+                "custom-a",
+                "custom-b",
+                "new-default",
+                "new-haiku",
+                "new-sonnet",
+                "new-opus",
+            ]
+        );
+        assert!(matches!(
+            config.routes[2].match_type,
+            ModelRouterMatchType::Default
+        ));
+        assert!(config.routes[2].match_value.is_none());
     }
 
     #[test]

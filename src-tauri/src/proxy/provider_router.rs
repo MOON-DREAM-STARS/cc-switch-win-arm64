@@ -420,6 +420,7 @@ mod tests {
             provider_type: Some("model_router".to_string()),
             model_router: Some(crate::provider::ModelRouterConfig {
                 routes: vec![crate::provider::ModelRouterRule {
+                    id: None,
                     match_type: crate::provider::ModelRouterMatchType::Role,
                     match_value: Some("sonnet".to_string()),
                     target: Some(crate::provider::ModelRouterProviderRef {
@@ -502,6 +503,7 @@ mod tests {
             provider_type: Some("model_router".to_string()),
             model_router: Some(crate::provider::ModelRouterConfig {
                 routes: vec![crate::provider::ModelRouterRule {
+                    id: None,
                     match_type: crate::provider::ModelRouterMatchType::Default,
                     match_value: None,
                     target: Some(crate::provider::ModelRouterProviderRef {

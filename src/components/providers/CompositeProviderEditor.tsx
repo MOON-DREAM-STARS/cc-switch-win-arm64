@@ -39,6 +39,7 @@ import {
   getModelFetchDescriptor,
   type CompositeMappings,
   type CompositeRole,
+  type ModelFetchDescriptor,
 } from "@/utils/providerModelDetection";
 
 interface CompositeProviderEditorProps {
@@ -47,7 +48,10 @@ interface CompositeProviderEditorProps {
   provider: Provider | null;
   providers: Record<string, Provider>;
   onOpenChange: (open: boolean) => void;
-  onSubmit: (payload: { provider: Provider; originalId?: string }) => Promise<void> | void;
+  onSubmit: (payload: {
+    provider: Provider;
+    originalId?: string;
+  }) => Promise<void> | void;
 }
 
 type DetectionState = Record<
@@ -60,6 +64,7 @@ type DetectionState = Record<
 >;
 
 const NO_PROVIDER_VALUE = "__none__";
+const MODEL_DETECTION_CONCURRENCY = 4;
 
 const emptyMappings = (): CompositeMappings => ({
   default: { providerId: "", upstreamModel: "" },
@@ -68,10 +73,26 @@ const emptyMappings = (): CompositeMappings => ({
   opus: { providerId: "", upstreamModel: "" },
 });
 
-const roleLabels: Array<{ role: CompositeRole; key: string; defaultLabel: string }> = [
-  { role: "default", key: "combinedProvider.mapping.default", defaultLabel: "默认模型" },
-  { role: "haiku", key: "combinedProvider.mapping.haiku", defaultLabel: "Haiku" },
-  { role: "sonnet", key: "combinedProvider.mapping.sonnet", defaultLabel: "Sonnet" },
+const roleLabels: Array<{
+  role: CompositeRole;
+  key: string;
+  defaultLabel: string;
+}> = [
+  {
+    role: "default",
+    key: "combinedProvider.mapping.default",
+    defaultLabel: "默认模型",
+  },
+  {
+    role: "haiku",
+    key: "combinedProvider.mapping.haiku",
+    defaultLabel: "Haiku",
+  },
+  {
+    role: "sonnet",
+    key: "combinedProvider.mapping.sonnet",
+    defaultLabel: "Sonnet",
+  },
   { role: "opus", key: "combinedProvider.mapping.opus", defaultLabel: "Opus" },
 ];
 
@@ -102,7 +123,9 @@ const getStoredModelValue = (
   return stripClaudeOneMMarker(nextVisibleModel);
 };
 
-const routeToMappings = (routes: ProviderModelRouterRule[]): CompositeMappings => {
+const routeToMappings = (
+  routes: ProviderModelRouterRule[],
+): CompositeMappings => {
   const mappings = emptyMappings();
   for (const route of routes) {
     const providerId = route.target?.providerId ?? "";
@@ -114,13 +137,13 @@ const routeToMappings = (routes: ProviderModelRouterRule[]): CompositeMappings =
       continue;
     }
 
-    if (
-      route.matchType === "role" &&
-      (route.matchValue === "haiku" ||
-        route.matchValue === "sonnet" ||
-        route.matchValue === "opus")
-    ) {
-      mappings[route.matchValue] = { providerId, upstreamModel };
+    if (route.matchType === "role") {
+      const role = route.matchValue?.trim().toLowerCase();
+      if (role === "default") {
+        mappings.default = { providerId, upstreamModel };
+      } else if (role === "haiku" || role === "sonnet" || role === "opus") {
+        mappings[role] = { providerId, upstreamModel };
+      }
     }
   }
   return mappings;
@@ -162,62 +185,88 @@ export function CompositeProviderEditor({
   }, [open, provider]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      setDetection({});
+      return;
+    }
     let cancelled = false;
 
+    const initialDetection: DetectionState = {};
+    const networkTasks: Array<{
+      providerId: string;
+      descriptor: Extract<ModelFetchDescriptor, { source: "network" }>;
+    }> = [];
+
+    for (const ordinaryProvider of ordinaryProviders) {
+      const descriptor = getModelFetchDescriptor(ordinaryProvider, appId);
+      if (descriptor.source === "stored") {
+        initialDetection[ordinaryProvider.id] = {
+          status: "ready",
+          models: descriptor.models,
+        };
+        continue;
+      }
+
+      if (descriptor.source === "unavailable") {
+        initialDetection[ordinaryProvider.id] = {
+          status: "unavailable",
+          models: [],
+          message: descriptor.reason,
+        };
+        continue;
+      }
+
+      initialDetection[ordinaryProvider.id] = {
+        status: "detecting",
+        models: [],
+      };
+      networkTasks.push({ providerId: ordinaryProvider.id, descriptor });
+    }
+
+    setDetection(initialDetection);
+
     const detect = async () => {
-      for (const ordinaryProvider of ordinaryProviders) {
-        const descriptor = getModelFetchDescriptor(ordinaryProvider, appId);
-        if (descriptor.source === "stored") {
-          setDetection((prev) => ({
-            ...prev,
-            [ordinaryProvider.id]: {
-              status: "ready",
-              models: descriptor.models,
-            },
-          }));
-          continue;
-        }
+      for (
+        let offset = 0;
+        offset < networkTasks.length;
+        offset += MODEL_DETECTION_CONCURRENCY
+      ) {
+        const batch = networkTasks.slice(
+          offset,
+          offset + MODEL_DETECTION_CONCURRENCY,
+        );
+        const results = await Promise.allSettled(
+          batch.map(({ descriptor }) =>
+            fetchModelsForConfig(
+              descriptor.baseUrl,
+              descriptor.apiKey,
+              descriptor.isFullUrl,
+              descriptor.modelsUrl,
+            ),
+          ),
+        );
 
-        if (descriptor.source === "unavailable") {
-          setDetection((prev) => ({
-            ...prev,
-            [ordinaryProvider.id]: {
-              status: "unavailable",
-              models: [],
-              message: descriptor.reason,
-            },
-          }));
-          continue;
-        }
+        if (cancelled) return;
+        setDetection((prev) => {
+          const next = { ...prev };
+          results.forEach((result, index) => {
+            const providerId = batch[index].providerId;
+            if (result.status === "fulfilled") {
+              next[providerId] = { status: "ready", models: result.value };
+              return;
+            }
 
-        setDetection((prev) => ({
-          ...prev,
-          [ordinaryProvider.id]: { status: "detecting", models: [] },
-        }));
-        try {
-          const models = await fetchModelsForConfig(
-            descriptor.baseUrl,
-            descriptor.apiKey,
-            descriptor.isFullUrl,
-            descriptor.modelsUrl,
-          );
-          if (cancelled) return;
-          setDetection((prev) => ({
-            ...prev,
-            [ordinaryProvider.id]: { status: "ready", models },
-          }));
-        } catch (error) {
-          if (cancelled) return;
-          setDetection((prev) => ({
-            ...prev,
-            [ordinaryProvider.id]: {
+            next[providerId] = {
               status: "failed",
               models: [],
-              message: error instanceof Error ? error.message : String(error),
-            },
-          }));
-        }
+              message:
+                result.reason instanceof Error
+                  ? result.reason.message
+                  : String(result.reason),
+            };
+          });
+          return next;
+        });
       }
     };
 
@@ -225,7 +274,7 @@ export function CompositeProviderEditor({
     return () => {
       cancelled = true;
     };
-  }, [appId, open, ordinaryProviders]);
+  }, [appId, open, ordinaryProviders, provider?.id]);
 
   const effectiveIconColor = icon
     ? iconColor || getIconMetadata(icon)?.defaultColor
@@ -271,7 +320,10 @@ export function CompositeProviderEditor({
       }
     }
 
-    const routes = buildCompositeRoutes(provider.meta?.modelRouter?.routes ?? [], mappings);
+    const routes = buildCompositeRoutes(
+      provider.meta?.modelRouter?.routes ?? [],
+      mappings,
+    );
     const { model_router: _modelRouterAlias, ...meta } = provider.meta ?? {};
     const trimmedName = name.trim();
     const trimmedNotes = notes.trim();
@@ -290,7 +342,8 @@ export function CompositeProviderEditor({
       meta: {
         ...meta,
         providerType: "model_router",
-        managedModelRouterProvider: provider.meta?.managedModelRouterProvider ?? true,
+        managedModelRouterProvider:
+          provider.meta?.managedModelRouterProvider ?? true,
         modelRouter: { version: 1, routes },
       },
     };
@@ -299,7 +352,9 @@ export function CompositeProviderEditor({
     try {
       await onSubmit({ provider: updatedProvider, originalId: provider.id });
       toast.success(
-        t("combinedProvider.saveSuccess", { defaultValue: "组合 Provider 已保存" }),
+        t("combinedProvider.saveSuccess", {
+          defaultValue: "组合 Provider 已保存",
+        }),
       );
       onOpenChange(false);
     } finally {
@@ -310,7 +365,9 @@ export function CompositeProviderEditor({
   return (
     <FullScreenPanel
       isOpen={open}
-      title={t("combinedProvider.editTitle", { defaultValue: "编辑组合provider" })}
+      title={t("combinedProvider.editTitle", {
+        defaultValue: "编辑组合provider",
+      })}
       onClose={() => onOpenChange(false)}
       footer={
         <Button
@@ -397,7 +454,9 @@ export function CompositeProviderEditor({
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="space-y-2">
-            <Label htmlFor="composite-provider-name">{t("provider.name")}</Label>
+            <Label htmlFor="composite-provider-name">
+              {t("provider.name")}
+            </Label>
             <Input
               id="composite-provider-name"
               value={name}
@@ -407,7 +466,9 @@ export function CompositeProviderEditor({
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="composite-provider-notes">{t("provider.notes")}</Label>
+            <Label htmlFor="composite-provider-notes">
+              {t("provider.notes")}
+            </Label>
             <Input
               id="composite-provider-notes"
               value={notes}
@@ -433,12 +494,14 @@ export function CompositeProviderEditor({
           <div className="space-y-1">
             <h3 className="text-sm font-medium">
               {t("combinedProvider.description", {
-                defaultValue: "按请求模型把流量路由到当前应用中的普通 Provider。",
+                defaultValue:
+                  "按请求模型把流量路由到当前应用中的普通 Provider。",
               })}
             </h3>
             <p className="text-xs text-muted-foreground">
               {t("combinedProvider.providerStatusHint", {
-                defaultValue: "下方显示可用于组合路由的普通 Provider 及其模型探测状态。",
+                defaultValue:
+                  "下方显示可用于组合路由的普通 Provider 及其模型探测状态。",
               })}
             </p>
           </div>
@@ -457,7 +520,9 @@ export function CompositeProviderEditor({
                     key={ordinaryProvider.id}
                     className="rounded-lg border border-border/50 bg-muted/20 p-3"
                   >
-                    <p className="text-sm font-medium">{ordinaryProvider.name}</p>
+                    <p className="text-sm font-medium">
+                      {ordinaryProvider.name}
+                    </p>
                     <p className="text-xs text-muted-foreground">
                       {state?.status === "ready"
                         ? `${state.models.length} models`
@@ -483,16 +548,21 @@ export function CompositeProviderEditor({
         <section className="space-y-3">
           <div className="space-y-1 border-t border-border/50 pt-4">
             <h3 className="text-sm font-medium">
-              {t("combinedProvider.mapping.title", { defaultValue: "模型映射" })}
+              {t("combinedProvider.mapping.title", {
+                defaultValue: "模型映射",
+              })}
             </h3>
             <p className="text-xs text-muted-foreground">
               {t("combinedProvider.mapping.hint", {
-                defaultValue: "为每个 Claude 模型角色选择普通 Provider，并指定要请求的上游模型。",
+                defaultValue:
+                  "为每个 Claude 模型角色选择普通 Provider，并指定要请求的上游模型。",
               })}
             </p>
           </div>
 
-          <div className={`hidden grid-cols-1 gap-2 px-1 text-xs font-medium text-muted-foreground md:grid ${mappingGridClassName(appId)}`}>
+          <div
+            className={`hidden grid-cols-1 gap-2 px-1 text-xs font-medium text-muted-foreground md:grid ${mappingGridClassName(appId)}`}
+          >
             <span>
               {t("providerForm.modelRoleLabel", {
                 defaultValue: "模型角色",
@@ -517,7 +587,9 @@ export function CompositeProviderEditor({
             const label = t(key, { defaultValue: defaultLabel });
             const mapping = mappings[role];
             const selectedProvider = providers[mapping.providerId];
-            const state = selectedProvider ? detection[selectedProvider.id] : undefined;
+            const state = selectedProvider
+              ? detection[selectedProvider.id]
+              : undefined;
             const models = state?.models ?? [];
             const oneMSupported = supportsClaudeOneM(appId, role);
             const oneMChecked = hasClaudeOneMMarker(mapping.upstreamModel);
@@ -574,7 +646,10 @@ export function CompositeProviderEditor({
                   </Select>
                 </div>
                 <div className="space-y-2 md:space-y-0">
-                  <Label htmlFor={`combined-${role}-model`} className="md:hidden">
+                  <Label
+                    htmlFor={`combined-${role}-model`}
+                    className="md:hidden"
+                  >
                     {label} Model
                   </Label>
                   <ModelInputWithFetch
@@ -619,7 +694,10 @@ export function CompositeProviderEditor({
                           htmlFor={`combined-${role}-one-m`}
                           className="cursor-pointer text-sm font-normal"
                         >
-                          {label} {t("providerForm.modelOneMLabel", { defaultValue: "1M" })}
+                          {label}{" "}
+                          {t("providerForm.modelOneMLabel", {
+                            defaultValue: "1M",
+                          })}
                         </Label>
                       </>
                     ) : null}

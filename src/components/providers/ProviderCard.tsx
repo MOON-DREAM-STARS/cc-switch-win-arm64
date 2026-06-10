@@ -26,6 +26,7 @@ import {
 } from "@/utils/providerConfigUtils";
 import { useProviderHealth } from "@/lib/query/failover";
 import { useUsageQuery } from "@/lib/query/queries";
+import { isModelRouterProvider } from "@/utils/combinedProviderUtils";
 
 interface DragHandleProps {
   attributes: DraggableAttributes;
@@ -67,7 +68,7 @@ interface ProviderCardProps {
 
 /** 判断是否为官方供应商（无自定义 base URL / API key，直连官方 API） */
 function isOfficialProvider(provider: Provider, appId: AppId): boolean {
-  if (provider.meta?.providerType === "model_router") {
+  if (isModelRouterProvider(provider)) {
     return false;
   }
 
@@ -195,7 +196,7 @@ export function ProviderCard({
   }, [provider.notes, displayUrl, fallbackUrlText]);
 
   const usageEnabled = provider.meta?.usage_script?.enabled ?? false;
-  const isModelRouter = provider.meta?.providerType === "model_router";
+  const isModelRouter = isModelRouterProvider(provider);
   const isOfficial = isOfficialProvider(provider, appId);
   const isOfficialBlockedByProxy =
     isProxyTakeover &&

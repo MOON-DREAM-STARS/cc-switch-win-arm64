@@ -119,6 +119,7 @@ import { HERMES_DEFAULT_CONFIG } from "./hooks/useHermesFormState";
 import { resolveManagedAccountId } from "@/lib/authBinding";
 import { useOpenClawLiveProviderIds } from "@/hooks/useOpenClaw";
 import { useHermesLiveProviderIds } from "@/hooks/useHermes";
+import { isModelRouterProvider as isProviderModelRouter } from "@/utils/combinedProviderUtils";
 
 type PresetEntry = {
   id: string;
@@ -337,7 +338,7 @@ function ProviderFormFull({
   const isOmoCategory = appId === "opencode" && category === "omo";
   const isOmoSlimCategory = appId === "opencode" && category === "omo-slim";
   const isAnyOmoCategory = isOmoCategory || isOmoSlimCategory;
-  const isModelRouterProvider = initialData?.meta?.providerType === "model_router";
+  const isModelRouterProvider = isProviderModelRouter(initialData);
   const initialProviderType = initialData?.meta?.providerType;
 
   useEffect(() => {
@@ -382,7 +383,7 @@ function ProviderFormFull({
                 : appId === "hermes"
                   ? HERMES_DEFAULT_CONFIG
                   : CLAUDE_DEFAULT_CONFIG,
-                metaConfig: stringifyProviderExtraMeta(initialData?.meta),
+      metaConfig: stringifyProviderExtraMeta(initialData?.meta),
       icon: initialData?.icon ?? "",
       iconColor: initialData?.iconColor ?? "",
     }),
@@ -658,8 +659,7 @@ function ProviderFormFull({
 
   const effectiveProviderType = isModelRouterProvider
     ? "model_router"
-    : templatePreset?.providerType ||
-      (initialProviderType === "model_router" ? undefined : initialProviderType);
+    : templatePreset?.providerType || initialProviderType;
 
   const {
     useCommonConfig,
@@ -1067,8 +1067,7 @@ function ProviderFormFull({
     const isCopilotProvider =
       effectiveProviderType === "github_copilot" ||
       baseUrl.includes("githubcopilot.com");
-    const isCodexOauthProvider =
-      effectiveProviderType === "codex_oauth";
+    const isCodexOauthProvider = effectiveProviderType === "codex_oauth";
     if (isCopilotProvider && !isCopilotAuthenticated) {
       toast.error(
         t("copilot.loginRequired", {
@@ -1187,8 +1186,7 @@ function ProviderFormFull({
     const isCopilotProvider =
       effectiveProviderType === "github_copilot" ||
       baseUrl.includes("githubcopilot.com");
-    const isCodexOauthProvider =
-      effectiveProviderType === "codex_oauth";
+    const isCodexOauthProvider = effectiveProviderType === "codex_oauth";
 
     let settingsConfig: string;
 
@@ -2358,7 +2356,6 @@ function ProviderFormFull({
               {settingsConfigErrorField}
             </>
           )}
-
 
           {!isAnyOmoCategory &&
             appId !== "opencode" &&

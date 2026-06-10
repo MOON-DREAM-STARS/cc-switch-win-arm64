@@ -1,7 +1,8 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Provider } from "@/types";
+import type { FetchedModel } from "@/lib/api/model-fetch";
 import { CompositeProviderEditor } from "@/components/providers/CompositeProviderEditor";
 import { COMBINED_PROVIDER_ID } from "@/utils/combinedProviderUtils";
 
@@ -82,6 +83,17 @@ const networkClaudeProvider: Provider = {
   },
 };
 
+const anotherNetworkClaudeProvider: Provider = {
+  id: "network-claude-2",
+  name: "Network Claude Provider 2",
+  settingsConfig: {
+    env: {
+      ANTHROPIC_BASE_URL: "https://api-2.example.com",
+      ANTHROPIC_API_KEY: "test-api-key-2",
+    },
+  },
+};
+
 const compositeProviderWithDefaultNetworkRoute: Provider = {
   ...combinedProvider,
   meta: {
@@ -94,11 +106,30 @@ const compositeProviderWithDefaultNetworkRoute: Provider = {
           id: "combined-default",
           enabled: true,
           matchType: "default",
-          target: { providerId: "network-claude", upstreamModel: "gpt-5.4-mini" },
+          target: {
+            providerId: "network-claude",
+            upstreamModel: "gpt-5.4-mini",
+          },
         },
       ],
     },
   },
+};
+
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+};
+
+const createDeferred = <T,>(): Deferred<T> => {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
 };
 
 const selectProvider = async (
@@ -175,18 +206,112 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     const defaultModelRow = defaultModelInput.closest("div")?.parentElement;
     expect(defaultModelRow).toBeTruthy();
 
-    const modelDropdownTrigger = within(defaultModelRow as HTMLElement).getByRole(
-      "button",
-      { name: "默认模型 Model options" },
-    );
+    const modelDropdownTrigger = within(
+      defaultModelRow as HTMLElement,
+    ).getByRole("button", { name: "默认模型 Model options" });
     await user.click(modelDropdownTrigger);
 
-    expect(await screen.findByRole("menuitem", { name: "gpt-5.4-mini" })).toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: "gpt-5.4[1M]" })).toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: "gpt-5.5" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("menuitem", { name: "gpt-5.4-mini" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("menuitem", { name: "gpt-5.4[1M]" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("menuitem", { name: "gpt-5.5" }),
+    ).toBeInTheDocument();
 
     await user.click(screen.getByRole("menuitem", { name: "gpt-5.5" }));
     expect(defaultModelInput).toHaveValue("gpt-5.5");
+  });
+
+  it("starts network model detection concurrently", async () => {
+    const pending: Array<Deferred<FetchedModel[]>> = [];
+    fetchMocks.fetchModelsForConfig.mockImplementation(() => {
+      const deferred = createDeferred<FetchedModel[]>();
+      pending.push(deferred);
+      return deferred.promise;
+    });
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={combinedProvider}
+        providers={{
+          [combinedProvider.id]: combinedProvider,
+          [networkClaudeProvider.id]: networkClaudeProvider,
+          [anotherNetworkClaudeProvider.id]: anotherNetworkClaudeProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(fetchMocks.fetchModelsForConfig).toHaveBeenCalledTimes(2),
+    );
+    expect(screen.getAllByText("正在探测模型…")).toHaveLength(2);
+
+    await act(async () => {
+      pending[0].resolve([{ id: "first-model", ownedBy: null }]);
+      pending[1].resolve([{ id: "second-model", ownedBy: null }]);
+      await Promise.all(pending.map(({ promise }) => promise));
+    });
+
+    await waitFor(() =>
+      expect(screen.getAllByText("1 models")).toHaveLength(2),
+    );
+  });
+
+  it("clears detection and ignores stale results after switching app", async () => {
+    const pending = createDeferred<FetchedModel[]>();
+    fetchMocks.fetchModelsForConfig.mockReturnValueOnce(pending.promise);
+
+    const { rerender } = render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={combinedProvider}
+        providers={{
+          [combinedProvider.id]: combinedProvider,
+          [networkClaudeProvider.id]: networkClaudeProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(fetchMocks.fetchModelsForConfig).toHaveBeenCalledTimes(1),
+    );
+    expect(screen.getByText("正在探测模型…")).toBeInTheDocument();
+
+    rerender(
+      <CompositeProviderEditor
+        open
+        appId="gemini"
+        provider={combinedProvider}
+        providers={{
+          [combinedProvider.id]: combinedProvider,
+          [networkClaudeProvider.id]: networkClaudeProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText("missing-base-url")).toBeInTheDocument(),
+    );
+
+    await act(async () => {
+      pending.resolve([{ id: "stale-model", ownedBy: null }]);
+      await pending.promise;
+    });
+
+    expect(screen.getByText("missing-base-url")).toBeInTheDocument();
+    expect(screen.queryByText("1 models")).not.toBeInTheDocument();
   });
 
   it("saves default and role mappings as modelRouter routes", async () => {
@@ -226,14 +351,20 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
               id: "combined-default",
               enabled: true,
               matchType: "default",
-              target: { providerId: "ordinary", upstreamModel: "stored-default" },
+              target: {
+                providerId: "ordinary",
+                upstreamModel: "stored-default",
+              },
             },
             {
               id: "combined-role-sonnet",
               enabled: true,
               matchType: "role",
               matchValue: "sonnet",
-              target: { providerId: "ordinary", upstreamModel: "stored-sonnet" },
+              target: {
+                providerId: "ordinary",
+                upstreamModel: "stored-sonnet",
+              },
             },
           ],
         },
@@ -288,7 +419,9 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     await user.click(screen.getByRole("button", { name: "保存" }));
 
     await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
-    expect(handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes).toEqual([
+    expect(
+      handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes,
+    ).toEqual([
       {
         id: "combined-role-sonnet",
         enabled: true,
@@ -327,7 +460,9 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     await user.click(screen.getByRole("button", { name: "保存" }));
 
     await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
-    expect(handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes).toEqual([
+    expect(
+      handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes,
+    ).toEqual([
       {
         id: "combined-role-sonnet",
         enabled: true,
@@ -386,7 +521,9 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     await user.click(screen.getByRole("button", { name: "保存" }));
 
     await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
-    expect(handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes).toEqual([
+    expect(
+      handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes,
+    ).toEqual([
       {
         id: "combined-role-sonnet",
         enabled: true,
@@ -419,7 +556,9 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
       />,
     );
 
-    await waitFor(() => expect(fetchMocks.fetchModelsForConfig).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(fetchMocks.fetchModelsForConfig).toHaveBeenCalled(),
+    );
     await selectProvider(user, "默认模型 Provider", "Network Claude Provider");
 
     const defaultModelInput = screen.getByLabelText("默认模型 Model");
@@ -431,7 +570,9 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
         name: "默认模型 Model options",
       }),
     );
-    await user.click(await screen.findByRole("menuitem", { name: "auto-default" }));
+    await user.click(
+      await screen.findByRole("menuitem", { name: "auto-default" }),
+    );
     await user.click(screen.getByRole("checkbox", { name: "默认模型 1M" }));
 
     expect(defaultModelInput).toHaveValue("auto-default");
@@ -439,12 +580,17 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     await user.click(screen.getByRole("button", { name: "保存" }));
 
     await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
-    expect(handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes).toEqual([
+    expect(
+      handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes,
+    ).toEqual([
       {
         id: "combined-default",
         enabled: true,
         matchType: "default",
-        target: { providerId: "network-claude", upstreamModel: "auto-default[1M]" },
+        target: {
+          providerId: "network-claude",
+          upstreamModel: "auto-default[1M]",
+        },
       },
     ]);
   });
@@ -477,7 +623,9 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     await user.click(screen.getByRole("button", { name: "保存" }));
 
     await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
-    expect(handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes).toEqual([
+    expect(
+      handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes,
+    ).toEqual([
       {
         id: "combined-role-haiku",
         enabled: true,
@@ -534,7 +682,9 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     await user.click(screen.getByRole("button", { name: "保存" }));
 
     await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
-    expect(handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes).toEqual([
+    expect(
+      handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes,
+    ).toEqual([
       {
         id: "combined-role-haiku",
         enabled: true,
@@ -565,7 +715,10 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
               id: "combined-default",
               enabled: true,
               matchType: "default",
-              target: { providerId: "ordinary", upstreamModel: "stored-default" },
+              target: {
+                providerId: "ordinary",
+                upstreamModel: "stored-default",
+              },
             },
           ],
         },
@@ -587,7 +740,10 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     );
 
     await user.clear(screen.getByLabelText("provider.name"));
-    await user.type(screen.getByLabelText("provider.name"), "Updated Composite");
+    await user.type(
+      screen.getByLabelText("provider.name"),
+      "Updated Composite",
+    );
     await user.clear(screen.getByLabelText("provider.notes"));
     await user.type(screen.getByLabelText("provider.notes"), "updated notes");
     await user.clear(screen.getByLabelText("provider.websiteUrl"));

@@ -16,8 +16,9 @@ const normalizeModelRouterConfig = (
   routes: Array.isArray(config?.routes) ? config.routes : [],
 });
 
-export const isModelRouterProvider = (provider?: Provider | null): boolean =>
-  provider?.meta?.providerType === "model_router";
+export const isModelRouterProvider = (
+  provider?: Pick<Provider, "meta"> | null,
+): boolean => provider?.meta?.providerType === "model_router";
 
 export const isManagedCombinedProvider = (
   provider?: Provider | null,
@@ -33,9 +34,7 @@ export const createManagedCombinedProvider = (
 ): Provider => {
   const { model_router: _modelRouterAlias, ...meta } = existing?.meta ?? {};
 
-  const name = existing?.name?.trim()
-    ? existing.name
-    : COMBINED_PROVIDER_NAME;
+  const name = existing?.name?.trim() ? existing.name : COMBINED_PROVIDER_NAME;
 
   return {
     ...(existing ?? {}),
@@ -53,8 +52,9 @@ export const createManagedCombinedProvider = (
   };
 };
 
-export const normalizeManagedCombinedProvider = (provider: Provider): Provider =>
-  createManagedCombinedProvider(provider);
+export const normalizeManagedCombinedProvider = (
+  provider: Provider,
+): Provider => createManagedCombinedProvider(provider);
 
 export const filterManagedCombinedProvider = (
   providers: Record<string, Provider>,
