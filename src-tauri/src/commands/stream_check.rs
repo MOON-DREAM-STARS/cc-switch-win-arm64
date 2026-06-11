@@ -195,6 +195,12 @@ fn sanitize_composite_audit_model(model: &str) -> String {
     without_effort.to_string()
 }
 
+/// Returns the target that actually handled the request: targets[retry_count], or the last target
+/// if the index is out of bounds.
+fn actual_target(targets: &[Provider], retry_count: u32) -> Option<&Provider> {
+    targets.get(retry_count as usize).or_else(|| targets.last())
+}
+
 fn sanitize_composite_audit_targets(mut targets: Vec<Provider>) -> Vec<Provider> {
     for target in &mut targets {
         if let Some(meta) = target.meta.as_mut() {
@@ -307,19 +313,28 @@ async fn check_model_router_provider(
     let mut route_results = Vec::new();
 
     for route in &router_config.routes {
-        let Some(route_key) = managed_model_router_route_key(route) else {
-            continue;
-        };
         if route.normalized_provider_chain().is_empty() {
             continue;
         }
 
-        let request_model = request_model_for_managed_route(&route_key).to_string();
+        let (route_key, request_model) =
+            if route.match_type == ModelRouterMatchType::Exact {
+                let match_value = match route.match_value.as_deref().map(str::trim) {
+                    Some(v) if !v.is_empty() => v.to_string(),
+                    _ => continue,
+                };
+                (format!("exact:{}", match_value), match_value)
+            } else {
+                let Some(key) = managed_model_router_route_key(route) else {
+                    continue;
+                };
+                let req = request_model_for_managed_route(&key).to_string();
+                (key, req)
+            };
         match resolve_model_router_targets_for_request_model(db, app_type, provider, &request_model)
         {
             Ok(targets) if !targets.is_empty() => {
                 let targets = sanitize_composite_audit_targets(targets);
-                let primary_target = targets.first();
                 let result = match check_resolved_target_chain(
                     copilot_state,
                     app_type,
@@ -331,12 +346,12 @@ async fn check_model_router_provider(
                     Ok(result) => result,
                     Err(error) => stream_check_result_from_error(&error, request_model.clone()),
                 };
-
+                let hit = actual_target(&targets, result.retry_count);
                 route_results.push(ModelRouterRouteCheckResult {
                     route_key,
                     request_model,
-                    target_provider_id: primary_target.map(|target| target.id.clone()),
-                    target_provider_name: primary_target.map(|target| target.name.clone()),
+                    target_provider_id: hit.map(|t| t.id.clone()),
+                    target_provider_name: hit.map(|t| t.name.clone()),
                     result,
                 });
             }
@@ -563,8 +578,9 @@ async fn resolve_claude_api_format_override(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_copilot_provider, managed_model_router_route_key, request_model_for_managed_route,
-        resolve_model_router_targets_for_request_model, sanitize_composite_audit_model,
+        actual_target, is_copilot_provider, managed_model_router_route_key,
+        request_model_for_managed_route, resolve_model_router_targets_for_request_model,
+        sanitize_composite_audit_model,
     };
     use crate::app_config::AppType;
     use crate::database::Database;
@@ -736,5 +752,86 @@ mod tests {
             provider.meta.as_ref().and_then(|meta| meta.is_full_url),
             Some(true)
         );
+    }
+
+    #[test]
+    fn exact_route_appears_in_resolved_targets() {
+        let db = Database::memory().expect("memory database");
+        let target = Provider::with_id(
+            "target".to_string(),
+            "Target".to_string(),
+            json!({ "env": {
+                "ANTHROPIC_BASE_URL": "https://api.example.com",
+                "ANTHROPIC_AUTH_TOKEN": "token"
+            }}),
+            None,
+        );
+        db.save_provider(AppType::Claude.as_str(), &target).unwrap();
+
+        let exact_model = "claude-opus-4-5-20250929";
+        let mut router = Provider::with_id(
+            "router".to_string(),
+            "Router".to_string(),
+            json!({ "env": {} }),
+            None,
+        );
+        router.meta = Some(ProviderMeta {
+            provider_type: Some("model_router".to_string()),
+            model_router: Some(ModelRouterConfig {
+                routes: vec![ModelRouterRule {
+                    id: None,
+                    match_type: ModelRouterMatchType::Exact,
+                    match_value: Some(exact_model.to_string()),
+                    target: Some(ModelRouterProviderRef {
+                        provider_id: "target".to_string(),
+                        upstream_model: None,
+                        label: None,
+                    }),
+                    provider_chain: Vec::new(),
+                    fallbacks: Vec::new(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        // managed_model_router_route_key returns None for Exact (the pre-fix behaviour)
+        let exact_route = &router.meta.as_ref().unwrap().model_router.as_ref().unwrap().routes[0];
+        assert_eq!(managed_model_router_route_key(exact_route), None);
+
+        // The fix: audit loop uses match_value as request_model and "exact:<val>" as key.
+        // Verify the resolver finds the target when given the exact match_value.
+        let resolved = resolve_model_router_targets_for_request_model(
+            &db,
+            &AppType::Claude,
+            &router,
+            exact_model,
+        )
+        .expect("exact route should resolve");
+        assert!(!resolved.is_empty());
+        assert_eq!(resolved[0].id, "target");
+
+        // Verify the route_key format produced by the fix.
+        let route_key = format!("exact:{exact_model}");
+        assert_eq!(route_key, "exact:claude-opus-4-5-20250929");
+    }
+
+    #[test]
+    fn actual_target_returns_fallback_when_primary_fails() {
+        let make = |id: &str, name: &str| {
+            Provider::with_id(id.to_string(), name.to_string(), json!({"env": {}}), None)
+        };
+        let targets = vec![make("primary", "Primary"), make("fallback", "Fallback")];
+
+        // retry_count == 1: targets[0] failed, targets[1] succeeded
+        let hit = actual_target(&targets, 1).unwrap();
+        assert_eq!(hit.id, "fallback");
+        assert_eq!(hit.name, "Fallback");
+
+        // retry_count == 0: targets[0] succeeded directly
+        assert_eq!(actual_target(&targets, 0).unwrap().id, "primary");
+
+        // out-of-bounds: falls back to last target
+        assert_eq!(actual_target(&targets, 99).unwrap().id, "fallback");
     }
 }
