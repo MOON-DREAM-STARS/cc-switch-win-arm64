@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Download, Loader2, Package, Save, Wand2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -362,10 +362,17 @@ export function CompositeProviderEditor({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [isCommonConfigModalOpen, setIsCommonConfigModalOpen] = useState(false);
+  const [isDirty, setIsDirty] = useState(false);
+
+  const handleClose = useCallback(() => {
+    if (isDirty && !window.confirm("有未保存的更改，确定要离开吗？")) return;
+    onOpenChange(false);
+  }, [isDirty, onOpenChange]);
 
   const handleSettingsConfigChange = useCallback((value: string) => {
     setSettingsConfigText(value);
     setSettingsConfigDirty(true);
+    setIsDirty(true);
     if (settingsConfigError) setSettingsConfigError("");
   }, [settingsConfigError]);
 
@@ -412,7 +419,7 @@ export function CompositeProviderEditor({
     setIcon(provider.icon ?? "");
     setIconColor(provider.iconColor ?? "");
     setIconDialogOpen(false);
-    setMappings(routeToMappings(provider.meta?.modelRouter?.routes ?? []));
+    setMappings(routeToMappings(provider.meta?.modelRouter?.routes ?? provider.meta?.model_router?.routes ?? []));
     setModelRouterTestConfig({
       ...defaultModelRouterTestConfig(),
       ...(provider.meta?.modelRouterTestConfig ?? {}),
@@ -420,6 +427,7 @@ export function CompositeProviderEditor({
     setSettingsConfigText(formatCompositeCommonConfig(provider.settingsConfig));
     setSettingsConfigError("");
     setSettingsConfigDirty(false);
+    setIsDirty(false);
   }, [open, provider]);
 
   const refreshModelDetection = useCallback(
@@ -624,6 +632,7 @@ export function CompositeProviderEditor({
         const newText = JSON.stringify(config, null, 2);
         setSettingsConfigText(newText);
         setSettingsConfigDirty(true);
+        setIsDirty(true);
         if (settingsConfigError) setSettingsConfigError("");
       } catch {
         // Don't modify if JSON is invalid
@@ -644,6 +653,7 @@ export function CompositeProviderEditor({
         return next;
       }, {} as CompositeMappings),
     );
+    setIsDirty(true);
     toast.success(
       t("combinedProvider.mapping.quickSetSuccess", {
         defaultValue: "已应用到全部模型角色",
@@ -699,12 +709,14 @@ export function CompositeProviderEditor({
         ...patch,
       },
     }));
+    setIsDirty(true);
   };
 
   const handleIconSelect = (selectedIcon: string) => {
     const meta = getIconMetadata(selectedIcon);
     setIcon(selectedIcon);
     setIconColor(meta?.defaultColor ?? "");
+    setIsDirty(true);
   };
 
   const handleSubmit = async () => {
@@ -784,7 +796,7 @@ export function CompositeProviderEditor({
     }
 
     const routes = buildCompositeRoutes(
-      provider.meta?.modelRouter?.routes ?? [],
+      provider.meta?.modelRouter?.routes ?? provider.meta?.model_router?.routes ?? [],
       mappings,
     );
     const { model_router: _modelRouterAlias, ...meta } = provider.meta ?? {};
@@ -823,6 +835,7 @@ export function CompositeProviderEditor({
           defaultValue: "组合 Provider 已保存",
         }),
       );
+      setIsDirty(false);
       onOpenChange(false);
     } finally {
       setIsSubmitting(false);
@@ -835,7 +848,7 @@ export function CompositeProviderEditor({
       title={t("combinedProvider.editTitle", {
         defaultValue: "编辑组合provider",
       })}
-      onClose={() => onOpenChange(false)}
+      onClose={handleClose}
       footer={
         <Button
           type="submit"
@@ -927,7 +940,7 @@ export function CompositeProviderEditor({
             <Input
               id="composite-provider-name"
               value={name}
-              onChange={(event) => setName(event.target.value)}
+              onChange={(event) => { setName(event.target.value); setIsDirty(true); }}
               placeholder={t("provider.namePlaceholder")}
             />
           </div>
@@ -939,7 +952,7 @@ export function CompositeProviderEditor({
             <Input
               id="composite-provider-notes"
               value={notes}
-              onChange={(event) => setNotes(event.target.value)}
+              onChange={(event) => { setNotes(event.target.value); setIsDirty(true); }}
               placeholder={t("provider.notesPlaceholder")}
             />
           </div>
@@ -952,7 +965,7 @@ export function CompositeProviderEditor({
           <Input
             id="composite-provider-website-url"
             value={websiteUrl}
-            onChange={(event) => setWebsiteUrl(event.target.value)}
+            onChange={(event) => { setWebsiteUrl(event.target.value); setIsDirty(true); }}
             placeholder={t("providerForm.websiteUrlPlaceholder")}
           />
         </div>
@@ -1176,6 +1189,13 @@ export function CompositeProviderEditor({
                     ariaLabel={`${label} Model`}
                     dropdownAriaLabel={`${label} Model options`}
                   />
+                  {mapping.providerId &&
+                    (state?.status === "failed" ||
+                      state?.status === "unavailable") && (
+                      <p className="text-xs text-muted-foreground mt-1">
+                        {state.message || "模型列表获取失败"}
+                      </p>
+                    )}
                 </div>
                 {appId === "claude" ? (
                   <div className="flex h-9 items-center gap-2">
@@ -1415,12 +1435,13 @@ export function CompositeProviderEditor({
                 <Switch
                   id="combined-test-config-enabled"
                   checked={modelRouterTestConfig.enabled}
-                  onCheckedChange={(checked) =>
+                  onCheckedChange={(checked) => {
                     setModelRouterTestConfig((prev) => ({
                       ...prev,
                       enabled: checked,
-                    }))
-                  }
+                    }));
+                    setIsDirty(true);
+                  }}
                 />
               </div>
             </div>
@@ -1453,14 +1474,15 @@ export function CompositeProviderEditor({
                 min={1}
                 max={300}
                 value={modelRouterTestConfig.timeoutSecs || ""}
-                onChange={(event) =>
+                onChange={(event) => {
                   setModelRouterTestConfig((prev) => ({
                     ...prev,
                     timeoutSecs: event.target.value
-                      ? parseInt(event.target.value, 10)
+                      ? (Number.isFinite(Number(event.target.value)) ? Number(event.target.value) | 0 : prev.timeoutSecs)
                       : undefined,
-                  }))
-                }
+                  }));
+                  setIsDirty(true);
+                }}
                 placeholder="45"
                 disabled={!modelRouterTestConfig.enabled}
               />
@@ -1474,12 +1496,13 @@ export function CompositeProviderEditor({
               <Input
                 id="combined-test-prompt"
                 value={modelRouterTestConfig.testPrompt || ""}
-                onChange={(event) =>
+                onChange={(event) => {
                   setModelRouterTestConfig((prev) => ({
                     ...prev,
                     testPrompt: event.target.value || undefined,
-                  }))
-                }
+                  }));
+                  setIsDirty(true);
+                }}
                 placeholder="Who are you?"
                 disabled={!modelRouterTestConfig.enabled}
               />
@@ -1496,14 +1519,15 @@ export function CompositeProviderEditor({
                 min={100}
                 max={60000}
                 value={modelRouterTestConfig.degradedThresholdMs || ""}
-                onChange={(event) =>
+                onChange={(event) => {
                   setModelRouterTestConfig((prev) => ({
                     ...prev,
                     degradedThresholdMs: event.target.value
-                      ? parseInt(event.target.value, 10)
+                      ? (Number.isFinite(Number(event.target.value)) ? Number(event.target.value) | 0 : prev.degradedThresholdMs)
                       : undefined,
-                  }))
-                }
+                  }));
+                  setIsDirty(true);
+                }}
                 placeholder="6000"
                 disabled={!modelRouterTestConfig.enabled}
               />
@@ -1520,14 +1544,15 @@ export function CompositeProviderEditor({
                 min={0}
                 max={10}
                 value={modelRouterTestConfig.maxRetries ?? ""}
-                onChange={(event) =>
+                onChange={(event) => {
                   setModelRouterTestConfig((prev) => ({
                     ...prev,
                     maxRetries: event.target.value
-                      ? parseInt(event.target.value, 10)
+                      ? (Number.isFinite(Number(event.target.value)) ? Number(event.target.value) | 0 : prev.maxRetries)
                       : undefined,
-                  }))
-                }
+                  }));
+                  setIsDirty(true);
+                }}
                 placeholder="2"
                 disabled={!modelRouterTestConfig.enabled}
               />
