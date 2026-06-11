@@ -1399,7 +1399,7 @@ export function CompositeProviderEditor({
                 <p className="text-xs text-muted-foreground">
                   {t("combinedProvider.testConfig.hint", {
                     defaultValue:
-                      "开启后会按模型映射中已配置路由逐条巡检；巡检请求会自动去掉 thinking 参数和 [1M] 本地标记，避免上游误判。",
+                      "组合 Provider 始终对每条路由执行巡检。开启后使用下方自定义的超时、重试、提示词和阈值；关闭后沿用全局流检配置。巡检请求会自动去掉 thinking 参数和 [1M] 本地标记，避免上游误判。",
                   })}
                 </p>
               </div>
@@ -1409,7 +1409,7 @@ export function CompositeProviderEditor({
                   className="text-sm text-muted-foreground"
                 >
                   {t("combinedProvider.testConfig.enabled", {
-                    defaultValue: "使用单独配置",
+                    defaultValue: "使用自定义巡检参数",
                   })}
                 </Label>
                 <Switch
