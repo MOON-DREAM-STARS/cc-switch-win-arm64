@@ -273,10 +273,22 @@ impl ProxyService {
             }
         }
 
-        if haiku_model.is_none() && sonnet_model.is_none() && opus_model.is_none() {
+        if haiku_model.is_none() {
+            if let Some(model) = default_model.clone() {
+                haiku_model = Some(model);
+                haiku_display_name = default_display_name.clone();
+            }
+        }
+        if sonnet_model.is_none() {
             if let Some(model) = default_model.clone() {
                 sonnet_model = Some(model);
-                sonnet_display_name = default_display_name;
+                sonnet_display_name = default_display_name.clone();
+            }
+        }
+        if opus_model.is_none() {
+            if let Some(model) = default_model {
+                opus_model = Some(model);
+                opus_display_name = default_display_name;
             }
         }
 
@@ -6277,5 +6289,71 @@ experimental_bearer_token = "PROXY_MANAGED"
                 "must not overwrite good backup for {app_type} with proxy placeholder"
             );
         }
+    }
+
+    #[test]
+    fn model_router_default_plus_opus_fallback_fills_sonnet_and_opus() {
+        let mut provider = Provider::with_id(
+            "router".to_string(),
+            "组合provider".to_string(),
+            json!({ "env": {} }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            provider_type: Some("model_router".to_string()),
+            model_router: Some(crate::provider::ModelRouterConfig {
+                routes: vec![
+                    crate::provider::ModelRouterRule {
+                        id: None,
+                        match_type: crate::provider::ModelRouterMatchType::Default,
+                        match_value: None,
+                        target: Some(ModelRouterProviderRef {
+                            provider_id: "default-provider".to_string(),
+                            upstream_model: Some("default-model".to_string()),
+                            label: None,
+                        }),
+                        provider_chain: Vec::new(),
+                        fallbacks: Vec::new(),
+                    },
+                    crate::provider::ModelRouterRule {
+                        id: None,
+                        match_type: crate::provider::ModelRouterMatchType::Role,
+                        match_value: Some("opus".to_string()),
+                        target: Some(ModelRouterProviderRef {
+                            provider_id: "opus-provider".to_string(),
+                            upstream_model: Some("opus-model".to_string()),
+                            label: None,
+                        }),
+                        provider_chain: Vec::new(),
+                        fallbacks: Vec::new(),
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let mut live_config = json!({ "env": {} });
+        ProxyService::apply_claude_takeover_fields_for_provider(
+            &mut live_config,
+            "http://127.0.0.1:15721",
+            &provider,
+        );
+
+        let env = live_config
+            .get("env")
+            .and_then(|v| v.as_object())
+            .expect("env should exist");
+
+        // sonnet slot must be filled via default fallback
+        assert!(
+            env.get("ANTHROPIC_DEFAULT_SONNET_MODEL").is_some(),
+            "sonnet model must be set via default fallback"
+        );
+        // opus slot must be set from the explicit opus route
+        assert!(
+            env.get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_some(),
+            "opus model must be set"
+        );
     }
 }
