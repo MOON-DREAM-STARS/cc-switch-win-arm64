@@ -243,6 +243,19 @@ impl Database {
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        let _ = conn.execute(
+            "ALTER TABLE stream_check_logs ADD COLUMN audit_mode TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE stream_check_logs ADD COLUMN error_category TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE stream_check_logs ADD COLUMN route_results_json TEXT",
+            [],
+        );
+
         // 注意：circuit_breaker_config 已合并到 proxy_config 表中
 
         // 16. Proxy Live Backup 表 (Live 配置备份)

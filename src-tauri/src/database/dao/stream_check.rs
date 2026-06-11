@@ -15,11 +15,17 @@ impl Database {
     ) -> Result<i64, AppError> {
         let conn = lock_conn!(self.conn);
 
+        let route_results_json = result
+            .route_results
+            .as_ref()
+            .and_then(|r| serde_json::to_string(r).ok());
+
         conn.execute(
-            "INSERT INTO stream_check_logs 
-             (provider_id, provider_name, app_type, status, success, message, 
-              response_time_ms, http_status, model_used, retry_count, tested_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO stream_check_logs
+             (provider_id, provider_name, app_type, status, success, message,
+              response_time_ms, http_status, model_used, retry_count, tested_at,
+              audit_mode, error_category, route_results_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 provider_id,
                 provider_name,
@@ -32,6 +38,9 @@ impl Database {
                 result.model_used,
                 result.retry_count as i64,
                 result.tested_at,
+                result.audit_mode,
+                result.error_category,
+                route_results_json,
             ],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
