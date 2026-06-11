@@ -709,8 +709,11 @@ export function CompositeProviderEditor({
 
   const handleSubmit = async () => {
     if (!provider) return;
+    let hasCompleteValidRoute = false;
     for (const [role, value] of Object.entries(mappings)) {
-      if (value.upstreamModel.trim() && !value.providerId.trim()) {
+      const providerId = value.providerId.trim();
+      const upstreamModel = value.upstreamModel.trim();
+      if (upstreamModel && !providerId) {
         toast.error(
           t("combinedProvider.validation.modelWithoutProvider", {
             role,
@@ -719,6 +722,36 @@ export function CompositeProviderEditor({
         );
         return;
       }
+      if (providerId && !providers[providerId]) {
+        toast.error(
+          t("combinedProvider.validation.providerNotFound", {
+            role,
+            defaultValue: "模型映射引用的 Provider 不存在，请重新选择。",
+          }),
+        );
+        return;
+      }
+      if (providerId && !upstreamModel) {
+        toast.error(
+          t("combinedProvider.validation.providerWithoutModel", {
+            role,
+            defaultValue: "已选择 Provider，请填写实际请求模型。",
+          }),
+        );
+        return;
+      }
+      if (providerId && upstreamModel) {
+        hasCompleteValidRoute = true;
+      }
+    }
+
+    if (!hasCompleteValidRoute) {
+      toast.error(
+        t("combinedProvider.validation.noCompleteRoute", {
+          defaultValue: "请至少配置一条完整的模型映射。",
+        }),
+      );
+      return;
     }
 
     let commonSettingsConfig = provider.settingsConfig ?? {};
