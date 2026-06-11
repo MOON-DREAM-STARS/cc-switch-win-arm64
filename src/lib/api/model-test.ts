@@ -34,7 +34,7 @@ export interface StreamCheckResult {
   retryCount: number;
   /** 细粒度错误分类，如 "modelNotFound" */
   errorCategory?: string;
-  auditMode?: string;
+  auditMode?: "all_routes";
   routeResults?: ModelRouterRouteCheckResult[];
 }
 

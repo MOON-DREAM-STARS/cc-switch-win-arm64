@@ -123,6 +123,7 @@ export const FullScreenPanel: React.FC<FullScreenPanelProps> = ({
                 variant="outline"
                 size="icon"
                 onClick={onClose}
+                aria-label="返回"
                 className="rounded-lg select-none"
                 style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
               >
