@@ -184,7 +184,8 @@ export function useSettingsForm(): UseSettingsFormResult {
         skipClaudeOnboarding: serverData.skipClaudeOnboarding ?? false,
         preserveCodexOfficialAuthOnSwitch:
           serverData.preserveCodexOfficialAuthOnSwitch ?? false,
-        enableModelRouterProvider: serverData.enableModelRouterProvider ?? false,
+        enableModelRouterProvider:
+          serverData.enableModelRouterProvider ?? false,
         claudeConfigDir: sanitizeDir(serverData.claudeConfigDir),
         codexConfigDir: sanitizeDir(serverData.codexConfigDir),
         geminiConfigDir: sanitizeDir(serverData.geminiConfigDir),

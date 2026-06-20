@@ -83,7 +83,10 @@ const isManagedCompositeRoute = (
   if (route.matchType === "default") return true;
 
   if (appId === "codex") {
-    return route.matchType === "exact" && Boolean(route.id?.startsWith("combined-exact-"));
+    return (
+      route.matchType === "exact" &&
+      Boolean(route.id?.startsWith("combined-exact-"))
+    );
   }
 
   if (route.id && MANAGED_ROUTE_IDS.has(route.id)) return true;
@@ -95,7 +98,10 @@ const isManagedCompositeRoute = (
 const getEnv = (provider: Provider): Record<string, any> =>
   asRecord(provider.settingsConfig?.env);
 
-const modelFromString = (id: string, ownedBy: string | null = null): FetchedModel => ({
+const modelFromString = (
+  id: string,
+  ownedBy: string | null = null,
+): FetchedModel => ({
   id,
   ownedBy,
 });
@@ -135,7 +141,10 @@ const getStoredModels = (provider: Provider, appId: AppId): FetchedModel[] => {
       : [];
     return uniqueModels(
       catalogModels.map((item: any) =>
-        modelFromString(asString(item.model), asString(item.displayName) || null),
+        modelFromString(
+          asString(item.model),
+          asString(item.displayName) || null,
+        ),
       ),
     );
   }
@@ -152,7 +161,9 @@ const getStoredModels = (provider: Provider, appId: AppId): FetchedModel[] => {
   if (appId === "openclaw" || appId === "hermes") {
     const models = Array.isArray(config.models) ? config.models : [];
     return uniqueModels(
-      models.map((item: any) => modelFromString(asString(item.id || item.name))),
+      models.map((item: any) =>
+        modelFromString(asString(item.id || item.name)),
+      ),
     );
   }
 
@@ -214,7 +225,9 @@ export const getModelFetchDescriptor = (
     apiKey = asString(env.GEMINI_API_KEY);
   } else if (appId === "opencode") {
     const options = asRecord(config.options);
-    baseUrl = asString(options.baseURL || options.baseUrl || config.baseURL || config.baseUrl);
+    baseUrl = asString(
+      options.baseURL || options.baseUrl || config.baseURL || config.baseUrl,
+    );
     apiKey = asString(options.apiKey || config.apiKey);
   } else if (appId === "openclaw") {
     baseUrl = asString(config.baseUrl || config.base_url);

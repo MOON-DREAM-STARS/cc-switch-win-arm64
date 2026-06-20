@@ -10,11 +10,13 @@ export default defineConfig({
     },
   },
   test: {
+    include: ["tests/**/*.{test,spec}.{ts,tsx}"],
     environment: "jsdom",
     setupFiles: ["./tests/setupGlobals.ts", "./tests/setupTests.ts"],
     globals: true,
     coverage: {
       reporter: ["text", "lcov"],
     },
+    exclude: ["**/.claude/**"],
   },
 });

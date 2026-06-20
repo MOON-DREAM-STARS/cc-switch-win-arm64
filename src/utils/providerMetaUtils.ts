@@ -25,7 +25,8 @@ const MANAGED_PROVIDER_META_KEYS = new Set<string>([
 
 const isNonEmptyObject = (
   value: Record<string, unknown> | undefined,
-): value is Record<string, unknown> => Boolean(value && Object.keys(value).length > 0);
+): value is Record<string, unknown> =>
+  Boolean(value && Object.keys(value).length > 0);
 
 export function splitProviderMeta(meta: ProviderMeta | undefined): {
   managedMeta: ProviderMeta | undefined;

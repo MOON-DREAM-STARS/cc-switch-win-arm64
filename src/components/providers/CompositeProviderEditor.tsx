@@ -166,8 +166,9 @@ const emptyCodexRow = (): CodexCompositeExactRowValue => ({
   contextWindow: "",
 });
 
-const toCodexContextWindowValue = (value: string | number | undefined): string =>
-  value === undefined ? "" : String(value);
+const toCodexContextWindowValue = (
+  value: string | number | undefined,
+): string => (value === undefined ? "" : String(value));
 
 const defaultModelRouterTestConfig = (): ProviderModelRouterTestConfig => ({
   enabled: false,
@@ -793,9 +794,9 @@ export function CompositeProviderEditor({
               codexMappings.defaultRoute.providerId,
               ...codexMappings.exactRows.map((row) => row.providerId),
             ].filter(Boolean)
-          : COMPOSITE_ROLE_ORDER.map((role) => mappings[role].providerId).filter(
-              Boolean,
-            ),
+          : COMPOSITE_ROLE_ORDER.map(
+              (role) => mappings[role].providerId,
+            ).filter(Boolean),
       ),
     );
     setIsRefreshingModels(true);
@@ -853,9 +854,12 @@ export function CompositeProviderEditor({
 
     if (appId === "codex") {
       const defaultProviderId = codexMappings.defaultRoute.providerId.trim();
-      const defaultUpstreamModel = codexMappings.defaultRoute.upstreamModel.trim();
+      const defaultUpstreamModel =
+        codexMappings.defaultRoute.upstreamModel.trim();
       const seenRequestModels = new Set<string>();
-      let hasCompleteValidRoute = Boolean(defaultProviderId && defaultUpstreamModel);
+      let hasCompleteValidRoute = Boolean(
+        defaultProviderId && defaultUpstreamModel,
+      );
 
       if (defaultUpstreamModel && !defaultProviderId) {
         toast.error(
@@ -886,7 +890,12 @@ export function CompositeProviderEditor({
         const requestModel = row.requestModel.trim();
         const providerId = row.providerId.trim();
         const upstreamModel = row.upstreamModel.trim();
-        if (!requestModel && !providerId && !upstreamModel && !row.displayName.trim()) {
+        if (
+          !requestModel &&
+          !providerId &&
+          !upstreamModel &&
+          !row.displayName.trim()
+        ) {
           continue;
         }
         if (requestModel && seenRequestModels.has(requestModel)) {
@@ -1400,7 +1409,9 @@ export function CompositeProviderEditor({
                   size="sm"
                   className="gap-2"
                   onClick={() => void handleRefreshSelectedModels()}
-                  disabled={isRefreshingModels || ordinaryProviders.length === 0}
+                  disabled={
+                    isRefreshingModels || ordinaryProviders.length === 0
+                  }
                 >
                   {isRefreshingModels ? (
                     <Loader2 className="h-4 w-4 animate-spin" />
@@ -1428,7 +1439,9 @@ export function CompositeProviderEditor({
                     默认兜底 Provider
                   </Label>
                   <Select
-                    value={codexMappings.defaultRoute.providerId || NO_PROVIDER_VALUE}
+                    value={
+                      codexMappings.defaultRoute.providerId || NO_PROVIDER_VALUE
+                    }
                     onValueChange={(value) =>
                       updateCodexDefaultRoute({
                         providerId: value === NO_PROVIDER_VALUE ? "" : value,
@@ -1446,7 +1459,9 @@ export function CompositeProviderEditor({
                       <SelectValue placeholder="默认兜底 Provider" />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value={NO_PROVIDER_VALUE}>默认兜底 Provider</SelectItem>
+                      <SelectItem value={NO_PROVIDER_VALUE}>
+                        默认兜底 Provider
+                      </SelectItem>
                       {ordinaryProviders.map((ordinaryProvider) => (
                         <SelectItem
                           key={ordinaryProvider.id}
@@ -1459,7 +1474,10 @@ export function CompositeProviderEditor({
                   </Select>
                 </div>
                 <div className="space-y-2 md:space-y-0">
-                  <Label htmlFor="codex-default-upstream-model" className="md:hidden">
+                  <Label
+                    htmlFor="codex-default-upstream-model"
+                    className="md:hidden"
+                  >
                     默认兜底 实际请求模型
                   </Label>
                   <ModelInputWithFetch
@@ -1473,12 +1491,13 @@ export function CompositeProviderEditor({
                     })}
                     fetchedModels={
                       codexMappings.defaultRoute.providerId
-                        ? detection[codexMappings.defaultRoute.providerId]?.models ?? []
+                        ? (detection[codexMappings.defaultRoute.providerId]
+                            ?.models ?? [])
                         : []
                     }
                     isLoading={
-                      detection[codexMappings.defaultRoute.providerId]?.status ===
-                      "detecting"
+                      detection[codexMappings.defaultRoute.providerId]
+                        ?.status === "detecting"
                     }
                     ariaLabel="默认兜底 实际请求模型"
                     dropdownAriaLabel="默认兜底 实际请求模型 options"
@@ -1487,7 +1506,9 @@ export function CompositeProviderEditor({
               </div>
 
               {codexMappings.exactRows.map((row, index) => {
-                const state = row.providerId ? detection[row.providerId] : undefined;
+                const state = row.providerId
+                  ? detection[row.providerId]
+                  : undefined;
                 return (
                   <div
                     key={`codex-exact-row-${index}`}
@@ -1538,14 +1559,19 @@ export function CompositeProviderEditor({
                         />
                       </div>
                       <div className="space-y-2">
-                        <Label htmlFor={`codex-provider-${index}`}>精确匹配 Provider</Label>
+                        <Label htmlFor={`codex-provider-${index}`}>
+                          精确匹配 Provider
+                        </Label>
                         <Select
                           value={row.providerId || NO_PROVIDER_VALUE}
                           onValueChange={(value) =>
                             updateCodexExactRow(index, {
-                              providerId: value === NO_PROVIDER_VALUE ? "" : value,
+                              providerId:
+                                value === NO_PROVIDER_VALUE ? "" : value,
                               upstreamModel:
-                                value === NO_PROVIDER_VALUE ? "" : row.upstreamModel,
+                                value === NO_PROVIDER_VALUE
+                                  ? ""
+                                  : row.upstreamModel,
                             })
                           }
                         >
@@ -1580,9 +1606,12 @@ export function CompositeProviderEditor({
                           onChange={(value) =>
                             updateCodexExactRow(index, { upstreamModel: value })
                           }
-                          placeholder={t("combinedProvider.manualModelPlaceholder", {
-                            defaultValue: "选择或手动输入模型",
-                          })}
+                          placeholder={t(
+                            "combinedProvider.manualModelPlaceholder",
+                            {
+                              defaultValue: "选择或手动输入模型",
+                            },
+                          )}
                           fetchedModels={state?.models ?? []}
                           isLoading={state?.status === "detecting"}
                           ariaLabel="精确匹配 实际请求模型"
@@ -1663,7 +1692,8 @@ export function CompositeProviderEditor({
                         value={mapping.providerId || NO_PROVIDER_VALUE}
                         onValueChange={(value) =>
                           updateMapping(role, {
-                            providerId: value === NO_PROVIDER_VALUE ? "" : value,
+                            providerId:
+                              value === NO_PROVIDER_VALUE ? "" : value,
                             upstreamModel: "",
                           })
                         }
@@ -1704,7 +1734,10 @@ export function CompositeProviderEditor({
                       </Label>
                       <ModelInputWithFetch
                         id={`combined-${role}-model`}
-                        value={getVisibleModelValue(appId, mapping.upstreamModel)}
+                        value={getVisibleModelValue(
+                          appId,
+                          mapping.upstreamModel,
+                        )}
                         onChange={(value) =>
                           updateMapping(role, {
                             upstreamModel: getStoredModelValue(
@@ -1715,9 +1748,12 @@ export function CompositeProviderEditor({
                             ),
                           })
                         }
-                        placeholder={t("combinedProvider.manualModelPlaceholder", {
-                          defaultValue: "选择或手动输入模型",
-                        })}
+                        placeholder={t(
+                          "combinedProvider.manualModelPlaceholder",
+                          {
+                            defaultValue: "选择或手动输入模型",
+                          },
+                        )}
                         fetchedModels={models}
                         isLoading={state?.status === "detecting"}
                         ariaLabel={`${label} Model`}
