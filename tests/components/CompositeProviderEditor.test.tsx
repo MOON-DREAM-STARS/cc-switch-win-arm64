@@ -1,10 +1,19 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { http, HttpResponse } from "msw";
 import type { Provider } from "@/types";
 import type { FetchedModel } from "@/lib/api/model-fetch";
 import { CompositeProviderEditor } from "@/components/providers/CompositeProviderEditor";
 import { COMBINED_PROVIDER_ID } from "@/utils/combinedProviderUtils";
+import { server } from "../msw/server";
 
 vi.mock("@/components/common/FullScreenPanel", () => ({
   FullScreenPanel: ({
@@ -116,6 +125,40 @@ const anotherNetworkClaudeProvider: Provider = {
   },
 };
 
+const COMMON_CONFIG_SNIPPET = JSON.stringify(
+  {
+    env: {
+      ENABLE_TOOL_SEARCH: "true",
+    },
+    defaultShell: "powershell",
+    includeCoAuthoredBy: false,
+  },
+  null,
+  2,
+);
+
+const compositeProviderWithDefaultOrdinaryRoute: Provider = {
+  ...combinedProvider,
+  meta: {
+    providerType: "model_router",
+    managedModelRouterProvider: true,
+    modelRouter: {
+      version: 1,
+      routes: [
+        {
+          id: "combined-default",
+          enabled: true,
+          matchType: "default",
+          target: {
+            providerId: "ordinary",
+            upstreamModel: "stored-default",
+          },
+        },
+      ],
+    },
+  },
+};
+
 const compositeProviderWithDefaultNetworkRoute: Provider = {
   ...combinedProvider,
   meta: {
@@ -137,7 +180,6 @@ const compositeProviderWithDefaultNetworkRoute: Provider = {
     },
   },
 };
-
 type Deferred<T> = {
   promise: Promise<T>;
   resolve: (value: T) => void;
@@ -169,6 +211,17 @@ const selectProvider = async (
 describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
   beforeEach(() => {
     fetchMocks.fetchModelsForConfig.mockReset();
+    server.use(
+      http.post("http://tauri.local/get_common_config_snippet", () =>
+        HttpResponse.json(COMMON_CONFIG_SNIPPET),
+      ),
+      http.post("http://tauri.local/set_common_config_snippet", () =>
+        HttpResponse.json(true),
+      ),
+      http.post("http://tauri.local/extract_common_config_snippet", () =>
+        HttpResponse.json(COMMON_CONFIG_SNIPPET),
+      ),
+    );
   });
 
   it("lists current-app ordinary providers and excludes model routers", () => {
@@ -862,6 +915,40 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     ]);
   });
 
+  it("rehydrates merged common config on reopen when stored diff is flagged", async () => {
+    const providerWithStoredDiff: Provider = {
+      ...combinedProvider,
+      settingsConfig: {
+        env: { CLAUDE_CODE_EFFORT_LEVEL: "max" },
+      },
+      meta: {
+        ...combinedProvider.meta,
+        commonConfigEnabled: true,
+      },
+    };
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={providerWithStoredDiff}
+        providers={{ [providerWithStoredDiff.id]: providerWithStoredDiff }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const editor = screen.getByLabelText(
+        "composite-settings-config",
+      ) as HTMLTextAreaElement;
+      expect(editor.value).toContain('"CLAUDE_CODE_EFFORT_LEVEL": "max"');
+      expect(editor.value).toContain('"ENABLE_TOOL_SEARCH": "true"');
+      expect(editor.value).toContain('"defaultShell": "powershell"');
+      expect(editor.value).toContain('"includeCoAuthoredBy": false');
+    });
+  });
+
   it("saves edited composite config JSON as settingsConfig", async () => {
     const user = userEvent.setup();
     const handleSubmit = vi.fn().mockResolvedValue(undefined);
@@ -870,8 +957,12 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
       <CompositeProviderEditor
         open
         appId="claude"
-        provider={combinedProvider}
-        providers={{ [combinedProvider.id]: combinedProvider }}
+        provider={compositeProviderWithDefaultOrdinaryRoute}
+        providers={{
+          [compositeProviderWithDefaultOrdinaryRoute.id]:
+            compositeProviderWithDefaultOrdinaryRoute,
+          [ordinaryProvider.id]: ordinaryProvider,
+        }}
         onOpenChange={vi.fn()}
         onSubmit={handleSubmit}
       />,
@@ -898,6 +989,34 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     });
   });
 
+  it("persists commonConfigEnabled in composite provider meta on save", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={compositeProviderWithDefaultOrdinaryRoute}
+        providers={{
+          [compositeProviderWithDefaultOrdinaryRoute.id]:
+            compositeProviderWithDefaultOrdinaryRoute,
+          [ordinaryProvider.id]: ordinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await user.click(screen.getByRole("checkbox", { name: "写入通用配置" }));
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(
+      handleSubmit.mock.calls[0][0].provider.meta?.commonConfigEnabled,
+    ).toBe(true);
+  });
+
   it("blocks model and endpoint fields in composite config JSON", async () => {
     const user = userEvent.setup();
     const handleSubmit = vi.fn().mockResolvedValue(undefined);
@@ -906,8 +1025,12 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
       <CompositeProviderEditor
         open
         appId="claude"
-        provider={combinedProvider}
-        providers={{ [combinedProvider.id]: combinedProvider }}
+        provider={compositeProviderWithDefaultOrdinaryRoute}
+        providers={{
+          [compositeProviderWithDefaultOrdinaryRoute.id]:
+            compositeProviderWithDefaultOrdinaryRoute,
+          [ordinaryProvider.id]: ordinaryProvider,
+        }}
         onOpenChange={vi.fn()}
         onSubmit={handleSubmit}
       />,
@@ -933,7 +1056,7 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     const user = userEvent.setup();
     const handleSubmit = vi.fn().mockResolvedValue(undefined);
     const providerWithLegacySettings: Provider = {
-      ...combinedProvider,
+      ...compositeProviderWithDefaultOrdinaryRoute,
       settingsConfig: {
         env: { ANTHROPIC_BASE_URL: "https://legacy.example.com" },
       },
@@ -944,7 +1067,10 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
         open
         appId="claude"
         provider={providerWithLegacySettings}
-        providers={{ [providerWithLegacySettings.id]: providerWithLegacySettings }}
+        providers={{
+          [providerWithLegacySettings.id]: providerWithLegacySettings,
+          [ordinaryProvider.id]: ordinaryProvider,
+        }}
         onOpenChange={vi.fn()}
         onSubmit={handleSubmit}
       />,

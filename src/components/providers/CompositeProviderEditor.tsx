@@ -1,5 +1,12 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Download, Loader2, Package, Save, Wand2 } from "lucide-react";
+import {
+  ArrowLeft,
+  Download,
+  Loader2,
+  Package,
+  Save,
+  Wand2,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -226,9 +233,7 @@ const isRouteConfigPath = (path: string[]): boolean =>
 
 const isForbiddenCompositeEnvKey = (key: string): boolean =>
   COMPOSITE_CONFIG_FORBIDDEN_ENV_KEYS.has(key.toUpperCase()) ||
-  COMPOSITE_CONFIG_FORBIDDEN_ENV_PATTERNS.some((pattern) =>
-    pattern.test(key),
-  );
+  COMPOSITE_CONFIG_FORBIDDEN_ENV_PATTERNS.some((pattern) => pattern.test(key));
 
 const isForbiddenCompositeConfigPath = (
   path: string[],
@@ -369,12 +374,42 @@ export function CompositeProviderEditor({
     onOpenChange(false);
   }, [isDirty, onOpenChange]);
 
-  const handleSettingsConfigChange = useCallback((value: string) => {
-    setSettingsConfigText(value);
-    setSettingsConfigDirty(true);
-    setIsDirty(true);
-    if (settingsConfigError) setSettingsConfigError("");
-  }, [settingsConfigError]);
+  const handleSettingsConfigChange = useCallback(
+    (value: string) => {
+      setSettingsConfigText(value);
+      setSettingsConfigDirty(true);
+      setIsDirty(true);
+      if (settingsConfigError) setSettingsConfigError("");
+    },
+    [settingsConfigError],
+  );
+
+  const handleCommonConfigChange = useCallback(
+    (value: string) => {
+      const shouldKeepClean =
+        open &&
+        provider?.meta?.commonConfigEnabled === true &&
+        !settingsConfigDirty &&
+        !isDirty &&
+        settingsConfigText ===
+          formatCompositeCommonConfig(provider.settingsConfig);
+
+      setSettingsConfigText(value);
+      if (!shouldKeepClean) {
+        setSettingsConfigDirty(true);
+        setIsDirty(true);
+      }
+      if (settingsConfigError) setSettingsConfigError("");
+    },
+    [
+      open,
+      provider,
+      settingsConfigDirty,
+      isDirty,
+      settingsConfigText,
+      settingsConfigError,
+    ],
+  );
 
   const {
     useCommonConfig,
@@ -386,7 +421,12 @@ export function CompositeProviderEditor({
     isExtracting: isCommonExtracting,
   } = useCommonConfigSnippet({
     settingsConfig: settingsConfigText,
-    onConfigChange: handleSettingsConfigChange,
+    onConfigChange: handleCommonConfigChange,
+    initialData: provider
+      ? { settingsConfig: provider.settingsConfig }
+      : undefined,
+    initialEnabled: provider?.meta?.commonConfigEnabled,
+    enabled: open,
   });
 
   const detectionRunRef = useRef(0);
@@ -419,7 +459,13 @@ export function CompositeProviderEditor({
     setIcon(provider.icon ?? "");
     setIconColor(provider.iconColor ?? "");
     setIconDialogOpen(false);
-    setMappings(routeToMappings(provider.meta?.modelRouter?.routes ?? provider.meta?.model_router?.routes ?? []));
+    setMappings(
+      routeToMappings(
+        provider.meta?.modelRouter?.routes ??
+          provider.meta?.model_router?.routes ??
+          [],
+      ),
+    );
     setModelRouterTestConfig({
       ...defaultModelRouterTestConfig(),
       ...(provider.meta?.modelRouterTestConfig ?? {}),
@@ -583,7 +629,13 @@ export function CompositeProviderEditor({
           config?.env?.DISABLE_AUTOUPDATER === 1,
       };
     } catch {
-      return { hideAttribution: false, teammates: false, enableToolSearch: false, effortMax: false, disableAutoUpgrade: false };
+      return {
+        hideAttribution: false,
+        teammates: false,
+        enableToolSearch: false,
+        effortMax: false,
+        disableAutoUpgrade: false,
+      };
     }
   }, [settingsConfigText]);
 
@@ -796,7 +848,9 @@ export function CompositeProviderEditor({
     }
 
     const routes = buildCompositeRoutes(
-      provider.meta?.modelRouter?.routes ?? provider.meta?.model_router?.routes ?? [],
+      provider.meta?.modelRouter?.routes ??
+        provider.meta?.model_router?.routes ??
+        [],
       mappings,
     );
     const { model_router: _modelRouterAlias, ...meta } = provider.meta ?? {};
@@ -820,6 +874,7 @@ export function CompositeProviderEditor({
         providerType: "model_router",
         managedModelRouterProvider:
           provider.meta?.managedModelRouterProvider ?? true,
+        commonConfigEnabled: useCommonConfig,
         modelRouter: { version: 1, routes },
         modelRouterTestConfig: modelRouterTestConfig.enabled
           ? modelRouterTestConfig
@@ -940,7 +995,10 @@ export function CompositeProviderEditor({
             <Input
               id="composite-provider-name"
               value={name}
-              onChange={(event) => { setName(event.target.value); setIsDirty(true); }}
+              onChange={(event) => {
+                setName(event.target.value);
+                setIsDirty(true);
+              }}
               placeholder={t("provider.namePlaceholder")}
             />
           </div>
@@ -952,7 +1010,10 @@ export function CompositeProviderEditor({
             <Input
               id="composite-provider-notes"
               value={notes}
-              onChange={(event) => { setNotes(event.target.value); setIsDirty(true); }}
+              onChange={(event) => {
+                setNotes(event.target.value);
+                setIsDirty(true);
+              }}
               placeholder={t("provider.notesPlaceholder")}
             />
           </div>
@@ -965,7 +1026,10 @@ export function CompositeProviderEditor({
           <Input
             id="composite-provider-website-url"
             value={websiteUrl}
-            onChange={(event) => { setWebsiteUrl(event.target.value); setIsDirty(true); }}
+            onChange={(event) => {
+              setWebsiteUrl(event.target.value);
+              setIsDirty(true);
+            }}
             placeholder={t("providerForm.websiteUrlPlaceholder")}
           />
         </div>
@@ -1061,7 +1125,9 @@ export function CompositeProviderEditor({
                   size="sm"
                   className="gap-2"
                   onClick={() => void handleRefreshSelectedModels()}
-                  disabled={isRefreshingModels || ordinaryProviders.length === 0}
+                  disabled={
+                    isRefreshingModels || ordinaryProviders.length === 0
+                  }
                 >
                   {isRefreshingModels ? (
                     <Loader2 className="h-4 w-4 animate-spin" />
@@ -1234,8 +1300,13 @@ export function CompositeProviderEditor({
         <section className="space-y-3">
           <div className="space-y-1 border-t border-border/50 pt-4">
             <div className="flex items-center justify-between">
-              <Label htmlFor="composite-settings-config" className="text-sm font-medium">
-                {t("combinedProvider.configJson.title", { defaultValue: "配置 JSON" })}
+              <Label
+                htmlFor="composite-settings-config"
+                className="text-sm font-medium"
+              >
+                {t("combinedProvider.configJson.title", {
+                  defaultValue: "配置 JSON",
+                })}
               </Label>
               <div className="flex items-center gap-2">
                 <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
@@ -1245,7 +1316,11 @@ export function CompositeProviderEditor({
                     onChange={(e) => handleCommonConfigToggle(e.target.checked)}
                     className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
                   />
-                  <span>{t("claudeConfig.writeCommonConfig", { defaultValue: "写入通用配置" })}</span>
+                  <span>
+                    {t("claudeConfig.writeCommonConfig", {
+                      defaultValue: "写入通用配置",
+                    })}
+                  </span>
                 </label>
               </div>
             </div>
@@ -1255,7 +1330,9 @@ export function CompositeProviderEditor({
                 onClick={() => setIsCommonConfigModalOpen(true)}
                 className="text-xs text-blue-400 dark:text-blue-500 hover:text-blue-500 dark:hover:text-blue-400 transition-colors"
               >
-                {t("claudeConfig.editCommonConfig", { defaultValue: "编辑通用配置" })}
+                {t("claudeConfig.editCommonConfig", {
+                  defaultValue: "编辑通用配置",
+                })}
               </button>
             </div>
             <p className="text-xs text-muted-foreground">
@@ -1270,7 +1347,12 @@ export function CompositeProviderEditor({
               <input
                 type="checkbox"
                 checked={compositeConfigToggles.hideAttribution}
-                onChange={(e) => handleCompositeConfigToggle("hideAttribution", e.target.checked)}
+                onChange={(e) =>
+                  handleCompositeConfigToggle(
+                    "hideAttribution",
+                    e.target.checked,
+                  )
+                }
                 className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
               />
               <span>{t("claudeConfig.hideAttribution")}</span>
@@ -1279,7 +1361,9 @@ export function CompositeProviderEditor({
               <input
                 type="checkbox"
                 checked={compositeConfigToggles.teammates}
-                onChange={(e) => handleCompositeConfigToggle("teammates", e.target.checked)}
+                onChange={(e) =>
+                  handleCompositeConfigToggle("teammates", e.target.checked)
+                }
                 className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
               />
               <span>{t("claudeConfig.enableTeammates")}</span>
@@ -1288,7 +1372,12 @@ export function CompositeProviderEditor({
               <input
                 type="checkbox"
                 checked={compositeConfigToggles.enableToolSearch}
-                onChange={(e) => handleCompositeConfigToggle("enableToolSearch", e.target.checked)}
+                onChange={(e) =>
+                  handleCompositeConfigToggle(
+                    "enableToolSearch",
+                    e.target.checked,
+                  )
+                }
                 className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
               />
               <span>{t("claudeConfig.enableToolSearch")}</span>
@@ -1297,7 +1386,9 @@ export function CompositeProviderEditor({
               <input
                 type="checkbox"
                 checked={compositeConfigToggles.effortMax}
-                onChange={(e) => handleCompositeConfigToggle("effortMax", e.target.checked)}
+                onChange={(e) =>
+                  handleCompositeConfigToggle("effortMax", e.target.checked)
+                }
                 className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
               />
               <span>{t("claudeConfig.effortMax")}</span>
@@ -1306,13 +1397,18 @@ export function CompositeProviderEditor({
               <input
                 type="checkbox"
                 checked={compositeConfigToggles.disableAutoUpgrade}
-                onChange={(e) => handleCompositeConfigToggle("disableAutoUpgrade", e.target.checked)}
+                onChange={(e) =>
+                  handleCompositeConfigToggle(
+                    "disableAutoUpgrade",
+                    e.target.checked,
+                  )
+                }
                 className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
               />
               <span>{t("claudeConfig.disableAutoUpgrade")}</span>
             </label>
           </div>
-          {(settingsConfigError || commonSnippetError) ? (
+          {settingsConfigError || commonSnippetError ? (
             <p className="text-xs text-red-500 dark:text-red-400">
               {settingsConfigError || commonSnippetError}
             </p>
@@ -1338,7 +1434,9 @@ export function CompositeProviderEditor({
           />
           <FullScreenPanel
             isOpen={isCommonConfigModalOpen}
-            title={t("claudeConfig.editCommonConfigTitle", { defaultValue: "编辑通用配置片段" })}
+            title={t("claudeConfig.editCommonConfigTitle", {
+              defaultValue: "编辑通用配置片段",
+            })}
             onClose={() => setIsCommonConfigModalOpen(false)}
             footer={
               <>
@@ -1354,12 +1452,22 @@ export function CompositeProviderEditor({
                   ) : (
                     <Download className="w-4 h-4" />
                   )}
-                  {t("claudeConfig.extractFromCurrent", { defaultValue: "从编辑内容提取" })}
+                  {t("claudeConfig.extractFromCurrent", {
+                    defaultValue: "从编辑内容提取",
+                  })}
                 </Button>
-                <Button type="button" variant="outline" onClick={() => setIsCommonConfigModalOpen(false)}>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setIsCommonConfigModalOpen(false)}
+                >
                   {t("common.cancel")}
                 </Button>
-                <Button type="button" onClick={() => setIsCommonConfigModalOpen(false)} className="gap-2">
+                <Button
+                  type="button"
+                  onClick={() => setIsCommonConfigModalOpen(false)}
+                  className="gap-2"
+                >
                   <Save className="w-4 h-4" />
                   {t("common.save")}
                 </Button>
@@ -1384,10 +1492,14 @@ export function CompositeProviderEditor({
                   {t("commonConfig.guideReassurance")}
                 </p>
               </div>
-              {(!commonConfigSnippet || commonConfigSnippet.trim() === "" || commonConfigSnippet.trim() === "{}") && (
+              {(!commonConfigSnippet ||
+                commonConfigSnippet.trim() === "" ||
+                commonConfigSnippet.trim() === "{}") && (
                 <div className="flex flex-col items-center justify-center py-6 text-center text-muted-foreground">
                   <Package className="h-8 w-8 mb-2 opacity-40" />
-                  <p className="text-sm font-medium">{t("commonConfig.emptyTitle")}</p>
+                  <p className="text-sm font-medium">
+                    {t("commonConfig.emptyTitle")}
+                  </p>
                   <p className="text-xs mt-1">{t("commonConfig.emptyHint")}</p>
                 </div>
               )}
@@ -1401,7 +1513,9 @@ export function CompositeProviderEditor({
                 language="json"
               />
               {commonSnippetError && (
-                <p className="text-sm text-red-500 dark:text-red-400">{commonSnippetError}</p>
+                <p className="text-sm text-red-500 dark:text-red-400">
+                  {commonSnippetError}
+                </p>
               )}
             </div>
           </FullScreenPanel>
@@ -1478,7 +1592,9 @@ export function CompositeProviderEditor({
                   setModelRouterTestConfig((prev) => ({
                     ...prev,
                     timeoutSecs: event.target.value
-                      ? (Number.isFinite(Number(event.target.value)) ? Number(event.target.value) | 0 : prev.timeoutSecs)
+                      ? Number.isFinite(Number(event.target.value))
+                        ? Number(event.target.value) | 0
+                        : prev.timeoutSecs
                       : undefined,
                   }));
                   setIsDirty(true);
@@ -1523,7 +1639,9 @@ export function CompositeProviderEditor({
                   setModelRouterTestConfig((prev) => ({
                     ...prev,
                     degradedThresholdMs: event.target.value
-                      ? (Number.isFinite(Number(event.target.value)) ? Number(event.target.value) | 0 : prev.degradedThresholdMs)
+                      ? Number.isFinite(Number(event.target.value))
+                        ? Number(event.target.value) | 0
+                        : prev.degradedThresholdMs
                       : undefined,
                   }));
                   setIsDirty(true);
@@ -1548,7 +1666,9 @@ export function CompositeProviderEditor({
                   setModelRouterTestConfig((prev) => ({
                     ...prev,
                     maxRetries: event.target.value
-                      ? (Number.isFinite(Number(event.target.value)) ? Number(event.target.value) | 0 : prev.maxRetries)
+                      ? Number.isFinite(Number(event.target.value))
+                        ? Number(event.target.value) | 0
+                        : prev.maxRetries
                       : undefined,
                   }));
                   setIsDirty(true);
