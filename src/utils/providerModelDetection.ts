@@ -1,5 +1,6 @@
 import type { FetchedModel } from "@/lib/api/model-fetch";
 import type {
+  CodexCatalogModel,
   Provider,
   ProviderModelRouterRole,
   ProviderModelRouterRule,
@@ -31,6 +32,19 @@ export interface CompositeMappingRowValue {
 
 export type CompositeMappings = Record<CompositeRole, CompositeMappingRowValue>;
 
+export interface CodexCompositeExactRowValue {
+  requestModel: string;
+  displayName: string;
+  providerId: string;
+  upstreamModel: string;
+  contextWindow?: string | number;
+}
+
+export interface CodexCompositeMappings {
+  defaultRoute: CompositeMappingRowValue;
+  exactRows: CodexCompositeExactRowValue[];
+}
+
 const MANAGED_ROUTE_IDS = new Set([
   "combined-default",
   "combined-role-haiku",
@@ -45,14 +59,6 @@ const MANAGED_ROUTE_ROLES = new Set<CompositeRole>([
   "opus",
 ]);
 
-const isManagedCompositeRoute = (route: ProviderModelRouterRule): boolean => {
-  if (route.id && MANAGED_ROUTE_IDS.has(route.id)) return true;
-  if (route.matchType === "default") return true;
-  if (route.matchType !== "role") return false;
-  const role = asString(route.matchValue).toLowerCase() as CompositeRole;
-  return MANAGED_ROUTE_ROLES.has(role);
-};
-
 const asRecord = (value: unknown): Record<string, any> =>
   value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, any>)
@@ -60,6 +66,31 @@ const asRecord = (value: unknown): Record<string, any> =>
 
 const asString = (value: unknown): string =>
   typeof value === "string" ? value.trim() : "";
+
+const normalizeCodexManagedRouteId = (requestModel: string): string => {
+  const normalized = requestModel
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return normalized ? `combined-exact-${normalized}` : "combined-exact";
+};
+
+const isManagedCompositeRoute = (
+  route: ProviderModelRouterRule,
+  appId: AppId,
+): boolean => {
+  if (route.matchType === "default") return true;
+
+  if (appId === "codex") {
+    return route.matchType === "exact" && Boolean(route.id?.startsWith("combined-exact-"));
+  }
+
+  if (route.id && MANAGED_ROUTE_IDS.has(route.id)) return true;
+  if (route.matchType !== "role") return false;
+  const role = asString(route.matchValue).toLowerCase() as CompositeRole;
+  return MANAGED_ROUTE_ROLES.has(role);
+};
 
 const getEnv = (provider: Provider): Record<string, any> =>
   asRecord(provider.settingsConfig?.env);
@@ -80,6 +111,11 @@ const uniqueModels = (models: FetchedModel[]): FetchedModel[] => {
   }
   return result;
 };
+
+export const emptyCodexCompositeMappings = (): CodexCompositeMappings => ({
+  defaultRoute: { providerId: "", upstreamModel: "" },
+  exactRows: [],
+});
 
 export const getDetectableOrdinaryProviders = (
   providers: Record<string, Provider>,
@@ -209,7 +245,7 @@ export const getModelFetchDescriptor = (
   };
 };
 
-const makeManagedRoute = (
+const makeManagedClaudeRoute = (
   role: CompositeRole,
   value: CompositeMappingRowValue,
 ): ProviderModelRouterRule | null => {
@@ -240,11 +276,118 @@ export const buildCompositeRoutes = (
   mappings: CompositeMappings,
 ): ProviderModelRouterRule[] => {
   const preserved = existingRoutes.filter(
-    (route) => !isManagedCompositeRoute(route),
+    (route) => !isManagedCompositeRoute(route, "claude"),
   );
   const managed = (["default", "haiku", "sonnet", "opus"] as const)
-    .map((role) => makeManagedRoute(role, mappings[role]))
+    .map((role) => makeManagedClaudeRoute(role, mappings[role]))
     .filter((route): route is ProviderModelRouterRule => Boolean(route));
 
   return [...preserved, ...managed];
+};
+
+export const buildCodexCompositeRoutes = (
+  existingRoutes: ProviderModelRouterRule[],
+  mappings: CodexCompositeMappings,
+): ProviderModelRouterRule[] => {
+  const preserved = existingRoutes.filter(
+    (route) => !isManagedCompositeRoute(route, "codex"),
+  );
+  const managed: ProviderModelRouterRule[] = [];
+
+  const defaultProviderId = mappings.defaultRoute.providerId.trim();
+  const defaultUpstreamModel = mappings.defaultRoute.upstreamModel.trim();
+  if (defaultProviderId && defaultUpstreamModel) {
+    managed.push({
+      id: "combined-default",
+      enabled: true,
+      matchType: "default",
+      target: {
+        providerId: defaultProviderId,
+        upstreamModel: defaultUpstreamModel,
+      },
+    });
+  }
+
+  for (const row of mappings.exactRows) {
+    const requestModel = row.requestModel.trim();
+    const providerId = row.providerId.trim();
+    const upstreamModel = row.upstreamModel.trim();
+    if (!requestModel || !providerId || !upstreamModel) continue;
+    managed.push({
+      id: normalizeCodexManagedRouteId(requestModel),
+      enabled: true,
+      matchType: "exact",
+      matchValue: requestModel,
+      target: { providerId, upstreamModel },
+    });
+  }
+
+  return [...preserved, ...managed];
+};
+
+export const buildCodexCompositeModelCatalog = (
+  rows: CodexCompositeExactRowValue[],
+): CodexCatalogModel[] => {
+  const seen = new Set<string>();
+  const result: CodexCatalogModel[] = [];
+
+  for (const row of rows) {
+    const model = row.requestModel.trim();
+    if (!model || seen.has(model)) continue;
+    seen.add(model);
+
+    const catalogRow: CodexCatalogModel = { model };
+    const displayName = row.displayName.trim();
+    if (displayName) catalogRow.displayName = displayName;
+
+    if (row.contextWindow !== undefined && row.contextWindow !== "") {
+      const digits = String(row.contextWindow).replace(/[^0-9]/g, "");
+      if (digits) catalogRow.contextWindow = Number(digits);
+    }
+
+    result.push(catalogRow);
+  }
+
+  return result;
+};
+
+export const routeToCodexCompositeMappings = (
+  routes: ProviderModelRouterRule[],
+  settingsConfig?: Record<string, any>,
+): CodexCompositeMappings => {
+  const next = emptyCodexCompositeMappings();
+  const catalogModels = Array.isArray(settingsConfig?.modelCatalog?.models)
+    ? settingsConfig.modelCatalog.models
+    : [];
+  const catalogByModel = new Map(
+    catalogModels.map((item: any) => [asString(item.model), item]),
+  );
+
+  for (const route of routes) {
+    const providerId = route.target?.providerId ?? "";
+    const upstreamModel = route.target?.upstreamModel ?? "";
+
+    if (route.matchType === "default") {
+      next.defaultRoute = { providerId, upstreamModel };
+      continue;
+    }
+
+    if (route.matchType !== "exact") continue;
+    const requestModel = asString(route.matchValue);
+    if (!requestModel) continue;
+    const catalog = asRecord(catalogByModel.get(requestModel));
+    next.exactRows.push({
+      requestModel,
+      displayName: asString(catalog.displayName),
+      providerId,
+      upstreamModel,
+      contextWindow:
+        typeof catalog.contextWindow === "number" ||
+        typeof catalog.contextWindow === "string"
+          ? catalog.contextWindow
+          : undefined,
+    });
+  }
+
+  return next;
 };

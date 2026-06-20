@@ -48,9 +48,15 @@ import type {
 import type { AppId } from "@/lib/api";
 import { fetchModelsForConfig, type FetchedModel } from "@/lib/api/model-fetch";
 import {
+  buildCodexCompositeModelCatalog,
+  buildCodexCompositeRoutes,
   buildCompositeRoutes,
+  emptyCodexCompositeMappings,
   getDetectableOrdinaryProviders,
   getModelFetchDescriptor,
+  routeToCodexCompositeMappings,
+  type CodexCompositeExactRowValue,
+  type CodexCompositeMappings,
   type CompositeMappings,
   type CompositeRole,
   type ModelFetchDescriptor,
@@ -151,6 +157,17 @@ const emptyMappings = (): CompositeMappings => ({
   sonnet: { providerId: "", upstreamModel: "" },
   opus: { providerId: "", upstreamModel: "" },
 });
+
+const emptyCodexRow = (): CodexCompositeExactRowValue => ({
+  requestModel: "",
+  displayName: "",
+  providerId: "",
+  upstreamModel: "",
+  contextWindow: "",
+});
+
+const toCodexContextWindowValue = (value: string | number | undefined): string =>
+  value === undefined ? "" : String(value);
 
 const defaultModelRouterTestConfig = (): ProviderModelRouterTestConfig => ({
   enabled: false,
@@ -357,6 +374,9 @@ export function CompositeProviderEditor({
   const [iconColor, setIconColor] = useState("");
   const [iconDialogOpen, setIconDialogOpen] = useState(false);
   const [mappings, setMappings] = useState<CompositeMappings>(emptyMappings);
+  const [codexMappings, setCodexMappings] = useState<CodexCompositeMappings>(
+    emptyCodexCompositeMappings,
+  );
   const [modelRouterTestConfig, setModelRouterTestConfig] =
     useState<ProviderModelRouterTestConfig>(defaultModelRouterTestConfig);
   const [settingsConfigText, setSettingsConfigText] = useState("{}");
@@ -466,6 +486,19 @@ export function CompositeProviderEditor({
           [],
       ),
     );
+    const initialCodexMappings = routeToCodexCompositeMappings(
+      provider.meta?.modelRouter?.routes ??
+        provider.meta?.model_router?.routes ??
+        [],
+      provider.settingsConfig,
+    );
+    setCodexMappings({
+      defaultRoute: initialCodexMappings.defaultRoute,
+      exactRows: initialCodexMappings.exactRows.map((row) => ({
+        ...row,
+        contextWindow: toCodexContextWindowValue(row.contextWindow),
+      })),
+    });
     setModelRouterTestConfig({
       ...defaultModelRouterTestConfig(),
       ...(provider.meta?.modelRouterTestConfig ?? {}),
@@ -713,12 +746,56 @@ export function CompositeProviderEditor({
     );
   };
 
+  const updateCodexDefaultRoute = (
+    patch: Partial<{ providerId: string; upstreamModel: string }>,
+  ) => {
+    setCodexMappings((prev) => ({
+      ...prev,
+      defaultRoute: { ...prev.defaultRoute, ...patch },
+    }));
+    setIsDirty(true);
+  };
+
+  const updateCodexExactRow = (
+    index: number,
+    patch: Partial<CodexCompositeExactRowValue>,
+  ) => {
+    setCodexMappings((prev) => ({
+      ...prev,
+      exactRows: prev.exactRows.map((row, rowIndex) =>
+        rowIndex === index ? { ...row, ...patch } : row,
+      ),
+    }));
+    setIsDirty(true);
+  };
+
+  const addCodexExactRow = () => {
+    setCodexMappings((prev) => ({
+      ...prev,
+      exactRows: [...prev.exactRows, emptyCodexRow()],
+    }));
+    setIsDirty(true);
+  };
+
+  const removeCodexExactRow = (index: number) => {
+    setCodexMappings((prev) => ({
+      ...prev,
+      exactRows: prev.exactRows.filter((_, rowIndex) => rowIndex !== index),
+    }));
+    setIsDirty(true);
+  };
+
   const handleRefreshSelectedModels = async () => {
     const selectedProviderIds = Array.from(
       new Set(
-        COMPOSITE_ROLE_ORDER.map((role) => mappings[role].providerId).filter(
-          Boolean,
-        ),
+        appId === "codex"
+          ? [
+              codexMappings.defaultRoute.providerId,
+              ...codexMappings.exactRows.map((row) => row.providerId),
+            ].filter(Boolean)
+          : COMPOSITE_ROLE_ORDER.map((role) => mappings[role].providerId).filter(
+              Boolean,
+            ),
       ),
     );
     setIsRefreshingModels(true);
@@ -773,6 +850,184 @@ export function CompositeProviderEditor({
 
   const handleSubmit = async () => {
     if (!provider) return;
+
+    if (appId === "codex") {
+      const defaultProviderId = codexMappings.defaultRoute.providerId.trim();
+      const defaultUpstreamModel = codexMappings.defaultRoute.upstreamModel.trim();
+      const seenRequestModels = new Set<string>();
+      let hasCompleteValidRoute = Boolean(defaultProviderId && defaultUpstreamModel);
+
+      if (defaultUpstreamModel && !defaultProviderId) {
+        toast.error(
+          t("combinedProvider.validation.modelWithoutProvider", {
+            defaultValue: "请选择 Provider 后再填写模型。",
+          }),
+        );
+        return;
+      }
+      if (defaultProviderId && !providers[defaultProviderId]) {
+        toast.error(
+          t("combinedProvider.validation.providerNotFound", {
+            defaultValue: "模型映射引用的 Provider 不存在，请重新选择。",
+          }),
+        );
+        return;
+      }
+      if (defaultProviderId && !defaultUpstreamModel) {
+        toast.error(
+          t("combinedProvider.validation.providerWithoutModel", {
+            defaultValue: "已选择 Provider，请填写实际请求模型。",
+          }),
+        );
+        return;
+      }
+
+      for (const row of codexMappings.exactRows) {
+        const requestModel = row.requestModel.trim();
+        const providerId = row.providerId.trim();
+        const upstreamModel = row.upstreamModel.trim();
+        if (!requestModel && !providerId && !upstreamModel && !row.displayName.trim()) {
+          continue;
+        }
+        if (requestModel && seenRequestModels.has(requestModel)) {
+          toast.error(
+            t("combinedProvider.codex.validation.duplicateRequestModel", {
+              defaultValue: "请求模型不能重复。",
+            }),
+          );
+          return;
+        }
+        if (requestModel) seenRequestModels.add(requestModel);
+        if (upstreamModel && !providerId) {
+          toast.error(
+            t("combinedProvider.validation.modelWithoutProvider", {
+              defaultValue: "请选择 Provider 后再填写模型。",
+            }),
+          );
+          return;
+        }
+        if ((providerId || upstreamModel) && !requestModel) {
+          toast.error(
+            t("combinedProvider.codex.validation.requestModelRequired", {
+              defaultValue: "请先填写请求模型。",
+            }),
+          );
+          return;
+        }
+        if (providerId && !providers[providerId]) {
+          toast.error(
+            t("combinedProvider.validation.providerNotFound", {
+              defaultValue: "模型映射引用的 Provider 不存在，请重新选择。",
+            }),
+          );
+          return;
+        }
+        if (providerId && !upstreamModel) {
+          toast.error(
+            t("combinedProvider.validation.providerWithoutModel", {
+              defaultValue: "已选择 Provider，请填写实际请求模型。",
+            }),
+          );
+          return;
+        }
+        if (requestModel && providerId && upstreamModel) {
+          hasCompleteValidRoute = true;
+        }
+      }
+
+      if (!hasCompleteValidRoute) {
+        toast.error(
+          t("combinedProvider.validation.noCompleteRoute", {
+            defaultValue: "请至少配置一条完整的模型映射。",
+          }),
+        );
+        return;
+      }
+
+      let commonSettingsConfig = provider.settingsConfig ?? {};
+      if (settingsConfigDirty) {
+        try {
+          const result = validateCompositeCommonConfigText(settingsConfigText);
+          if (result.forbiddenPaths.length > 0) {
+            const message = t("combinedProvider.configJson.forbiddenKeys", {
+              keys: result.forbiddenPaths.join(", "),
+              defaultValue: `配置 JSON 不能包含模型、URL、认证或路由字段：${result.forbiddenPaths.join(", ")}`,
+            });
+            setSettingsConfigError(message);
+            toast.error(message);
+            return;
+          }
+          commonSettingsConfig = result.config;
+        } catch (error) {
+          const message =
+            error instanceof Error && error.message === "root-must-be-object"
+              ? t("jsonEditor.mustBeObject", {
+                  defaultValue: "JSON 必须是对象",
+                })
+              : t("combinedProvider.configJson.invalidJson", {
+                  defaultValue: "配置 JSON 格式无效",
+                });
+          setSettingsConfigError(message);
+          toast.error(message);
+          return;
+        }
+      }
+
+      const routes = buildCodexCompositeRoutes(
+        provider.meta?.modelRouter?.routes ??
+          provider.meta?.model_router?.routes ??
+          [],
+        codexMappings,
+      );
+      const { model_router: _modelRouterAlias, ...meta } = provider.meta ?? {};
+      const trimmedName = name.trim();
+      const trimmedNotes = notes.trim();
+      const trimmedWebsiteUrl = websiteUrl.trim();
+      const trimmedIcon = icon.trim();
+      const trimmedIconColor = iconColor.trim();
+      const updatedProvider: Provider = {
+        ...provider,
+        name:
+          trimmedName ||
+          t("combinedProvider.name", { defaultValue: "组合provider" }),
+        notes: trimmedNotes || undefined,
+        websiteUrl: trimmedWebsiteUrl || undefined,
+        icon: trimmedIcon || undefined,
+        iconColor: trimmedIconColor || undefined,
+        settingsConfig: {
+          ...(commonSettingsConfig as Record<string, any>),
+          modelCatalog: {
+            models: buildCodexCompositeModelCatalog(codexMappings.exactRows),
+          },
+        },
+        meta: {
+          ...meta,
+          providerType: "model_router",
+          managedModelRouterProvider:
+            provider.meta?.managedModelRouterProvider ?? true,
+          commonConfigEnabled: useCommonConfig,
+          modelRouter: { version: 1, routes },
+          modelRouterTestConfig: modelRouterTestConfig.enabled
+            ? modelRouterTestConfig
+            : undefined,
+        },
+      };
+
+      setIsSubmitting(true);
+      try {
+        await onSubmit({ provider: updatedProvider, originalId: provider.id });
+        toast.success(
+          t("combinedProvider.saveSuccess", {
+            defaultValue: "组合 Provider 已保存",
+          }),
+        );
+        setIsDirty(false);
+        onOpenChange(false);
+      } finally {
+        setIsSubmitting(false);
+      }
+      return;
+    }
     let hasCompleteValidRoute = false;
     for (const [role, value] of Object.entries(mappings)) {
       const providerId = value.providerId.trim();
@@ -1099,35 +1354,53 @@ export function CompositeProviderEditor({
                   })}
                 </h3>
                 <p className="text-xs text-muted-foreground">
-                  {t("combinedProvider.mapping.hint", {
-                    defaultValue:
-                      "为每个 Claude 模型角色选择普通 Provider，并指定要请求的上游模型。",
-                  })}
+                  {appId === "codex"
+                    ? t("combinedProvider.codex.mapping.hint", {
+                        defaultValue:
+                          "为 Codex 配置默认兜底路由，并按请求模型名添加精确匹配。",
+                      })
+                    : t("combinedProvider.mapping.hint", {
+                        defaultValue:
+                          "为每个 Claude 模型角色选择普通 Provider，并指定要请求的上游模型。",
+                      })}
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="gap-2"
-                  onClick={handleQuickSetMappings}
-                  disabled={!quickSetSourceRole}
-                >
-                  <Wand2 className="h-4 w-4" />
-                  {t("providerForm.quickSetModels", {
-                    defaultValue: "一键设置",
-                  })}
-                </Button>
+                {appId === "claude" ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="gap-2"
+                    onClick={handleQuickSetMappings}
+                    disabled={!quickSetSourceRole}
+                  >
+                    <Wand2 className="h-4 w-4" />
+                    {t("providerForm.quickSetModels", {
+                      defaultValue: "一键设置",
+                    })}
+                  </Button>
+                ) : null}
+                {appId === "codex" ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="gap-2"
+                    onClick={addCodexExactRow}
+                  >
+                    {t("combinedProvider.codex.addModel", {
+                      defaultValue: "添加模型",
+                    })}
+                  </Button>
+                ) : null}
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
                   className="gap-2"
                   onClick={() => void handleRefreshSelectedModels()}
-                  disabled={
-                    isRefreshingModels || ordinaryProviders.length === 0
-                  }
+                  disabled={isRefreshingModels || ordinaryProviders.length === 0}
                 >
                   {isRefreshingModels ? (
                     <Loader2 className="h-4 w-4 animate-spin" />
@@ -1142,80 +1415,38 @@ export function CompositeProviderEditor({
             </div>
           </div>
 
-          <div
-            className={`hidden grid-cols-1 gap-2 px-1 text-xs font-medium text-muted-foreground md:grid ${mappingGridClassName(appId)}`}
-          >
-            <span>
-              {t("providerForm.modelRoleLabel", {
-                defaultValue: "模型角色",
-              })}
-            </span>
-            <span>Provider</span>
-            <span>
-              {t("providerForm.requestModelLabel", {
-                defaultValue: "实际请求模型",
-              })}
-            </span>
-            {appId === "claude" ? (
-              <span>
-                {t("providerForm.modelOneMHeader", {
-                  defaultValue: "声明支持 1M",
-                })}
-              </span>
-            ) : null}
-          </div>
-
-          {roleLabels.map(({ role, key, defaultLabel }) => {
-            const label = t(key, { defaultValue: defaultLabel });
-            const mapping = mappings[role];
-            const selectedProvider = providers[mapping.providerId];
-            const state = selectedProvider
-              ? detection[selectedProvider.id]
-              : undefined;
-            const models = state?.models ?? [];
-            const oneMSupported = supportsClaudeOneM(appId, role);
-            const oneMChecked = hasClaudeOneMMarker(mapping.upstreamModel);
-
-            return (
-              <div
-                key={role}
-                className={`grid grid-cols-1 gap-2 ${mappingGridClassName(appId)}`}
-              >
+          {appId === "codex" ? (
+            <div className="space-y-5">
+              <div className="grid grid-cols-1 gap-2 md:grid-cols-[160px_minmax(0,1fr)_minmax(0,1fr)]">
                 <div className="flex h-9 items-center rounded-md border border-input bg-muted px-3 text-sm font-medium text-muted-foreground">
-                  {label}
+                  {t("combinedProvider.codex.defaultFallback", {
+                    defaultValue: "默认兜底",
+                  })}
                 </div>
                 <div className="space-y-2 md:space-y-0">
-                  <Label
-                    htmlFor={`combined-${role}-provider`}
-                    className="md:hidden"
-                  >
-                    {label} Provider
+                  <Label htmlFor="codex-default-provider" className="md:hidden">
+                    默认兜底 Provider
                   </Label>
                   <Select
-                    value={mapping.providerId || NO_PROVIDER_VALUE}
+                    value={codexMappings.defaultRoute.providerId || NO_PROVIDER_VALUE}
                     onValueChange={(value) =>
-                      updateMapping(role, {
+                      updateCodexDefaultRoute({
                         providerId: value === NO_PROVIDER_VALUE ? "" : value,
-                        upstreamModel: "",
+                        upstreamModel:
+                          value === NO_PROVIDER_VALUE
+                            ? ""
+                            : codexMappings.defaultRoute.upstreamModel,
                       })
                     }
                   >
                     <SelectTrigger
-                      id={`combined-${role}-provider`}
-                      aria-label={`${label} Provider`}
+                      id="codex-default-provider"
+                      aria-label="默认兜底 Provider"
                     >
-                      <SelectValue
-                        placeholder={t("combinedProvider.selectProvider", {
-                          defaultValue: "选择 Provider",
-                        })}
-                      />
+                      <SelectValue placeholder="默认兜底 Provider" />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value={NO_PROVIDER_VALUE}>
-                        {t("combinedProvider.selectProvider", {
-                          defaultValue: "选择 Provider",
-                        })}
-                      </SelectItem>
+                      <SelectItem value={NO_PROVIDER_VALUE}>默认兜底 Provider</SelectItem>
                       {ordinaryProviders.map((ordinaryProvider) => (
                         <SelectItem
                           key={ordinaryProvider.id}
@@ -1228,73 +1459,312 @@ export function CompositeProviderEditor({
                   </Select>
                 </div>
                 <div className="space-y-2 md:space-y-0">
-                  <Label
-                    htmlFor={`combined-${role}-model`}
-                    className="md:hidden"
-                  >
-                    {label} Model
+                  <Label htmlFor="codex-default-upstream-model" className="md:hidden">
+                    默认兜底 实际请求模型
                   </Label>
                   <ModelInputWithFetch
-                    id={`combined-${role}-model`}
-                    value={getVisibleModelValue(appId, mapping.upstreamModel)}
+                    id="codex-default-upstream-model"
+                    value={codexMappings.defaultRoute.upstreamModel}
                     onChange={(value) =>
-                      updateMapping(role, {
-                        upstreamModel: getStoredModelValue(
-                          appId,
-                          role,
-                          mapping.upstreamModel,
-                          value,
-                        ),
-                      })
+                      updateCodexDefaultRoute({ upstreamModel: value })
                     }
                     placeholder={t("combinedProvider.manualModelPlaceholder", {
                       defaultValue: "选择或手动输入模型",
                     })}
-                    fetchedModels={models}
-                    isLoading={state?.status === "detecting"}
-                    ariaLabel={`${label} Model`}
-                    dropdownAriaLabel={`${label} Model options`}
+                    fetchedModels={
+                      codexMappings.defaultRoute.providerId
+                        ? detection[codexMappings.defaultRoute.providerId]?.models ?? []
+                        : []
+                    }
+                    isLoading={
+                      detection[codexMappings.defaultRoute.providerId]?.status ===
+                      "detecting"
+                    }
+                    ariaLabel="默认兜底 实际请求模型"
+                    dropdownAriaLabel="默认兜底 实际请求模型 options"
                   />
-                  {mapping.providerId &&
-                    (state?.status === "failed" ||
-                      state?.status === "unavailable") && (
-                      <p className="text-xs text-muted-foreground mt-1">
-                        {state.message || "模型列表获取失败"}
-                      </p>
-                    )}
                 </div>
-                {appId === "claude" ? (
-                  <div className="flex h-9 items-center gap-2">
-                    {oneMSupported ? (
-                      <>
-                        <Checkbox
-                          id={`combined-${role}-one-m`}
-                          checked={oneMChecked}
-                          onCheckedChange={(checked) =>
-                            updateMapping(role, {
-                              upstreamModel: setClaudeOneMMarker(
-                                mapping.upstreamModel,
-                                checked === true,
-                              ),
+              </div>
+
+              {codexMappings.exactRows.map((row, index) => {
+                const state = row.providerId ? detection[row.providerId] : undefined;
+                return (
+                  <div
+                    key={`codex-exact-row-${index}`}
+                    className="rounded-lg border border-border/50 p-3 space-y-3"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-sm font-medium text-muted-foreground">
+                        {t("combinedProvider.codex.exactRow", {
+                          defaultValue: "精确匹配",
+                        })}
+                      </p>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => removeCodexExactRow(index)}
+                      >
+                        {t("common.delete", { defaultValue: "删除" })}
+                      </Button>
+                    </div>
+                    <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                      <div className="space-y-2">
+                        <Label htmlFor={`codex-request-model-${index}`}>
+                          请求模型
+                        </Label>
+                        <Input
+                          id={`codex-request-model-${index}`}
+                          value={row.requestModel}
+                          onChange={(event) =>
+                            updateCodexExactRow(index, {
+                              requestModel: event.target.value,
                             })
                           }
                         />
-                        <Label
-                          htmlFor={`combined-${role}-one-m`}
-                          className="cursor-pointer text-sm font-normal"
-                        >
-                          {label}{" "}
-                          {t("providerForm.modelOneMLabel", {
-                            defaultValue: "1M",
-                          })}
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor={`codex-display-name-${index}`}>
+                          菜单显示名
                         </Label>
-                      </>
-                    ) : null}
+                        <Input
+                          id={`codex-display-name-${index}`}
+                          value={row.displayName}
+                          onChange={(event) =>
+                            updateCodexExactRow(index, {
+                              displayName: event.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor={`codex-provider-${index}`}>精确匹配 Provider</Label>
+                        <Select
+                          value={row.providerId || NO_PROVIDER_VALUE}
+                          onValueChange={(value) =>
+                            updateCodexExactRow(index, {
+                              providerId: value === NO_PROVIDER_VALUE ? "" : value,
+                              upstreamModel:
+                                value === NO_PROVIDER_VALUE ? "" : row.upstreamModel,
+                            })
+                          }
+                        >
+                          <SelectTrigger
+                            id={`codex-provider-${index}`}
+                            aria-label="精确匹配 Provider"
+                          >
+                            <SelectValue placeholder="精确匹配 Provider" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value={NO_PROVIDER_VALUE}>
+                              精确匹配 Provider
+                            </SelectItem>
+                            {ordinaryProviders.map((ordinaryProvider) => (
+                              <SelectItem
+                                key={ordinaryProvider.id}
+                                value={ordinaryProvider.id}
+                              >
+                                {ordinaryProvider.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor={`codex-upstream-model-${index}`}>
+                          精确匹配 实际请求模型
+                        </Label>
+                        <ModelInputWithFetch
+                          id={`codex-upstream-model-${index}`}
+                          value={row.upstreamModel}
+                          onChange={(value) =>
+                            updateCodexExactRow(index, { upstreamModel: value })
+                          }
+                          placeholder={t("combinedProvider.manualModelPlaceholder", {
+                            defaultValue: "选择或手动输入模型",
+                          })}
+                          fetchedModels={state?.models ?? []}
+                          isLoading={state?.status === "detecting"}
+                          ariaLabel="精确匹配 实际请求模型"
+                          dropdownAriaLabel="精确匹配 实际请求模型 options"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor={`codex-context-window-${index}`}>
+                          上下文窗口
+                        </Label>
+                        <Input
+                          id={`codex-context-window-${index}`}
+                          value={toCodexContextWindowValue(row.contextWindow)}
+                          onChange={(event) =>
+                            updateCodexExactRow(index, {
+                              contextWindow: event.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                    </div>
                   </div>
+                );
+              })}
+            </div>
+          ) : (
+            <>
+              <div
+                className={`hidden grid-cols-1 gap-2 px-1 text-xs font-medium text-muted-foreground md:grid ${mappingGridClassName(appId)}`}
+              >
+                <span>
+                  {t("providerForm.modelRoleLabel", {
+                    defaultValue: "模型角色",
+                  })}
+                </span>
+                <span>Provider</span>
+                <span>
+                  {t("providerForm.requestModelLabel", {
+                    defaultValue: "实际请求模型",
+                  })}
+                </span>
+                {appId === "claude" ? (
+                  <span>
+                    {t("providerForm.modelOneMHeader", {
+                      defaultValue: "声明支持 1M",
+                    })}
+                  </span>
                 ) : null}
               </div>
-            );
-          })}
+
+              {roleLabels.map(({ role, key, defaultLabel }) => {
+                const label = t(key, { defaultValue: defaultLabel });
+                const mapping = mappings[role];
+                const selectedProvider = providers[mapping.providerId];
+                const state = selectedProvider
+                  ? detection[selectedProvider.id]
+                  : undefined;
+                const models = state?.models ?? [];
+                const oneMSupported = supportsClaudeOneM(appId, role);
+                const oneMChecked = hasClaudeOneMMarker(mapping.upstreamModel);
+
+                return (
+                  <div
+                    key={role}
+                    className={`grid grid-cols-1 gap-2 ${mappingGridClassName(appId)}`}
+                  >
+                    <div className="flex h-9 items-center rounded-md border border-input bg-muted px-3 text-sm font-medium text-muted-foreground">
+                      {label}
+                    </div>
+                    <div className="space-y-2 md:space-y-0">
+                      <Label
+                        htmlFor={`combined-${role}-provider`}
+                        className="md:hidden"
+                      >
+                        {label} Provider
+                      </Label>
+                      <Select
+                        value={mapping.providerId || NO_PROVIDER_VALUE}
+                        onValueChange={(value) =>
+                          updateMapping(role, {
+                            providerId: value === NO_PROVIDER_VALUE ? "" : value,
+                            upstreamModel: "",
+                          })
+                        }
+                      >
+                        <SelectTrigger
+                          id={`combined-${role}-provider`}
+                          aria-label={`${label} Provider`}
+                        >
+                          <SelectValue
+                            placeholder={t("combinedProvider.selectProvider", {
+                              defaultValue: "选择 Provider",
+                            })}
+                          />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value={NO_PROVIDER_VALUE}>
+                            {t("combinedProvider.selectProvider", {
+                              defaultValue: "选择 Provider",
+                            })}
+                          </SelectItem>
+                          {ordinaryProviders.map((ordinaryProvider) => (
+                            <SelectItem
+                              key={ordinaryProvider.id}
+                              value={ordinaryProvider.id}
+                            >
+                              {ordinaryProvider.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-2 md:space-y-0">
+                      <Label
+                        htmlFor={`combined-${role}-model`}
+                        className="md:hidden"
+                      >
+                        {label} Model
+                      </Label>
+                      <ModelInputWithFetch
+                        id={`combined-${role}-model`}
+                        value={getVisibleModelValue(appId, mapping.upstreamModel)}
+                        onChange={(value) =>
+                          updateMapping(role, {
+                            upstreamModel: getStoredModelValue(
+                              appId,
+                              role,
+                              mapping.upstreamModel,
+                              value,
+                            ),
+                          })
+                        }
+                        placeholder={t("combinedProvider.manualModelPlaceholder", {
+                          defaultValue: "选择或手动输入模型",
+                        })}
+                        fetchedModels={models}
+                        isLoading={state?.status === "detecting"}
+                        ariaLabel={`${label} Model`}
+                        dropdownAriaLabel={`${label} Model options`}
+                      />
+                      {mapping.providerId &&
+                        (state?.status === "failed" ||
+                          state?.status === "unavailable") && (
+                          <p className="text-xs text-muted-foreground mt-1">
+                            {state.message || "模型列表获取失败"}
+                          </p>
+                        )}
+                    </div>
+                    {appId === "claude" ? (
+                      <div className="flex h-9 items-center gap-2">
+                        {oneMSupported ? (
+                          <>
+                            <Checkbox
+                              id={`combined-${role}-one-m`}
+                              checked={oneMChecked}
+                              onCheckedChange={(checked) =>
+                                updateMapping(role, {
+                                  upstreamModel: setClaudeOneMMarker(
+                                    mapping.upstreamModel,
+                                    checked === true,
+                                  ),
+                                })
+                              }
+                            />
+                            <Label
+                              htmlFor={`combined-${role}-one-m`}
+                              className="cursor-pointer text-sm font-normal"
+                            >
+                              {label}{" "}
+                              {t("providerForm.modelOneMLabel", {
+                                defaultValue: "1M",
+                              })}
+                            </Label>
+                          </>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </>
+          )}
         </section>
 
         <section className="space-y-3">

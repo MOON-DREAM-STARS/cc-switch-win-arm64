@@ -180,6 +180,92 @@ const compositeProviderWithDefaultNetworkRoute: Provider = {
     },
   },
 };
+const codexOrdinaryProvider: Provider = {
+  id: "codex-ordinary",
+  name: "Codex 普通 Provider",
+  settingsConfig: {
+    auth: {
+      OPENAI_API_KEY: "codex-key",
+    },
+    config: `model_provider = "custom"
+[model_providers.custom]
+name = "Custom"
+base_url = "https://codex.example.com/v1"
+wire_api = "chat_completions"
+`,
+    modelCatalog: {
+      models: [
+        {
+          model: "deepseek-v4-flash",
+          displayName: "DeepSeek V4 Flash",
+          contextWindow: 128000,
+        },
+        {
+          model: "kimi-k2",
+          displayName: "Kimi K2",
+          contextWindow: 256000,
+        },
+      ],
+    },
+  },
+  meta: {
+    apiFormat: "openai_chat",
+  },
+};
+
+const codexCombinedProvider: Provider = {
+  ...combinedProvider,
+  settingsConfig: {
+    auth: {},
+    config: "",
+  },
+};
+
+const codexCompositeProviderWithExactRoutes: Provider = {
+  ...codexCombinedProvider,
+  settingsConfig: {
+    auth: {},
+    config: "",
+    modelCatalog: {
+      models: [
+        {
+          model: "deepseek-v4-flash",
+          displayName: "DeepSeek V4 Flash",
+          contextWindow: 128000,
+        },
+      ],
+    },
+  },
+  meta: {
+    providerType: "model_router",
+    managedModelRouterProvider: true,
+    modelRouter: {
+      version: 1,
+      routes: [
+        {
+          id: "combined-default",
+          enabled: true,
+          matchType: "default",
+          target: {
+            providerId: "codex-ordinary",
+            upstreamModel: "deepseek-v4-flash-upstream",
+          },
+        },
+        {
+          id: "combined-exact-deepseek-v4-flash",
+          enabled: true,
+          matchType: "exact",
+          matchValue: "deepseek-v4-flash",
+          target: {
+            providerId: "codex-ordinary",
+            upstreamModel: "deepseek-v4-flash-upstream",
+          },
+        },
+      ],
+    },
+  },
+};
+
 type Deferred<T> = {
   promise: Promise<T>;
   resolve: (value: T) => void;
@@ -1084,27 +1170,154 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     );
   });
 
-  it("does not submit when a model is entered without selecting a provider", async () => {
+  it("loads Codex default and exact routes into Codex-specific UI", async () => {
+    render(
+      <CompositeProviderEditor
+        open
+        appId="codex"
+        provider={codexCompositeProviderWithExactRoutes}
+        providers={{
+          [codexCompositeProviderWithExactRoutes.id]:
+            codexCompositeProviderWithExactRoutes,
+          [codexOrdinaryProvider.id]: codexOrdinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByDisplayValue("deepseek-v4-flash")).toBeInTheDocument();
+    });
+    expect(
+      screen.getByRole("combobox", { name: "默认兜底 Provider" }),
+    ).toHaveTextContent("Codex 普通 Provider");
+    expect(
+      screen.getByLabelText("默认兜底 实际请求模型"),
+    ).toHaveValue("deepseek-v4-flash-upstream");
+    expect(screen.getByLabelText("请求模型")).toHaveValue("deepseek-v4-flash");
+    expect(screen.getByLabelText("菜单显示名")).toHaveValue(
+      "DeepSeek V4 Flash",
+    );
+    expect(screen.getByLabelText("上下文窗口")).toHaveValue("128000");
+  });
+
+  it("saves Codex default and exact mappings with modelCatalog", async () => {
     const user = userEvent.setup();
     const handleSubmit = vi.fn().mockResolvedValue(undefined);
 
     render(
       <CompositeProviderEditor
         open
-        appId="claude"
-        provider={combinedProvider}
+        appId="codex"
+        provider={codexCombinedProvider}
         providers={{
-          [combinedProvider.id]: combinedProvider,
-          [ordinaryProvider.id]: ordinaryProvider,
+          [codexCombinedProvider.id]: codexCombinedProvider,
+          [codexOrdinaryProvider.id]: codexOrdinaryProvider,
         }}
         onOpenChange={vi.fn()}
         onSubmit={handleSubmit}
       />,
     );
 
-    await user.type(screen.getByLabelText("默认模型 Model"), "stored-default");
+    await selectProvider(user, "默认兜底 Provider", "Codex 普通 Provider");
+    await user.type(
+      screen.getByLabelText("默认兜底 实际请求模型"),
+      "deepseek-v4-flash-upstream",
+    );
+    await user.click(screen.getByRole("button", { name: "添加模型" }));
+    await user.type(screen.getByLabelText("请求模型"), "deepseek-v4-flash");
+    await user.type(
+      screen.getByLabelText("菜单显示名"),
+      "DeepSeek V4 Flash",
+    );
+    await selectProvider(user, "精确匹配 Provider", "Codex 普通 Provider");
+    await user.type(
+      screen.getByLabelText("精确匹配 实际请求模型"),
+      "deepseek-v4-flash-upstream",
+    );
+    await user.type(screen.getByLabelText("上下文窗口"), "128000");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes).toEqual([
+      {
+        id: "combined-default",
+        enabled: true,
+        matchType: "default",
+        target: {
+          providerId: "codex-ordinary",
+          upstreamModel: "deepseek-v4-flash-upstream",
+        },
+      },
+      {
+        id: "combined-exact-deepseek-v4-flash",
+        enabled: true,
+        matchType: "exact",
+        matchValue: "deepseek-v4-flash",
+        target: {
+          providerId: "codex-ordinary",
+          upstreamModel: "deepseek-v4-flash-upstream",
+        },
+      },
+    ]);
+    expect(handleSubmit.mock.calls[0][0].provider.settingsConfig).toEqual(
+      expect.objectContaining({
+        modelCatalog: {
+          models: [
+            {
+              model: "deepseek-v4-flash",
+              displayName: "DeepSeek V4 Flash",
+              contextWindow: 128000,
+            },
+          ],
+        },
+      }),
+    );
+  });
+
+  it("blocks duplicate Codex exact request models", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="codex"
+        provider={codexCombinedProvider}
+        providers={{
+          [codexCombinedProvider.id]: codexCombinedProvider,
+          [codexOrdinaryProvider.id]: codexOrdinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "添加模型" }));
+    await user.click(screen.getByRole("button", { name: "添加模型" }));
+    const requestModelInputs = screen.getAllByLabelText("请求模型");
+    await user.type(requestModelInputs[0], "deepseek-v4-flash");
+    await user.type(requestModelInputs[1], "deepseek-v4-flash");
+    const providerComboboxes = screen.getAllByRole("combobox", {
+      name: "精确匹配 Provider",
+    });
+    await user.click(providerComboboxes[0]);
+    let listbox = await screen.findByRole("listbox");
+    await user.click(
+      within(listbox).getByRole("option", { name: "Codex 普通 Provider" }),
+    );
+    await user.click(providerComboboxes[1]);
+    listbox = await screen.findByRole("listbox");
+    await user.click(
+      within(listbox).getByRole("option", { name: "Codex 普通 Provider" }),
+    );
+    const upstreamInputs = screen.getAllByLabelText("精确匹配 实际请求模型");
+    await user.type(upstreamInputs[0], "deepseek-upstream-a");
+    await user.type(upstreamInputs[1], "deepseek-upstream-b");
     await user.click(screen.getByRole("button", { name: "保存" }));
 
     expect(handleSubmit).not.toHaveBeenCalled();
   });
 });
+
