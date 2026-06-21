@@ -1,4 +1,5 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { parse as parseToml } from "smol-toml";
 import {
   ArrowLeft,
   Download,
@@ -32,12 +33,14 @@ import { FullScreenPanel } from "@/components/common/FullScreenPanel";
 import JsonEditor from "@/components/JsonEditor";
 import { IconPicker } from "@/components/IconPicker";
 import { ProviderIcon } from "@/components/ProviderIcon";
+import { CodexCommonConfigModal } from "@/components/providers/forms/CodexCommonConfigModal";
 import { ModelInputWithFetch } from "@/components/providers/forms/shared";
 import {
   hasClaudeOneMMarker,
   setClaudeOneMMarker,
   stripClaudeOneMMarker,
 } from "@/components/providers/forms/hooks/useModelState";
+import { useCodexCommonConfig } from "@/components/providers/forms/hooks/useCodexCommonConfig";
 import { useCommonConfigSnippet } from "@/components/providers/forms/hooks/useCommonConfigSnippet";
 import { getIconMetadata } from "@/icons/extracted/metadata";
 import type {
@@ -61,6 +64,7 @@ import {
   type CompositeRole,
   type ModelFetchDescriptor,
 } from "@/utils/providerModelDetection";
+import { updateCommonConfigSnippet, updateTomlCommonConfigSnippet } from "@/utils/providerConfigUtils";
 
 interface CompositeProviderEditorProps {
   open: boolean;
@@ -228,8 +232,16 @@ const getStoredModelValue = (
 const isPlainObject = (value: unknown): value is Record<string, any> =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value);
 
-const formatCompositeCommonConfig = (value: unknown): string =>
-  JSON.stringify(sanitizeCompositeCommonConfig(value), null, 2);
+const formatCompositeCommonConfig = (
+  appId: AppId,
+  value: unknown,
+): string => {
+  if (appId === "codex") {
+    const config = isPlainObject(value) ? value : {};
+    return typeof config.config === "string" ? config.config : "";
+  }
+  return JSON.stringify(sanitizeCompositeCommonConfig(value), null, 2);
+};
 
 const getNormalizedConfigKey = (key: string): string =>
   key.replace(/[^a-z0-9]/gi, "").toLowerCase();
@@ -333,6 +345,53 @@ const validateCompositeCommonConfigText = (
   return { config: parsed, forbiddenPaths };
 };
 
+const validateCodexCompositeCommonConfigText = (
+  text: string,
+): { config: string } => {
+  const trimmed = text.trim();
+  if (!trimmed) return { config: "" };
+  parseToml(text);
+  return { config: text };
+};
+
+const codexCompositeSettingsFromConfig = (
+  baseSettingsConfig: Record<string, any> | undefined,
+  configText: string,
+): Record<string, any> => {
+  const nextSettingsConfig = isPlainObject(baseSettingsConfig)
+    ? { ...baseSettingsConfig }
+    : {};
+  nextSettingsConfig.auth = isPlainObject(nextSettingsConfig.auth)
+    ? nextSettingsConfig.auth
+    : {};
+  nextSettingsConfig.config = configText;
+  return nextSettingsConfig;
+};
+
+const mergeClaudeCommonConfigPreview = (
+  baseText: string,
+  snippetText: string,
+): string => {
+  const { updatedConfig, error } = updateCommonConfigSnippet(
+    baseText,
+    snippetText,
+    true,
+  );
+  return error ? baseText : updatedConfig;
+};
+
+const mergeCodexCommonConfigPreview = (
+  baseText: string,
+  snippetText: string,
+): string => {
+  const { updatedConfig, error } = updateTomlCommonConfigSnippet(
+    baseText,
+    snippetText,
+    true,
+  );
+  return error ? baseText : updatedConfig;
+};
+
 const routeToMappings = (
   routes: ProviderModelRouterRule[],
 ): CompositeMappings => {
@@ -413,7 +472,7 @@ export function CompositeProviderEditor({
         !settingsConfigDirty &&
         !isDirty &&
         settingsConfigText ===
-          formatCompositeCommonConfig(provider.settingsConfig);
+          formatCompositeCommonConfig(appId, provider.settingsConfig);
 
       setSettingsConfigText(value);
       if (!shouldKeepClean) {
@@ -423,6 +482,7 @@ export function CompositeProviderEditor({
       if (settingsConfigError) setSettingsConfigError("");
     },
     [
+      appId,
       open,
       provider,
       settingsConfigDirty,
@@ -432,23 +492,77 @@ export function CompositeProviderEditor({
     ],
   );
 
-  const {
-    useCommonConfig,
-    commonConfigSnippet,
-    commonConfigError: commonSnippetError,
-    handleCommonConfigToggle,
-    handleCommonConfigSnippetChange,
-    handleExtract: handleCommonExtract,
-    isExtracting: isCommonExtracting,
-  } = useCommonConfigSnippet({
+  const claudeCommonConfig = useCommonConfigSnippet({
     settingsConfig: settingsConfigText,
     onConfigChange: handleCommonConfigChange,
-    initialData: provider
-      ? { settingsConfig: provider.settingsConfig }
-      : undefined,
-    initialEnabled: provider?.meta?.commonConfigEnabled,
-    enabled: open,
+    initialData:
+      appId === "claude" && provider
+        ? { settingsConfig: provider.settingsConfig }
+        : undefined,
+    initialEnabled:
+      appId === "claude" ? provider?.meta?.commonConfigEnabled : undefined,
+    enabled: appId === "claude" && open,
   });
+
+  const codexCommonConfig = useCodexCommonConfig({
+    codexConfig: settingsConfigText,
+    onConfigChange: handleCommonConfigChange,
+    initialData:
+      appId === "codex" && provider
+        ? { settingsConfig: provider.settingsConfig }
+        : undefined,
+    initialEnabled:
+      appId === "codex" ? provider?.meta?.commonConfigEnabled : undefined,
+    selectedPresetId: provider?.id,
+    enabled: appId === "codex" && open,
+  });
+
+  const activeCommonConfig =
+    appId === "codex"
+      ? {
+          useCommonConfig: codexCommonConfig.useCommonConfig,
+          commonConfigSnippet: codexCommonConfig.commonConfigSnippet,
+          commonConfigError: codexCommonConfig.commonConfigError,
+          handleCommonConfigToggle: codexCommonConfig.handleCommonConfigToggle,
+          handleCommonConfigSnippetChange:
+            codexCommonConfig.handleCommonConfigSnippetChange,
+          handleExtract: codexCommonConfig.handleExtract,
+          isExtracting: codexCommonConfig.isExtracting,
+          isLoading: codexCommonConfig.isLoading,
+          clearError: codexCommonConfig.clearCommonConfigError,
+        }
+      : {
+          useCommonConfig: claudeCommonConfig.useCommonConfig,
+          commonConfigSnippet: claudeCommonConfig.commonConfigSnippet,
+          commonConfigError: claudeCommonConfig.commonConfigError,
+          handleCommonConfigToggle: claudeCommonConfig.handleCommonConfigToggle,
+          handleCommonConfigSnippetChange:
+            claudeCommonConfig.handleCommonConfigSnippetChange,
+          handleExtract: claudeCommonConfig.handleExtract,
+          isExtracting: claudeCommonConfig.isExtracting,
+          isLoading: claudeCommonConfig.isLoading,
+          clearError: () => {},
+        };
+
+  const initialClaudeCompositeConfigText =
+    appId === "claude" && provider
+      ? formatCompositeCommonConfig(appId, provider.settingsConfig)
+      : "{}";
+
+  const initialCodexCompositeConfigText =
+    appId === "codex" && provider
+      ? formatCompositeCommonConfig(appId, provider.settingsConfig)
+      : "";
+
+  const showClaudeCommonConfigPreviewLoading =
+    appId === "claude" &&
+    open &&
+    provider?.meta?.commonConfigEnabled === true &&
+    !settingsConfigDirty &&
+    !isDirty &&
+    settingsConfigText === initialClaudeCompositeConfigText &&
+    (activeCommonConfig.isLoading ||
+      activeCommonConfig.commonConfigSnippet.trim().length > 0);
 
   const detectionRunRef = useRef(0);
 
@@ -504,11 +618,79 @@ export function CompositeProviderEditor({
       ...defaultModelRouterTestConfig(),
       ...(provider.meta?.modelRouterTestConfig ?? {}),
     });
-    setSettingsConfigText(formatCompositeCommonConfig(provider.settingsConfig));
+    setSettingsConfigText(formatCompositeCommonConfig(appId, provider.settingsConfig));
     setSettingsConfigError("");
     setSettingsConfigDirty(false);
     setIsDirty(false);
-  }, [open, provider]);
+  }, [open, provider, appId]);
+
+  useEffect(() => {
+    if (
+      !open ||
+      !provider ||
+      appId !== "claude" ||
+      provider.meta?.commonConfigEnabled !== true ||
+      claudeCommonConfig.isLoading ||
+      settingsConfigDirty ||
+      isDirty ||
+      settingsConfigText !== initialClaudeCompositeConfigText ||
+      !claudeCommonConfig.commonConfigSnippet.trim()
+    ) {
+      return;
+    }
+
+    const hydratedSettingsConfigText = mergeClaudeCommonConfigPreview(
+      initialClaudeCompositeConfigText,
+      claudeCommonConfig.commonConfigSnippet,
+    );
+    if (hydratedSettingsConfigText !== settingsConfigText) {
+      setSettingsConfigText(hydratedSettingsConfigText);
+    }
+  }, [
+    open,
+    provider,
+    appId,
+    claudeCommonConfig.isLoading,
+    claudeCommonConfig.commonConfigSnippet,
+    settingsConfigDirty,
+    isDirty,
+    settingsConfigText,
+    initialClaudeCompositeConfigText,
+  ]);
+
+  useEffect(() => {
+    if (
+      !open ||
+      !provider ||
+      appId !== "codex" ||
+      provider.meta?.commonConfigEnabled !== true ||
+      codexCommonConfig.isLoading ||
+      settingsConfigDirty ||
+      isDirty ||
+      settingsConfigText !== initialCodexCompositeConfigText ||
+      !codexCommonConfig.commonConfigSnippet.trim()
+    ) {
+      return;
+    }
+
+    const hydratedSettingsConfigText = mergeCodexCommonConfigPreview(
+      initialCodexCompositeConfigText,
+      codexCommonConfig.commonConfigSnippet,
+    );
+    if (hydratedSettingsConfigText !== settingsConfigText) {
+      setSettingsConfigText(hydratedSettingsConfigText);
+    }
+  }, [
+    open,
+    provider,
+    appId,
+    codexCommonConfig.isLoading,
+    codexCommonConfig.commonConfigSnippet,
+    settingsConfigDirty,
+    isDirty,
+    settingsConfigText,
+    initialCodexCompositeConfigText,
+  ]);
 
   const refreshModelDetection = useCallback(
     async (providerIds?: string[]): Promise<DetectionRefreshSummary> => {
@@ -953,28 +1135,23 @@ export function CompositeProviderEditor({
         return;
       }
 
-      let commonSettingsConfig = provider.settingsConfig ?? {};
+      let commonSettingsConfig = codexCompositeSettingsFromConfig(
+        provider.settingsConfig,
+        settingsConfigText,
+      );
       if (settingsConfigDirty) {
         try {
-          const result = validateCompositeCommonConfigText(settingsConfigText);
-          if (result.forbiddenPaths.length > 0) {
-            const message = t("combinedProvider.configJson.forbiddenKeys", {
-              keys: result.forbiddenPaths.join(", "),
-              defaultValue: `配置 JSON 不能包含模型、URL、认证或路由字段：${result.forbiddenPaths.join(", ")}`,
-            });
-            setSettingsConfigError(message);
-            toast.error(message);
-            return;
-          }
-          commonSettingsConfig = result.config;
+          const result = validateCodexCompositeCommonConfigText(settingsConfigText);
+          commonSettingsConfig = codexCompositeSettingsFromConfig(
+            provider.settingsConfig,
+            result.config,
+          );
         } catch (error) {
           const message =
-            error instanceof Error && error.message === "root-must-be-object"
-              ? t("jsonEditor.mustBeObject", {
-                  defaultValue: "JSON 必须是对象",
-                })
-              : t("combinedProvider.configJson.invalidJson", {
-                  defaultValue: "配置 JSON 格式无效",
+            error instanceof Error && error.message
+              ? error.message
+              : t("codexConfig.invalidToml", {
+                  defaultValue: "TOML 格式无效",
                 });
           setSettingsConfigError(message);
           toast.error(message);
@@ -1004,7 +1181,7 @@ export function CompositeProviderEditor({
         icon: trimmedIcon || undefined,
         iconColor: trimmedIconColor || undefined,
         settingsConfig: {
-          ...(commonSettingsConfig as Record<string, any>),
+          ...commonSettingsConfig,
           modelCatalog: {
             models: buildCodexCompositeModelCatalog(codexMappings.exactRows),
           },
@@ -1014,7 +1191,7 @@ export function CompositeProviderEditor({
           providerType: "model_router",
           managedModelRouterProvider:
             provider.meta?.managedModelRouterProvider ?? true,
-          commonConfigEnabled: useCommonConfig,
+          commonConfigEnabled: activeCommonConfig.useCommonConfig,
           modelRouter: { version: 1, routes },
           modelRouterTestConfig: modelRouterTestConfig.enabled
             ? modelRouterTestConfig
@@ -1138,7 +1315,7 @@ export function CompositeProviderEditor({
         providerType: "model_router",
         managedModelRouterProvider:
           provider.meta?.managedModelRouterProvider ?? true,
-        commonConfigEnabled: useCommonConfig,
+        commonConfigEnabled: activeCommonConfig.useCommonConfig,
         modelRouter: { version: 1, routes },
         modelRouterTestConfig: modelRouterTestConfig.enabled
           ? modelRouterTestConfig
@@ -1810,22 +1987,30 @@ export function CompositeProviderEditor({
                 htmlFor="composite-settings-config"
                 className="text-sm font-medium"
               >
-                {t("combinedProvider.configJson.title", {
-                  defaultValue: "配置 JSON",
-                })}
+                {appId === "codex"
+                  ? t("codexConfig.configToml")
+                  : t("combinedProvider.configJson.title", {
+                      defaultValue: "配置 JSON",
+                    })}
               </Label>
               <div className="flex items-center gap-2">
                 <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
                   <input
                     type="checkbox"
-                    checked={useCommonConfig}
-                    onChange={(e) => handleCommonConfigToggle(e.target.checked)}
+                    checked={activeCommonConfig.useCommonConfig}
+                    onChange={(e) =>
+                      activeCommonConfig.handleCommonConfigToggle(
+                        e.target.checked,
+                      )
+                    }
                     className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
                   />
                   <span>
-                    {t("claudeConfig.writeCommonConfig", {
-                      defaultValue: "写入通用配置",
-                    })}
+                    {appId === "codex"
+                      ? t("codexConfig.writeCommonConfig")
+                      : t("claudeConfig.writeCommonConfig", {
+                          defaultValue: "写入通用配置",
+                        })}
                   </span>
                 </label>
               </div>
@@ -1836,94 +2021,108 @@ export function CompositeProviderEditor({
                 onClick={() => setIsCommonConfigModalOpen(true)}
                 className="text-xs text-blue-400 dark:text-blue-500 hover:text-blue-500 dark:hover:text-blue-400 transition-colors"
               >
-                {t("claudeConfig.editCommonConfig", {
-                  defaultValue: "编辑通用配置",
-                })}
+                {appId === "codex"
+                  ? t("codexConfig.editCommonConfig")
+                  : t("claudeConfig.editCommonConfig", {
+                      defaultValue: "编辑通用配置",
+                    })}
               </button>
             </div>
             <p className="text-xs text-muted-foreground">
-              {t("combinedProvider.configJson.hint", {
-                defaultValue:
-                  "这里只编辑组合 Provider 的通用配置；模型、Provider、URL 和 API Key 请在模型映射或普通 Provider 中配置。",
-              })}
+              {appId === "codex"
+                ? t("codexConfig.commonConfigHint")
+                : t("combinedProvider.configJson.hint", {
+                    defaultValue:
+                      "这里只编辑组合 Provider 的通用配置；模型、Provider、URL 和 API Key 请在模型映射或普通 Provider 中配置。",
+                  })}
             </p>
           </div>
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-            <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
-              <input
-                type="checkbox"
-                checked={compositeConfigToggles.hideAttribution}
-                onChange={(e) =>
-                  handleCompositeConfigToggle(
-                    "hideAttribution",
-                    e.target.checked,
-                  )
-                }
-                className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
-              />
-              <span>{t("claudeConfig.hideAttribution")}</span>
-            </label>
-            <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
-              <input
-                type="checkbox"
-                checked={compositeConfigToggles.teammates}
-                onChange={(e) =>
-                  handleCompositeConfigToggle("teammates", e.target.checked)
-                }
-                className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
-              />
-              <span>{t("claudeConfig.enableTeammates")}</span>
-            </label>
-            <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
-              <input
-                type="checkbox"
-                checked={compositeConfigToggles.enableToolSearch}
-                onChange={(e) =>
-                  handleCompositeConfigToggle(
-                    "enableToolSearch",
-                    e.target.checked,
-                  )
-                }
-                className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
-              />
-              <span>{t("claudeConfig.enableToolSearch")}</span>
-            </label>
-            <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
-              <input
-                type="checkbox"
-                checked={compositeConfigToggles.effortMax}
-                onChange={(e) =>
-                  handleCompositeConfigToggle("effortMax", e.target.checked)
-                }
-                className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
-              />
-              <span>{t("claudeConfig.effortMax")}</span>
-            </label>
-            <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
-              <input
-                type="checkbox"
-                checked={compositeConfigToggles.disableAutoUpgrade}
-                onChange={(e) =>
-                  handleCompositeConfigToggle(
-                    "disableAutoUpgrade",
-                    e.target.checked,
-                  )
-                }
-                className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
-              />
-              <span>{t("claudeConfig.disableAutoUpgrade")}</span>
-            </label>
-          </div>
-          {settingsConfigError || commonSnippetError ? (
+          {appId === "claude" ? (
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+              <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={compositeConfigToggles.hideAttribution}
+                  onChange={(e) =>
+                    handleCompositeConfigToggle(
+                      "hideAttribution",
+                      e.target.checked,
+                    )
+                  }
+                  className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
+                />
+                <span>{t("claudeConfig.hideAttribution")}</span>
+              </label>
+              <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={compositeConfigToggles.teammates}
+                  onChange={(e) =>
+                    handleCompositeConfigToggle("teammates", e.target.checked)
+                  }
+                  className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
+                />
+                <span>{t("claudeConfig.enableTeammates")}</span>
+              </label>
+              <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={compositeConfigToggles.enableToolSearch}
+                  onChange={(e) =>
+                    handleCompositeConfigToggle(
+                      "enableToolSearch",
+                      e.target.checked,
+                    )
+                  }
+                  className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
+                />
+                <span>{t("claudeConfig.enableToolSearch")}</span>
+              </label>
+              <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={compositeConfigToggles.effortMax}
+                  onChange={(e) =>
+                    handleCompositeConfigToggle("effortMax", e.target.checked)
+                  }
+                  className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
+                />
+                <span>{t("claudeConfig.effortMax")}</span>
+              </label>
+              <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={compositeConfigToggles.disableAutoUpgrade}
+                  onChange={(e) =>
+                    handleCompositeConfigToggle(
+                      "disableAutoUpgrade",
+                      e.target.checked,
+                    )
+                  }
+                  className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
+                />
+                <span>{t("claudeConfig.disableAutoUpgrade")}</span>
+              </label>
+            </div>
+          ) : null}
+          {settingsConfigError || activeCommonConfig.commonConfigError ? (
             <p className="text-xs text-red-500 dark:text-red-400">
-              {settingsConfigError || commonSnippetError}
+              {settingsConfigError || activeCommonConfig.commonConfigError}
             </p>
           ) : null}
-          <JsonEditor
-            id="composite-settings-config"
-            value={settingsConfigText}
-            onChange={handleSettingsConfigChange}
-            placeholder={`{
+          {showClaudeCommonConfigPreviewLoading ? (
+            <div className="rounded-lg border border-border/50 bg-muted/30 px-4 py-6 text-sm text-muted-foreground">
+              正在加载通用配置预览…
+            </div>
+          ) : (
+            <JsonEditor
+              id="composite-settings-config"
+              value={settingsConfigText}
+              onChange={handleSettingsConfigChange}
+              placeholder={
+                appId === "codex"
+                  ? `# Common Codex config\n\n# Add your common TOML configuration here`
+                  : `{
   "env": {
     "ENABLE_TOOL_SEARCH": "true",
     "DISABLE_AUTOUPDATER": "1"
@@ -1932,99 +2131,116 @@ export function CompositeProviderEditor({
     "commit": "",
     "pr": ""
   }
-}`}
-            darkMode={isDarkMode}
-            rows={10}
-            showValidation={true}
-            language="json"
-          />
-          <FullScreenPanel
-            isOpen={isCommonConfigModalOpen}
-            title={t("claudeConfig.editCommonConfigTitle", {
-              defaultValue: "编辑通用配置片段",
-            })}
-            onClose={() => setIsCommonConfigModalOpen(false)}
-            footer={
-              <>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={handleCommonExtract}
-                  disabled={isCommonExtracting}
-                  className="gap-2"
-                >
-                  {isCommonExtracting ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Download className="w-4 h-4" />
-                  )}
-                  {t("claudeConfig.extractFromCurrent", {
-                    defaultValue: "从编辑内容提取",
-                  })}
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => setIsCommonConfigModalOpen(false)}
-                >
-                  {t("common.cancel")}
-                </Button>
-                <Button
-                  type="button"
-                  onClick={() => setIsCommonConfigModalOpen(false)}
-                  className="gap-2"
-                >
-                  <Save className="w-4 h-4" />
-                  {t("common.save")}
-                </Button>
-              </>
-            }
-          >
-            <div className="space-y-4">
-              <div className="rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-950/30 p-3 space-y-1.5">
-                <p className="text-sm font-medium text-blue-800 dark:text-blue-300">
-                  {t("commonConfig.guideTitle")}
-                </p>
-                <p className="text-xs text-blue-700/80 dark:text-blue-400/80">
-                  {t("commonConfig.guidePurpose")}
-                </p>
-                <p className="text-xs text-blue-700/80 dark:text-blue-400/80">
-                  {t("commonConfig.guideUsage")}
-                </p>
-                <p className="text-xs text-blue-700/80 dark:text-blue-400/80">
-                  {t("commonConfig.guideReExtract")}
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  {t("commonConfig.guideReassurance")}
-                </p>
-              </div>
-              {(!commonConfigSnippet ||
-                commonConfigSnippet.trim() === "" ||
-                commonConfigSnippet.trim() === "{}") && (
-                <div className="flex flex-col items-center justify-center py-6 text-center text-muted-foreground">
-                  <Package className="h-8 w-8 mb-2 opacity-40" />
-                  <p className="text-sm font-medium">
-                    {t("commonConfig.emptyTitle")}
+}`
+              }
+              darkMode={isDarkMode}
+              rows={10}
+              showValidation={appId !== "codex"}
+              language={appId === "codex" ? "javascript" : "json"}
+            />
+          )}
+          {appId === "codex" ? (
+            <CodexCommonConfigModal
+              isOpen={isCommonConfigModalOpen}
+              onClose={() => {
+                activeCommonConfig.clearError();
+                setIsCommonConfigModalOpen(false);
+              }}
+              value={activeCommonConfig.commonConfigSnippet}
+              onSave={activeCommonConfig.handleCommonConfigSnippetChange}
+              error={activeCommonConfig.commonConfigError}
+              onExtract={activeCommonConfig.handleExtract}
+              isExtracting={activeCommonConfig.isExtracting}
+            />
+          ) : (
+            <FullScreenPanel
+              isOpen={isCommonConfigModalOpen}
+              title={t("claudeConfig.editCommonConfigTitle", {
+                defaultValue: "编辑通用配置片段",
+              })}
+              onClose={() => setIsCommonConfigModalOpen(false)}
+              footer={
+                <>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={activeCommonConfig.handleExtract}
+                    disabled={activeCommonConfig.isExtracting}
+                    className="gap-2"
+                  >
+                    {activeCommonConfig.isExtracting ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Download className="w-4 h-4" />
+                    )}
+                    {t("claudeConfig.extractFromCurrent", {
+                      defaultValue: "从编辑内容提取",
+                    })}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => setIsCommonConfigModalOpen(false)}
+                  >
+                    {t("common.cancel")}
+                  </Button>
+                  <Button
+                    type="button"
+                    onClick={() => setIsCommonConfigModalOpen(false)}
+                    className="gap-2"
+                  >
+                    <Save className="w-4 h-4" />
+                    {t("common.save")}
+                  </Button>
+                </>
+              }
+            >
+              <div className="space-y-4">
+                <div className="rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-950/30 p-3 space-y-1.5">
+                  <p className="text-sm font-medium text-blue-800 dark:text-blue-300">
+                    {t("commonConfig.guideTitle")}
                   </p>
-                  <p className="text-xs mt-1">{t("commonConfig.emptyHint")}</p>
+                  <p className="text-xs text-blue-700/80 dark:text-blue-400/80">
+                    {t("commonConfig.guidePurpose")}
+                  </p>
+                  <p className="text-xs text-blue-700/80 dark:text-blue-400/80">
+                    {t("commonConfig.guideUsage")}
+                  </p>
+                  <p className="text-xs text-blue-700/80 dark:text-blue-400/80">
+                    {t("commonConfig.guideReExtract")}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    {t("commonConfig.guideReassurance")}
+                  </p>
                 </div>
-              )}
-              <JsonEditor
-                value={commonConfigSnippet}
-                onChange={handleCommonConfigSnippetChange}
-                placeholder={`{\n  "env": {\n    "ANTHROPIC_BASE_URL": "https://your-api-endpoint.com"\n  }\n}`}
-                darkMode={isDarkMode}
-                rows={16}
-                showValidation={true}
-                language="json"
-              />
-              {commonSnippetError && (
-                <p className="text-sm text-red-500 dark:text-red-400">
-                  {commonSnippetError}
-                </p>
-              )}
-            </div>
-          </FullScreenPanel>
+                {(!activeCommonConfig.commonConfigSnippet ||
+                  activeCommonConfig.commonConfigSnippet.trim() === "" ||
+                  activeCommonConfig.commonConfigSnippet.trim() === "{}") && (
+                  <div className="flex flex-col items-center justify-center py-6 text-center text-muted-foreground">
+                    <Package className="h-8 w-8 mb-2 opacity-40" />
+                    <p className="text-sm font-medium">
+                      {t("commonConfig.emptyTitle")}
+                    </p>
+                    <p className="text-xs mt-1">{t("commonConfig.emptyHint")}</p>
+                  </div>
+                )}
+                <JsonEditor
+                  value={activeCommonConfig.commonConfigSnippet}
+                  onChange={activeCommonConfig.handleCommonConfigSnippetChange}
+                  placeholder={`{\n  "env": {\n    "ANTHROPIC_BASE_URL": "https://your-api-endpoint.com"\n  }\n}`}
+                  darkMode={isDarkMode}
+                  rows={16}
+                  showValidation={true}
+                  language="json"
+                />
+                {activeCommonConfig.commonConfigError && (
+                  <p className="text-sm text-red-500 dark:text-red-400">
+                    {activeCommonConfig.commonConfigError}
+                  </p>
+                )}
+              </div>
+            </FullScreenPanel>
+          )}
         </section>
 
         <section className="space-y-3">

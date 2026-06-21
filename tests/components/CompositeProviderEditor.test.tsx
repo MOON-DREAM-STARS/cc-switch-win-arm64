@@ -137,6 +137,12 @@ const COMMON_CONFIG_SNIPPET = JSON.stringify(
   2,
 );
 
+const CODEX_COMMON_CONFIG_SNIPPET = `# Common Codex config
+model_reasoning_effort = "high"
+[projects."/tmp/demo"]
+trust_level = "trusted"
+`;
+
 const compositeProviderWithDefaultOrdinaryRoute: Provider = {
   ...combinedProvider,
   meta: {
@@ -298,14 +304,30 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
   beforeEach(() => {
     fetchMocks.fetchModelsForConfig.mockReset();
     server.use(
-      http.post("http://tauri.local/get_common_config_snippet", () =>
-        HttpResponse.json(COMMON_CONFIG_SNIPPET),
+      http.post(
+        "http://tauri.local/get_common_config_snippet",
+        async ({ request }) => {
+          const body = (await request.json()) as { appType?: string };
+          return HttpResponse.json(
+            body.appType === "codex"
+              ? CODEX_COMMON_CONFIG_SNIPPET
+              : COMMON_CONFIG_SNIPPET,
+          );
+        },
       ),
       http.post("http://tauri.local/set_common_config_snippet", () =>
         HttpResponse.json(true),
       ),
-      http.post("http://tauri.local/extract_common_config_snippet", () =>
-        HttpResponse.json(COMMON_CONFIG_SNIPPET),
+      http.post(
+        "http://tauri.local/extract_common_config_snippet",
+        async ({ request }) => {
+          const body = (await request.json()) as { appType?: string };
+          return HttpResponse.json(
+            body.appType === "codex"
+              ? CODEX_COMMON_CONFIG_SNIPPET
+              : COMMON_CONFIG_SNIPPET,
+          );
+        },
       ),
     );
   });
@@ -1001,6 +1023,65 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     ]);
   });
 
+  it("waits for Claude common config hydration before showing composite JSON preview", async () => {
+    const delayedSnippet = createDeferred<string>();
+    server.use(
+      http.post(
+        "http://tauri.local/get_common_config_snippet",
+        async ({ request }) => {
+          const body = (await request.json()) as { appType?: string };
+          return HttpResponse.json(
+            body.appType === "claude"
+              ? await delayedSnippet.promise
+              : CODEX_COMMON_CONFIG_SNIPPET,
+          );
+        },
+      ),
+    );
+
+    const providerWithStoredDiff: Provider = {
+      ...combinedProvider,
+      settingsConfig: {
+        env: { CLAUDE_CODE_EFFORT_LEVEL: "max" },
+      },
+      meta: {
+        ...combinedProvider.meta,
+        commonConfigEnabled: true,
+      },
+    };
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={providerWithStoredDiff}
+        providers={{ [providerWithStoredDiff.id]: providerWithStoredDiff }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.queryByLabelText("composite-settings-config"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("正在加载通用配置预览…")).toBeInTheDocument();
+
+    await act(async () => {
+      delayedSnippet.resolve(COMMON_CONFIG_SNIPPET);
+    });
+
+    await waitFor(() => {
+      const editor = screen.getByLabelText(
+        "composite-settings-config",
+      ) as HTMLTextAreaElement;
+      expect(editor.value).toContain('"CLAUDE_CODE_EFFORT_LEVEL": "max"');
+      expect(editor.value).toContain('"ENABLE_TOOL_SEARCH": "true"');
+      expect(editor.value).toContain('"defaultShell": "powershell"');
+      expect(editor.value).toContain('"includeCoAuthoredBy": false');
+    });
+    expect(screen.queryByText("正在加载通用配置预览…")).not.toBeInTheDocument();
+  });
+
   it("rehydrates merged common config on reopen when stored diff is flagged", async () => {
     const providerWithStoredDiff: Provider = {
       ...combinedProvider,
@@ -1035,8 +1116,175 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     });
   });
 
-  it("saves edited composite config JSON as settingsConfig", async () => {
+  it("keeps Claude common config hydrated and checked after closing and reopening", async () => {
+    const providerWithStoredDiff: Provider = {
+      ...combinedProvider,
+      settingsConfig: {
+        env: { CLAUDE_CODE_EFFORT_LEVEL: "max" },
+      },
+      meta: {
+        ...combinedProvider.meta,
+        commonConfigEnabled: true,
+      },
+    };
+
+    const { rerender } = render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={providerWithStoredDiff}
+        providers={{ [providerWithStoredDiff.id]: providerWithStoredDiff }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const editor = screen.getByLabelText(
+        "composite-settings-config",
+      ) as HTMLTextAreaElement;
+      expect(editor.value).toContain('"CLAUDE_CODE_EFFORT_LEVEL": "max"');
+      expect(editor.value).toContain('"ENABLE_TOOL_SEARCH": "true"');
+    });
+    expect(screen.getByRole("checkbox", { name: "写入通用配置" })).toBeChecked();
+
+    rerender(
+      <CompositeProviderEditor
+        open={false}
+        appId="claude"
+        provider={providerWithStoredDiff}
+        providers={{ [providerWithStoredDiff.id]: providerWithStoredDiff }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    rerender(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={providerWithStoredDiff}
+        providers={{ [providerWithStoredDiff.id]: providerWithStoredDiff }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const editor = screen.getByLabelText(
+        "composite-settings-config",
+      ) as HTMLTextAreaElement;
+      expect(editor.value).toContain('"CLAUDE_CODE_EFFORT_LEVEL": "max"');
+      expect(editor.value).toContain('"ENABLE_TOOL_SEARCH": "true"');
+      expect(editor.value).toContain('"defaultShell": "powershell"');
+      expect(editor.value).toContain('"includeCoAuthoredBy": false');
+    });
+    expect(screen.getByRole("checkbox", { name: "写入通用配置" })).toBeChecked();
+  });
+
+  it("preserves stored Claude diff after reopening and saving without editing", async () => {
     const user = userEvent.setup();
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+    const providerWithStoredDiff: Provider = {
+      ...compositeProviderWithDefaultOrdinaryRoute,
+      settingsConfig: {
+        env: { CLAUDE_CODE_EFFORT_LEVEL: "max" },
+      },
+      meta: {
+        ...compositeProviderWithDefaultOrdinaryRoute.meta,
+        commonConfigEnabled: true,
+      },
+    };
+
+    const { rerender } = render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={providerWithStoredDiff}
+        providers={{
+          [providerWithStoredDiff.id]: providerWithStoredDiff,
+          [ordinaryProvider.id]: ordinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await waitFor(() => {
+      const editor = screen.getByLabelText(
+        "composite-settings-config",
+      ) as HTMLTextAreaElement;
+      expect(editor.value).toContain('"ENABLE_TOOL_SEARCH": "true"');
+    });
+
+    rerender(
+      <CompositeProviderEditor
+        open={false}
+        appId="claude"
+        provider={providerWithStoredDiff}
+        providers={{
+          [providerWithStoredDiff.id]: providerWithStoredDiff,
+          [ordinaryProvider.id]: ordinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    rerender(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={providerWithStoredDiff}
+        providers={{
+          [providerWithStoredDiff.id]: providerWithStoredDiff,
+          [ordinaryProvider.id]: ordinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole("checkbox", { name: "写入通用配置" })).toBeChecked();
+    });
+
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(handleSubmit.mock.calls[0][0].provider.settingsConfig).toEqual(
+      providerWithStoredDiff.settingsConfig,
+    );
+  });
+
+  it("keeps Claude common config UI for claude composite providers", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={compositeProviderWithDefaultOrdinaryRoute}
+        providers={{
+          [compositeProviderWithDefaultOrdinaryRoute.id]:
+            compositeProviderWithDefaultOrdinaryRoute,
+          [ordinaryProvider.id]: ordinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("checkbox", { name: "写入通用配置" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /编辑通用配置/ }));
+
+    expect(
+      await screen.findByDisplayValue(/"ENABLE_TOOL_SEARCH": "true"/),
+    ).toBeInTheDocument();
+  });
+
+  it("saves edited composite config JSON as settingsConfig", async () => {    const user = userEvent.setup();
     const handleSubmit = vi.fn().mockResolvedValue(undefined);
 
     render(
@@ -1170,6 +1418,86 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     );
   });
 
+  it("rehydrates Codex common config content on reopen when stored config is flagged", async () => {
+    const providerWithStoredDiff: Provider = {
+      ...codexCompositeProviderWithExactRoutes,
+      settingsConfig: {
+        ...(codexCompositeProviderWithExactRoutes.settingsConfig as Record<
+          string,
+          unknown
+        >),
+        config: 'model_provider = "custom"',
+      },
+      meta: {
+        ...codexCompositeProviderWithExactRoutes.meta,
+        commonConfigEnabled: true,
+      },
+    };
+
+    const { rerender } = render(
+      <CompositeProviderEditor
+        open
+        appId="codex"
+        provider={providerWithStoredDiff}
+        providers={{
+          [providerWithStoredDiff.id]: providerWithStoredDiff,
+          [codexOrdinaryProvider.id]: codexOrdinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const editor = screen.getByLabelText(
+        "composite-settings-config",
+      ) as HTMLTextAreaElement;
+      expect(editor.value).toContain('model_reasoning_effort = "high"');
+    });
+    expect(
+      screen.getByRole("checkbox", { name: "codexConfig.writeCommonConfig" }),
+    ).toBeChecked();
+
+    rerender(
+      <CompositeProviderEditor
+        open={false}
+        appId="codex"
+        provider={providerWithStoredDiff}
+        providers={{
+          [providerWithStoredDiff.id]: providerWithStoredDiff,
+          [codexOrdinaryProvider.id]: codexOrdinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    rerender(
+      <CompositeProviderEditor
+        open
+        appId="codex"
+        provider={providerWithStoredDiff}
+        providers={{
+          [providerWithStoredDiff.id]: providerWithStoredDiff,
+          [codexOrdinaryProvider.id]: codexOrdinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const editor = screen.getByLabelText(
+        "composite-settings-config",
+      ) as HTMLTextAreaElement;
+      expect(editor.value).toContain('model_provider = "custom"');
+      expect(editor.value).toContain('model_reasoning_effort = "high"');
+    });
+    expect(
+      screen.getByRole("checkbox", { name: "codexConfig.writeCommonConfig" }),
+    ).toBeChecked();
+  });
+
   it("loads Codex default and exact routes into Codex-specific UI", async () => {
     render(
       <CompositeProviderEditor
@@ -1200,6 +1528,45 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
       "DeepSeek V4 Flash",
     );
     expect(screen.getByLabelText("上下文窗口")).toHaveValue("128000");
+  });
+
+  it("uses Codex common config snippet and Codex editor copy for codex composite providers", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="codex"
+        provider={codexCombinedProvider}
+        providers={{
+          [codexCombinedProvider.id]: codexCombinedProvider,
+          [codexOrdinaryProvider.id]: codexOrdinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("checkbox", { name: "codexConfig.writeCommonConfig" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("checkbox", { name: "写入通用配置" }),
+    ).not.toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", {
+        name: /codexConfig.editCommonConfig|编辑通用配置/,
+      }),
+    );
+
+    expect(
+      await screen.findByText("codexConfig.editCommonConfigTitle"),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByDisplayValue(/model_reasoning_effort = "high"/),
+    ).toBeInTheDocument();
+    expect(screen.queryByDisplayValue(COMMON_CONFIG_SNIPPET)).not.toBeInTheDocument();
   });
 
   it("saves Codex default and exact mappings with modelCatalog", async () => {
@@ -1276,8 +1643,42 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     );
   });
 
-  it("blocks duplicate Codex exact request models", async () => {
+  it("persists commonConfigEnabled for codex composite providers on save", async () => {
     const user = userEvent.setup();
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="codex"
+        provider={codexCompositeProviderWithExactRoutes}
+        providers={{
+          [codexCompositeProviderWithExactRoutes.id]:
+            codexCompositeProviderWithExactRoutes,
+          [codexOrdinaryProvider.id]: codexOrdinaryProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("checkbox", { name: "codexConfig.writeCommonConfig" }),
+    );
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(handleSubmit.mock.calls[0][0].provider.meta?.commonConfigEnabled).toBe(
+      true,
+    );
+    expect(handleSubmit.mock.calls[0][0].provider.settingsConfig).toEqual(
+      expect.objectContaining({
+        config: expect.stringContaining('model_reasoning_effort = "high"'),
+      }),
+    );
+  });
+
+  it("blocks duplicate Codex exact request models", async () => {    const user = userEvent.setup();
     const handleSubmit = vi.fn().mockResolvedValue(undefined);
 
     render(
