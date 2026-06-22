@@ -26,7 +26,7 @@ import {
 } from "@/utils/providerConfigUtils";
 import { useProviderHealth } from "@/lib/query/failover";
 import { useUsageQuery } from "@/lib/query/queries";
-import { isModelRouterProvider } from "@/utils/combinedProviderUtils";
+import { isManagedCombinedProvider, isModelRouterProvider } from "@/utils/combinedProviderUtils";
 
 interface DragHandleProps {
   attributes: DraggableAttributes;
@@ -196,6 +196,7 @@ export function ProviderCard({
   }, [provider.notes, displayUrl, fallbackUrlText]);
 
   const usageEnabled = provider.meta?.usage_script?.enabled ?? false;
+  const isManagedCombined = isManagedCombinedProvider(provider);
   const isModelRouter = isModelRouterProvider(provider);
   const isOfficial = isOfficialProvider(provider, appId);
   const supportsOfficialSubscription =
@@ -238,6 +239,7 @@ export function ProviderCard({
     provider.meta?.apiFormat,
     (provider.settingsConfig as Record<string, any>)?.config,
   ]);
+  const combinedNeedsRouting = isManagedCombined;
   const isClaudeThirdParty =
     appId === "claude" && provider.category === "third_party" && !isModelRouter;
 
@@ -395,6 +397,14 @@ export function ProviderCard({
               {codexNeedsRouting && (
                 <span className="inline-flex items-center rounded-md bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
                   {t("codex.needsRouting", {
+                    defaultValue: "需要路由",
+                  })}
+                </span>
+              )}
+
+              {combinedNeedsRouting && (
+                <span className="inline-flex items-center rounded-md bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">
+                  {t("provider.needsRouting", {
                     defaultValue: "需要路由",
                   })}
                 </span>

@@ -49,6 +49,36 @@ function createProvider(overrides: Partial<Provider> = {}): Provider {
 }
 
 describe("ProviderCard", () => {
+  it("shows a needs-routing badge for managed combined providers", () => {
+    const provider = createProvider({
+      id: COMBINED_PROVIDER_ID,
+      name: "组合provider",
+      settingsConfig: { env: {} },
+      meta: {
+        providerType: "model_router",
+        managedModelRouterProvider: true,
+      },
+    });
+
+    render(
+      <ProviderCard
+        provider={provider}
+        isCurrent={false}
+        appId="gemini"
+        onSwitch={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onConfigureUsage={vi.fn()}
+        onOpenWebsite={vi.fn()}
+        onDuplicate={vi.fn()}
+        onTest={vi.fn()}
+        isProxyRunning={true}
+      />,
+    );
+
+    expect(screen.getByText("需要路由")).toBeInTheDocument();
+  });
+
   it("keeps managed combined provider actions enabled during proxy takeover", () => {
     const provider = createProvider({
       id: COMBINED_PROVIDER_ID,
@@ -125,13 +155,13 @@ describe("ProviderCard", () => {
       />,
     );
 
-    expect(screen.getByText("已拦截")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "已拦截" })).toBeDisabled();
+    expect(screen.queryByText("已拦截")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "启用" })).toBeDisabled();
     expect(
       container.querySelector<HTMLButtonElement>('button[title="测试模型"]'),
     ).toHaveClass("cursor-not-allowed");
     expect(
       container.querySelector<HTMLButtonElement>('button[title="配置用量查询"]'),
-    ).toHaveClass("cursor-not-allowed");
+    ).toBeEnabled();
   });
 });
