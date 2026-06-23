@@ -363,6 +363,7 @@ function ProviderFormFull({
       ),
     });
     setCodexChatReasoning(initialData?.meta?.codexChatReasoning ?? {});
+    setCustomUserAgent(initialData?.meta?.customUserAgent ?? "");
   }, [appId, initialData, supportsFullUrl]);
 
   const defaultValues: ProviderFormData = useMemo(
@@ -457,6 +458,8 @@ function ProviderFormFull({
     defaultSonnetModelName,
     defaultOpusModel,
     defaultOpusModelName,
+    defaultFableModel,
+    defaultFableModelName,
     handleModelChange,
   } = useModelState({
     settingsConfig: form.getValues("settingsConfig"),
@@ -518,6 +521,9 @@ function ProviderFormFull({
     useState<CodexChatReasoning>(
       () => initialData?.meta?.codexChatReasoning ?? {},
     );
+  const [customUserAgent, setCustomUserAgent] = useState<string>(
+    () => initialData?.meta?.customUserAgent ?? "",
+  );
 
   const {
     codexAuth,
@@ -1414,6 +1420,10 @@ function ProviderFormFull({
         localCodexApiFormat === "openai_chat"
           ? normalizeCodexChatReasoningForSave(codexChatReasoning)
           : undefined,
+      customUserAgent:
+        (appId === "claude" || appId === "codex") && category !== "official"
+          ? customUserAgent.trim() || undefined
+          : undefined,
       testConfig: testConfig.enabled ? testConfig : undefined,
       costMultiplier: pricingConfig.enabled
         ? pricingConfig.costMultiplier
@@ -2027,6 +2037,8 @@ function ProviderFormFull({
               defaultSonnetModelName={defaultSonnetModelName}
               defaultOpusModel={defaultOpusModel}
               defaultOpusModelName={defaultOpusModelName}
+              defaultFableModel={defaultFableModel}
+              defaultFableModelName={defaultFableModelName}
               onModelChange={handleModelChange}
               speedTestEndpoints={speedTestEndpoints}
               apiFormat={localApiFormat}
@@ -2035,6 +2047,8 @@ function ProviderFormFull({
               onApiKeyFieldChange={handleApiKeyFieldChange}
               isFullUrl={localIsFullUrl}
               onFullUrlChange={setLocalIsFullUrl}
+              customUserAgent={customUserAgent}
+              onCustomUserAgentChange={setCustomUserAgent}
             />
           )}
 
@@ -2067,6 +2081,8 @@ function ProviderFormFull({
               catalogModels={codexCatalogModels}
               onCatalogModelsChange={setCodexCatalogModels}
               speedTestEndpoints={speedTestEndpoints}
+              customUserAgent={customUserAgent}
+              onCustomUserAgentChange={setCustomUserAgent}
             />
           )}
 

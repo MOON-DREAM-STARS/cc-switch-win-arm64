@@ -331,7 +331,7 @@ export function ProviderCard({
         )}
       />
       <div className="relative flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex flex-1 items-center gap-2">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
           <button
             type="button"
             className={cn(
@@ -346,7 +346,7 @@ export function ProviderCard({
             <GripVertical className="h-4 w-4" />
           </button>
 
-          <div className="h-8 w-8 rounded-lg bg-muted flex items-center justify-center border border-border group-hover:scale-105 transition-transform duration-300">
+          <div className="h-8 w-8 flex-shrink-0 rounded-lg bg-muted flex items-center justify-center border border-border group-hover:scale-105 transition-transform duration-300">
             <ProviderIcon
               icon={provider.icon}
               name={provider.name}
@@ -355,7 +355,7 @@ export function ProviderCard({
             />
           </div>
 
-          <div className="space-y-1">
+          <div className="min-w-0 flex-1 space-y-1">
             <div className="flex flex-wrap items-center gap-2 min-h-7">
               <h3 className="text-base font-semibold leading-none">
                 {provider.name}
@@ -470,7 +470,7 @@ export function ProviderCard({
                 type="button"
                 onClick={handleOpenWebsite}
                 className={cn(
-                  "inline-flex items-center text-sm max-w-[280px]",
+                  "inline-flex max-w-full items-center overflow-hidden text-left text-sm",
                   isClickableUrl
                     ? "text-blue-500 transition-colors hover:underline dark:text-blue-400 cursor-pointer"
                     : "text-muted-foreground cursor-default",
@@ -478,7 +478,7 @@ export function ProviderCard({
                 title={displayUrl}
                 disabled={!isClickableUrl}
               >
-                <span className="truncate">{displayUrl}</span>
+                <span className="min-w-0 truncate">{displayUrl}</span>
               </button>
             )}
           </div>
@@ -567,11 +567,12 @@ export function ProviderCard({
               onEdit={() => onEdit(provider)}
               onDuplicate={() => onDuplicate(provider)}
               onTest={
-                onTest &&
-                !isOfficial &&
-                !isCopilot &&
-                !isCodexOauth &&
-                !isClaudeThirdParty
+                // 连通检测对第三方/自定义/Copilot/Codex-OAuth 供应商开放（这些正是旧的
+                // 真实请求探测会误报、而可达性探测能正确处理的对象）。官方供应商
+                // (category === "official") 一律隐藏：它们 base_url 故意留空、走客户端
+                // 默认/OAuth 端点，cc-switch 没有可靠的探测目标（尤其 Claude Desktop
+                // 官方是原生 1P 模式，根本不在请求路径上）。
+                onTest && provider.category !== "official"
                   ? () => onTest(provider)
                   : undefined
               }
