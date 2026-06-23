@@ -2147,7 +2147,7 @@ export function CompositeProviderEditor({
                 setIsCommonConfigModalOpen(false);
               }}
               value={activeCommonConfig.commonConfigSnippet}
-              onSave={activeCommonConfig.handleCommonConfigSnippetChange}
+              onSave={codexCommonConfig.handleCommonConfigSnippetChange}
               error={activeCommonConfig.commonConfigError}
               onExtract={activeCommonConfig.handleExtract}
               isExtracting={activeCommonConfig.isExtracting}

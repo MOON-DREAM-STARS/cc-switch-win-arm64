@@ -240,9 +240,6 @@ export function ProviderCard({
     (provider.settingsConfig as Record<string, any>)?.config,
   ]);
   const combinedNeedsRouting = isManagedCombined;
-  const isClaudeThirdParty =
-    appId === "claude" && provider.category === "third_party" && !isModelRouter;
-
   // 获取用量数据以判断是否有多套餐
   // 累加模式应用（OpenCode/OpenClaw/Hermes）：使用 isInConfig 代替 isCurrent
   const shouldAutoQuery =

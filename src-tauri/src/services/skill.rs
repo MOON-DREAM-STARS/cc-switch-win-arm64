@@ -374,20 +374,15 @@ fn parse_branch_from_source_url(source_url: Option<&str>) -> Option<String> {
 
 /// 获取 `~/.agents/skills/` 目录（存在时返回）
 fn get_agents_skills_dir() -> Option<PathBuf> {
-    dirs::home_dir()
-        .map(|h| h.join(".agents").join("skills"))
-        .filter(|p| p.exists())
+    let path = crate::config::get_home_dir().join(".agents").join("skills");
+    path.exists().then_some(path)
 }
 
 /// 解析 `~/.agents/.skill-lock.json`，返回 skill_name -> 仓库信息
 fn parse_agents_lock() -> HashMap<String, LockRepoInfo> {
-    let path = match dirs::home_dir() {
-        Some(h) => h.join(".agents").join(".skill-lock.json"),
-        None => {
-            log::warn!("无法获取 HOME 目录，跳过解析 agents lock 文件");
-            return HashMap::new();
-        }
-    };
+    let path = crate::config::get_home_dir()
+        .join(".agents")
+        .join(".skill-lock.json");
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) => {
@@ -481,14 +476,9 @@ impl SkillService {
         let location = crate::settings::get_skill_storage_location();
         let dir = match location {
             SkillStorageLocation::CcSwitch => get_app_config_dir().join("skills"),
-            SkillStorageLocation::Unified => {
-                let home = dirs::home_dir().context(format_skill_error(
-                    "GET_HOME_DIR_FAILED",
-                    &[],
-                    Some("checkPermission"),
-                ))?;
-                home.join(".agents").join("skills")
-            }
+            SkillStorageLocation::Unified => crate::config::get_home_dir()
+                .join(".agents")
+                .join("skills"),
         };
         fs::create_dir_all(&dir)?;
         Ok(dir)
@@ -539,11 +529,7 @@ impl SkillService {
         }
 
         // 默认路径：回退到用户主目录下的标准位置
-        let home = dirs::home_dir().context(format_skill_error(
-            "GET_HOME_DIR_FAILED",
-            &[],
-            Some("checkPermission"),
-        ))?;
+        let home = crate::config::get_home_dir();
 
         Ok(match app {
             AppType::Claude => home.join(".claude").join("skills"),
@@ -1166,10 +1152,9 @@ impl SkillService {
         let old_dir = Self::get_ssot_dir()?;
         let new_dir = match target {
             SkillStorageLocation::CcSwitch => get_app_config_dir().join("skills"),
-            SkillStorageLocation::Unified => {
-                let home = dirs::home_dir().context("Cannot determine home directory")?;
-                home.join(".agents").join("skills")
-            }
+            SkillStorageLocation::Unified => crate::config::get_home_dir()
+                .join(".agents")
+                .join("skills"),
         };
         fs::create_dir_all(&new_dir)?;
 
@@ -1572,6 +1557,26 @@ impl SkillService {
             .unwrap_or(false)
     }
 
+    #[cfg(windows)]
+    fn is_windows_reparse_dir(path: &Path) -> bool {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+        path.symlink_metadata()
+            .map(|m| m.is_dir() && (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0))
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(windows))]
+    fn is_windows_reparse_dir(_path: &Path) -> bool {
+        false
+    }
+
+    fn is_link_like(path: &Path) -> bool {
+        Self::is_symlink(path) || Self::is_windows_reparse_dir(path)
+    }
+
     /// 获取当前同步方式配置
     fn get_sync_method() -> SyncMethod {
         crate::settings::get_skill_sync_method()
@@ -1654,7 +1659,7 @@ impl SkillService {
 
     /// 删除路径（支持 symlink 和真实目录）
     fn remove_path(path: &Path) -> Result<()> {
-        if Self::is_symlink(path) {
+        if Self::is_link_like(path) {
             // 符号链接：仅删除链接本身，不影响源文件
             #[cfg(unix)]
             fs::remove_file(path)?;
@@ -1729,27 +1734,30 @@ impl SkillService {
 
     /// 判断路径是否为指向 SSOT 目录内的符号链接。
     fn is_symlink_to_ssot(path: &Path, ssot_dir: &Path) -> bool {
-        if !Self::is_symlink(path) {
+        if !Self::is_link_like(path) {
             return false;
         }
-
-        let Ok(target) = fs::read_link(path) else {
-            return false;
-        };
-
-        if target.is_absolute() && target.starts_with(ssot_dir) {
-            return true;
-        }
-
-        let resolved = path
-            .parent()
-            .map(|parent| parent.join(&target))
-            .unwrap_or(target.clone());
 
         let canonical_ssot = ssot_dir
             .canonicalize()
             .unwrap_or_else(|_| ssot_dir.to_path_buf());
-        let canonical_target = resolved.canonicalize().unwrap_or(resolved);
+        let canonical_target = match fs::read_link(path) {
+            Ok(target) => {
+                if target.is_absolute() && target.starts_with(ssot_dir) {
+                    return true;
+                }
+
+                let resolved = path
+                    .parent()
+                    .map(|parent| parent.join(&target))
+                    .unwrap_or(target);
+                resolved.canonicalize().unwrap_or(resolved)
+            }
+            Err(_) => match path.canonicalize() {
+                Ok(resolved) => resolved,
+                Err(_) => return false,
+            },
+        };
 
         canonical_target.starts_with(&canonical_ssot)
     }

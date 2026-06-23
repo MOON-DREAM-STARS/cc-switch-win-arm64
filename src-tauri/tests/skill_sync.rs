@@ -24,7 +24,22 @@ fn symlink_dir(src: &std::path::Path, dest: &std::path::Path) {
 
 #[cfg(windows)]
 fn symlink_dir(src: &std::path::Path, dest: &std::path::Path) {
-    std::os::windows::fs::symlink_dir(src, dest).expect("create symlink");
+    if let Err(err) = std::os::windows::fs::symlink_dir(src, dest) {
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &dest.display().to_string(),
+                &src.display().to_string(),
+            ])
+            .status()
+            .expect("create junction");
+        assert!(
+            status.success(),
+            "create symlink or junction: {err}"
+        );
+    }
 }
 
 #[test]

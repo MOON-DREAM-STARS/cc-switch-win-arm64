@@ -1135,12 +1135,35 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 fn sqlite_home_from_codex_config(config_text: &str) -> Option<PathBuf> {
-    let doc = config_text.parse::<DocumentMut>().ok()?;
-    let raw = doc.get("sqlite_home")?.as_str()?.trim();
-    if raw.is_empty() {
-        return None;
+    if let Ok(doc) = config_text.parse::<DocumentMut>() {
+        let raw = doc.get("sqlite_home")?.as_str()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        return Some(resolve_user_path(raw));
     }
-    Some(resolve_user_path(raw))
+
+    for line in config_text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("sqlite_home") {
+            continue;
+        }
+        let (_, value_part) = trimmed.split_once('=')?;
+        let value_part = value_part.trim();
+        let quote = value_part.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let rest = &value_part[quote.len_utf8()..];
+        let end = rest.find(quote)?;
+        let raw = rest[..end].trim();
+        if raw.is_empty() {
+            return None;
+        }
+        return Some(resolve_user_path(raw));
+    }
+
+    None
 }
 
 fn sqlite_home_from_env() -> Option<PathBuf> {

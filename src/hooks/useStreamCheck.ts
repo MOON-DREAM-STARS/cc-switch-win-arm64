@@ -61,7 +61,6 @@ export function useStreamCheck(appId: AppId) {
                 closeButton: true,
               },
             );
-            resetCircuitBreaker.mutate({ providerId, appType: appId });
           } else if (result.status === "degraded") {
             toast.warning(
               t("streamCheck.auditDegraded", {
@@ -76,7 +75,6 @@ export function useStreamCheck(appId: AppId) {
                 closeButton: true,
               },
             );
-            resetCircuitBreaker.mutate({ providerId, appType: appId });
           } else {
             toast.error(
               t("streamCheck.auditFailed", {

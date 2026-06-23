@@ -1,7 +1,4 @@
-//! 供应商连通性检查命令
-//!
-//! 注意：本检查只探测 base_url 是否可达，不发真实大模型请求，也不触碰故障转移
-//! 熔断器（熔断器由真实转发流量驱动）。详见 `services::stream_check`。
+//! 流式健康检查命令
 
 use crate::app_config::AppType;
 use crate::commands::copilot::CopilotAuthState;
@@ -17,7 +14,7 @@ use crate::store::AppState;
 use std::collections::HashSet;
 use tauri::State;
 
-/// 连通性检查（单个供应商）
+/// 流式健康检查（单个供应商）
 #[tauri::command]
 pub async fn stream_check_provider(
     state: State<'_, AppState>,
@@ -50,7 +47,7 @@ pub async fn stream_check_provider(
     Ok(result)
 }
 
-/// 批量连通性检查
+/// 批量流式健康检查
 #[tauri::command]
 pub async fn stream_check_all_providers(
     state: State<'_, AppState>,
@@ -61,6 +58,7 @@ pub async fn stream_check_all_providers(
     let config = state.db.get_stream_check_config()?;
     let providers = state.db.get_all_providers(app_type.as_str())?;
 
+    let mut results = Vec::new();
     let allowed_ids: Option<HashSet<String>> = if proxy_targets_only {
         let mut ids = HashSet::new();
         if let Ok(Some(current_id)) = state.db.get_current_provider(app_type.as_str()) {
@@ -76,7 +74,6 @@ pub async fn stream_check_all_providers(
         None
     };
 
-    let mut results = Vec::new();
     for (id, provider) in providers {
         if let Some(ids) = &allowed_ids {
             if !ids.contains(&id) {
@@ -125,13 +122,13 @@ pub async fn stream_check_all_providers(
     Ok(results)
 }
 
-/// 获取连通性检查配置
+/// 获取流式检查配置
 #[tauri::command]
 pub fn get_stream_check_config(state: State<'_, AppState>) -> Result<StreamCheckConfig, AppError> {
     state.db.get_stream_check_config()
 }
 
-/// 保存连通性检查配置
+/// 保存流式检查配置
 #[tauri::command]
 pub fn save_stream_check_config(
     state: State<'_, AppState>,
@@ -528,6 +525,54 @@ fn is_copilot_provider(provider: &crate::provider::Provider) -> bool {
             .and_then(|value| value.as_str())
             .map(|url| url.contains("githubcopilot.com"))
             .unwrap_or(false)
+}
+
+async fn resolve_claude_api_format_override(
+    app_type: &AppType,
+    provider: &crate::provider::Provider,
+    config: &StreamCheckConfig,
+    copilot_state: &State<'_, CopilotAuthState>,
+    auth_override: Option<&crate::proxy::providers::AuthInfo>,
+) -> Result<Option<String>, AppError> {
+    if *app_type != AppType::Claude {
+        return Ok(None);
+    }
+
+    let is_copilot = auth_override
+        .map(|auth| auth.strategy == crate::proxy::providers::AuthStrategy::GitHubCopilot)
+        .unwrap_or(false);
+    if !is_copilot {
+        return Ok(None);
+    }
+
+    let model_id = StreamCheckService::resolve_effective_test_model(app_type, provider, config);
+    let auth_manager = copilot_state.0.read().await;
+    let account_id = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.managed_account_id_for("github_copilot"));
+
+    let vendor_result = match account_id.as_deref() {
+        Some(id) => {
+            auth_manager
+                .get_model_vendor_for_account(id, &model_id)
+                .await
+        }
+        None => auth_manager.get_model_vendor(&model_id).await,
+    };
+
+    let api_format = match vendor_result {
+        Ok(Some(vendor)) if vendor.eq_ignore_ascii_case("openai") => "openai_responses",
+        Ok(Some(_)) | Ok(None) => "openai_chat",
+        Err(err) => {
+            log::warn!(
+                "[StreamCheck] Failed to resolve Copilot model vendor for {model_id}: {err}. Falling back to chat/completions"
+            );
+            "openai_chat"
+        }
+    };
+
+    Ok(Some(api_format.to_string()))
 }
 
 #[cfg(test)]

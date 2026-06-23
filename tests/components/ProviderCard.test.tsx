@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import type { Provider } from "@/types";
 import { ProviderCard } from "@/components/providers/ProviderCard";
+import type { Provider } from "@/types";
 import { COMBINED_PROVIDER_ID } from "@/utils/combinedProviderUtils";
 
 vi.mock("react-i18next", () => ({
@@ -11,17 +11,21 @@ vi.mock("react-i18next", () => ({
       options?: string | { defaultValue?: string },
     ): string => {
       const defaults: Record<string, string> = {
-        "common.edit": "编辑",
-        "common.delete": "删除",
-        "modelTest.testProvider": "测试模型",
-        "provider.configureUsage": "配置用量查询",
-        "provider.duplicate": "复制",
-        "provider.enable": "启用",
-        "provider.inUse": "使用中",
+        "common.edit": "Edit",
+        "common.delete": "Delete",
+        "modelTest.testProvider": "Test model",
+        "provider.connectivityCheck": "Connectivity check",
+        "provider.configureUsage": "Configure usage",
+        "provider.duplicate": "Duplicate",
+        "provider.enable": "Enable",
+        "provider.inUse": "In use",
+        "provider.needsRouting": "Needs routing",
+        "provider.blockedByProxy": "Blocked",
       };
 
+      if (key in defaults) return defaults[key];
       if (typeof options === "string") return options;
-      return options?.defaultValue ?? defaults[key] ?? key;
+      return options?.defaultValue ?? key;
     },
   }),
 }));
@@ -52,7 +56,7 @@ describe("ProviderCard", () => {
   it("shows a needs-routing badge for managed combined providers", () => {
     const provider = createProvider({
       id: COMBINED_PROVIDER_ID,
-      name: "组合provider",
+      name: "Combined provider",
       settingsConfig: { env: {} },
       meta: {
         providerType: "model_router",
@@ -76,13 +80,13 @@ describe("ProviderCard", () => {
       />,
     );
 
-    expect(screen.getByText("需要路由")).toBeInTheDocument();
+    expect(screen.getByText("Needs routing")).toBeInTheDocument();
   });
 
   it("keeps managed combined provider actions enabled during proxy takeover", () => {
     const provider = createProvider({
       id: COMBINED_PROVIDER_ID,
-      name: "组合provider",
+      name: "Combined provider",
       settingsConfig: { env: {} },
       meta: {
         providerType: "model_router",
@@ -110,14 +114,14 @@ describe("ProviderCard", () => {
       />,
     );
 
-    expect(screen.queryByText("已拦截")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "启用" })).toBeEnabled();
+    expect(screen.queryByText("Blocked")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Enable" })).toBeEnabled();
 
     const testButton = container.querySelector<HTMLButtonElement>(
-      'button[title="测试模型"]',
+      'button[title="Connectivity check"]',
     );
     const usageButton = container.querySelector<HTMLButtonElement>(
-      'button[title="配置用量查询"]',
+      'button[title="Configure usage"]',
     );
 
     expect(testButton).toBeEnabled();
@@ -155,13 +159,17 @@ describe("ProviderCard", () => {
       />,
     );
 
-    expect(screen.queryByText("已拦截")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "启用" })).toBeDisabled();
+    expect(screen.queryByText("Blocked")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Enable" })).toBeDisabled();
     expect(
-      container.querySelector<HTMLButtonElement>('button[title="测试模型"]'),
+      container.querySelector<HTMLButtonElement>(
+        'button[title="Connectivity check"]',
+      ),
     ).toHaveClass("cursor-not-allowed");
     expect(
-      container.querySelector<HTMLButtonElement>('button[title="配置用量查询"]'),
+      container.querySelector<HTMLButtonElement>(
+        'button[title="Configure usage"]',
+      ),
     ).toBeEnabled();
   });
 });
