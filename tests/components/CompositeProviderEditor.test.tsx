@@ -717,6 +717,76 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     ]);
   });
 
+  it("removes a stale Opus 1M marker when a new dropdown model is selected", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn().mockResolvedValue(undefined);
+    fetchMocks.fetchModelsForConfig.mockResolvedValue([
+      { id: "gpt-5.5", ownedBy: "openai" },
+    ]);
+    const providerWithMarkedOpus: Provider = {
+      ...combinedProvider,
+      meta: {
+        providerType: "model_router",
+        managedModelRouterProvider: true,
+        modelRouter: {
+          version: 1,
+          routes: [
+            {
+              id: "combined-role-opus",
+              enabled: true,
+              matchType: "role",
+              matchValue: "opus",
+              target: {
+                providerId: "network-claude",
+                upstreamModel: "old-opus[1M]",
+              },
+            },
+          ],
+        },
+      },
+    };
+
+    render(
+      <CompositeProviderEditor
+        open
+        appId="claude"
+        provider={providerWithMarkedOpus}
+        providers={{
+          [providerWithMarkedOpus.id]: providerWithMarkedOpus,
+          [networkClaudeProvider.id]: networkClaudeProvider,
+        }}
+        onOpenChange={vi.fn()}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await screen.findByText("1 models");
+    const opusModelInput = screen.getByLabelText("Opus Model");
+    const opusModelRow = opusModelInput.closest("div")?.parentElement;
+    expect(opusModelRow).toBeTruthy();
+
+    const modelDropdownTrigger = within(
+      opusModelRow as HTMLElement,
+    ).getByRole("button", { name: "Opus Model options" });
+    await user.click(modelDropdownTrigger);
+    await user.click(await screen.findByRole("menuitem", { name: "gpt-5.5" }));
+
+    await user.click(screen.getByRole("button", { name: /保存|淇濆瓨/ }));
+
+    await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
+    expect(
+      handleSubmit.mock.calls[0][0].provider.meta?.modelRouter?.routes,
+    ).toEqual([
+      {
+        id: "combined-role-opus",
+        enabled: true,
+        matchType: "role",
+        matchValue: "opus",
+        target: { providerId: "network-claude", upstreamModel: "gpt-5.5" },
+      },
+    ]);
+  });
+
   it("declares an auto-detected default model as 1M", async () => {
     const user = userEvent.setup();
     const handleSubmit = vi.fn().mockResolvedValue(undefined);
@@ -1721,4 +1791,3 @@ describe("CompositeProviderEditor", { timeout: 10_000 }, () => {
     expect(handleSubmit).not.toHaveBeenCalled();
   });
 });
-

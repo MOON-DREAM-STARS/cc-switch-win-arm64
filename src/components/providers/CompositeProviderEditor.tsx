@@ -221,9 +221,14 @@ const getStoredModelValue = (
 ): string => {
   if (appId !== "claude") return nextVisibleModel;
   if (supportsClaudeOneM(appId, role)) {
+    const currentBaseModel = stripClaudeOneMMarker(currentUpstreamModel).trim();
+    const nextBaseModel = stripClaudeOneMMarker(nextVisibleModel).trim();
+    const shouldKeepCurrentMarker =
+      currentBaseModel === nextBaseModel &&
+      hasClaudeOneMMarker(currentUpstreamModel);
     return setClaudeOneMMarker(
       nextVisibleModel,
-      hasClaudeOneMMarker(currentUpstreamModel),
+      hasClaudeOneMMarker(nextVisibleModel) || shouldKeepCurrentMarker,
     );
   }
   return stripClaudeOneMMarker(nextVisibleModel);
