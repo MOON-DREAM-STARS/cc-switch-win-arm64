@@ -797,8 +797,8 @@ export function SessionManagerPage({ appId }: { appId: string }) {
           {/* 主内容区域 - 左右分栏 */}
           <div className="flex-1 overflow-hidden grid gap-4 md:grid-cols-[320px_1fr]">
             {/* 左侧会话列表 */}
-            <Card className="flex flex-col flex-1 min-h-0 overflow-hidden">
-              <CardHeader className="py-2 px-3 border-b">
+            <Card className="flex flex-col flex-1 min-h-0 overflow-hidden border-border/50">
+              <CardHeader className="py-2 px-3 border-b border-border/50">
                 {isSearchOpen ? (
                   <div className="flex items-center gap-2">
                     <div className="relative flex-1">
@@ -1147,7 +1147,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                       </div>
                     </div>
                     {selectionMode && (
-                      <div className="grid gap-3 rounded-md border bg-muted/40 px-3 py-2.5">
+                      <div className="grid gap-3 rounded-md border border-border/50 bg-muted/40 px-3 py-2.5">
                         <div className="flex items-center gap-2 text-xs text-muted-foreground">
                           <Badge variant="outline" className="text-xs">
                             {t("sessionManager.selectedCount", {
@@ -1253,7 +1253,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                                 toggleProviderGroup(providerGroup.providerId)
                               }
                             >
-                              <div className="flex w-full items-center gap-2 rounded-md border bg-muted/40 px-2.5 py-2 transition-colors hover:bg-muted">
+                              <div className="flex w-full items-center gap-2 rounded-md border border-border/50 bg-muted/40 px-2.5 py-2 transition-colors hover:bg-muted">
                                 {renderProviderGroupCheckbox(
                                   providerGroup,
                                   providerLabel,
@@ -1401,7 +1401,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
 
             {/* 右侧会话详情 */}
             <Card
-              className="flex flex-col overflow-hidden min-h-0"
+              className="flex flex-col overflow-hidden min-h-0 border-border/50"
               ref={detailRef}
             >
               {!selectedSession ? (
@@ -1412,7 +1412,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
               ) : (
                 <>
                   {/* 详情头部 */}
-                  <CardHeader className="py-3 px-4 border-b shrink-0">
+                  <CardHeader className="py-3 px-4 border-b border-border/50 shrink-0">
                     <div className="flex items-start justify-between gap-4">
                       {/* 左侧：会话信息 */}
                       <div className="min-w-0 flex-1">
