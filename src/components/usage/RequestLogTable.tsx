@@ -110,7 +110,7 @@ export function RequestLogTable({
 
   return (
     <div className="space-y-4">
-      <div className="rounded-lg border bg-card/50 p-2 backdrop-blur-sm">
+      <div className="rounded-lg border border-border/50 bg-card/50 p-2 backdrop-blur-sm">
         <div className="flex flex-wrap items-center gap-1.5">
           {/* Status code */}
           <Select

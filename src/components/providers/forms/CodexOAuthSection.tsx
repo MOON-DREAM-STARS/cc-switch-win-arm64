@@ -182,7 +182,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
             {accounts.map((account) => (
               <div
                 key={account.id}
-                className="space-y-2 p-2 rounded-md border bg-muted/30"
+                className="space-y-2 p-2 rounded-md border border-border/50 bg-muted/30"
               >
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
