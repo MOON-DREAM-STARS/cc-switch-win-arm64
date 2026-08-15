@@ -327,6 +327,12 @@ export type AgentUsageRequestCountSemantics =
   | "agent_call"
   | "unavailable";
 
+export type AgentDescendantUsageStatus =
+  | "available"
+  | "no_activity_in_range"
+  | "unavailable"
+  | "not_applicable";
+
 export type AgentUsageCapabilityStatus =
   | "supported"
   | "partial"
@@ -481,6 +487,7 @@ export interface AgentSessionUsageSummary {
   supportsDescendants: boolean;
   selfUsage: AgentUsageMeasure | null;
   descendantUsage: AgentUsageMeasure | null;
+  descendantUsageStatus: AgentDescendantUsageStatus;
   totalUsage: AgentUsageMeasure | null;
   descendantSessionCount: number;
   precision: AgentUsagePrecision;
@@ -496,6 +503,7 @@ export interface AgentTaskUsageRow {
   root: AgentSessionNodeView | null;
   selfUsage: AgentUsageMeasure | null;
   descendantUsage: AgentUsageMeasure | null;
+  descendantUsageStatus: AgentDescendantUsageStatus;
   totalUsage: AgentUsageMeasure | null;
   descendantSessionCount: number;
   precision: AgentUsagePrecision;

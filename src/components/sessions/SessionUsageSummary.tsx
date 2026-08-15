@@ -5,7 +5,6 @@ import {
   ChevronUp,
   Layers3,
   Loader2,
-  MessageSquare,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { RefObject } from "react";
@@ -20,7 +19,16 @@ import type {
   AgentUsageRequestCountSemantics,
 } from "@/types/usage";
 import { cn } from "@/lib/utils";
-import { formatKnownTokenTotal } from "@/components/usage/format";
+import {
+  formatKnownTokenTotal,
+  formatUsageCostWithStatus,
+  isCodexReplayInProgress,
+  resolveUsageCostStatusForMeasure,
+} from "@/components/usage/format";
+import {
+  UsageCostTooltip,
+  UsageQualityTooltip,
+} from "@/components/usage/UsageQualityTooltip";
 
 type SessionUsageSummaryProps = {
   appType: AgentUsageAppType;
@@ -94,13 +102,9 @@ const formatNumber = (value: number, language: string) =>
 
 const formatCost = (
   measure: AgentUsageMeasure | null,
+  costStatus: "reported" | "estimated" | "unavailable",
   unavailableLabel: string,
-) => {
-  if (!measure || measure.totalCostUsd === null) return unavailableLabel;
-  const cost = Number.parseFloat(measure.totalCostUsd);
-  if (!Number.isFinite(cost)) return unavailableLabel;
-  return `$${cost.toFixed(4)}`;
-};
+) => formatUsageCostWithStatus(measure, costStatus, unavailableLabel);
 
 const hasDescendantEvidence = (summary: AgentSessionUsageSummary) =>
   summary.supportsDescendants &&
@@ -109,23 +113,29 @@ const hasDescendantEvidence = (summary: AgentSessionUsageSummary) =>
 type MeasureCardProps = {
   label: string;
   measure: AgentUsageMeasure | null;
+  emptyMessage?: string;
   language: string;
   t: ReturnType<typeof useTranslation>["t"];
   countLabel?: string;
   count?: number;
   countUnavailableLabel: string;
   unavailableLabel: string;
+  costStatus: "reported" | "estimated" | "unavailable";
+  replayInProgress: boolean;
 };
 
 function MeasureCard({
   label,
   measure,
+  emptyMessage,
   language,
   t,
   countLabel,
   count,
   countUnavailableLabel,
   unavailableLabel,
+  costStatus,
+  replayInProgress,
 }: MeasureCardProps) {
   const effectiveCountLabel = measure
     ? requestCountLabel(measure.requestCountSemantics, t)
@@ -134,6 +144,18 @@ function MeasureCard({
     measure?.requestCount === null || measure == null
       ? unavailableLabel
       : formatNumber(measure.requestCount, language);
+  if (!measure) {
+    return (
+      <div className="min-w-0 rounded-md border border-border/60 bg-background/40 p-2.5">
+        <div className="truncate text-xs font-medium" title={label}>
+          {label}
+        </div>
+        <div className="mt-2 text-[11px] text-muted-foreground">
+          {emptyMessage ?? unavailableLabel}
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="min-w-0 rounded-md border border-border/60 bg-background/40 p-2.5">
       <div className="flex min-w-0 items-start justify-between gap-2">
@@ -161,7 +183,12 @@ function MeasureCard({
             className="truncate font-semibold tabular-nums"
             data-testid="usage-cost"
           >
-            {formatCost(measure, unavailableLabel)}
+            <UsageCostTooltip
+              status={costStatus}
+              replayInProgress={replayInProgress}
+            >
+              {formatCost(measure, costStatus, unavailableLabel)}
+            </UsageCostTooltip>
           </div>
         </div>
         <div className="min-w-0">
@@ -220,7 +247,6 @@ export function SessionUsageSummary({
   const { data, isLoading, isError } = useAgentSessionUsage(appType, sessionId);
   const isCompact = useCompactDetailLayout(detailContainerRef);
   const [usageOpen, setUsageOpen] = useState(false);
-  const [detailsOpen, setDetailsOpen] = useState(false);
   const previousCompactRef = useRef(false);
   const language = i18n.resolvedLanguage || i18n.language || "en-US";
   const unavailableLabel = t("sessionManager.usageUnavailableShort", {
@@ -229,13 +255,11 @@ export function SessionUsageSummary({
 
   useEffect(() => {
     setUsageOpen(false);
-    setDetailsOpen(false);
   }, [appType, sessionId]);
 
   useEffect(() => {
     if (isCompact && !previousCompactRef.current) {
       setUsageOpen(false);
-      setDetailsOpen(false);
     }
     previousCompactRef.current = isCompact;
   }, [isCompact]);
@@ -263,6 +287,7 @@ export function SessionUsageSummary({
   }
 
   const descendantVisible = hasDescendantEvidence(data);
+  const replayInProgress = isCodexReplayInProgress(data.sourceDimensions);
   const totalIsPartial = data.partial || Boolean(data.totalUsage?.partial);
   const measures = [data.totalUsage, data.selfUsage, data.descendantUsage];
   const measureHasPartial = measures.some(
@@ -279,9 +304,20 @@ export function SessionUsageSummary({
     (measure) =>
       measure?.timeSemantics && measure.timeSemantics !== "event_time",
   )?.timeSemantics;
-  const syncWindow = detailTimeSemantics === "sync_window_end";
-  const hasDataDetails =
+  const hasQualityDetails =
     totalIsPartial || measureHasDetails || data.warnings.length > 0;
+  const costStatus = resolveUsageCostStatusForMeasure(
+    data.totalUsage,
+    data.sourceDimensions,
+  );
+  const selfCostStatus = resolveUsageCostStatusForMeasure(
+    data.selfUsage,
+    data.sourceDimensions,
+  );
+  const descendantCostStatus = resolveUsageCostStatusForMeasure(
+    data.descendantUsage,
+    data.sourceDimensions,
+  );
   const totalLabel = t("sessionManager.usageTaskTotal", {
     defaultValue: "Task total",
   });
@@ -291,6 +327,12 @@ export function SessionUsageSummary({
   const descendantsLabel = t("sessionManager.usageDescendants", {
     defaultValue: "All descendants",
   });
+  const descendantEmptyMessage =
+    data.descendantUsageStatus === "no_activity_in_range"
+      ? t("sessionManager.usageDescendantsNoActivity", {
+          defaultValue: "No descendant activity in the selected time range",
+        })
+      : undefined;
   const tokenValue = formatKnownTokenTotal(
     data.totalUsage,
     language,
@@ -299,7 +341,7 @@ export function SessionUsageSummary({
   const tokenLabel = t("sessionManager.usageTokens", {
     defaultValue: "Tokens",
   });
-  const costValue = formatCost(data.totalUsage, unavailableLabel);
+  const costValue = formatCost(data.totalUsage, costStatus, unavailableLabel);
   const usageToggleLabel = t(
     usageOpen ? "sessionManager.usageCollapse" : "sessionManager.usageExpand",
     {
@@ -315,6 +357,12 @@ export function SessionUsageSummary({
         <div className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-muted-foreground">
           <Layers3 className="size-3.5 shrink-0" aria-hidden="true" />
           <span className="truncate">{totalLabel}</span>
+          <UsageQualityTooltip
+            partial={hasQualityDetails}
+            timeSemantics={detailTimeSemantics}
+            costStatus={costStatus}
+            replayInProgress={replayInProgress}
+          />
         </div>
         <div className="mt-1 flex min-w-0 items-baseline gap-2">
           <span
@@ -332,13 +380,15 @@ export function SessionUsageSummary({
         </div>
       </div>
       <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] text-muted-foreground">
-        <span
-          className="inline-flex min-w-0 items-center gap-1 truncate"
-          title={costValue}
+        <UsageCostTooltip
+          status={costStatus}
+          replayInProgress={replayInProgress}
         >
-          <Coins className="size-3 shrink-0" aria-hidden="true" />
-          <span className="truncate">{costValue}</span>
-        </span>
+          <span className="inline-flex min-w-0 items-center gap-1 truncate">
+            <Coins className="size-3 shrink-0" aria-hidden="true" />
+            <span className="truncate">{costValue}</span>
+          </span>
+        </UsageCostTooltip>
       </div>
     </div>
   );
@@ -374,36 +424,46 @@ export function SessionUsageSummary({
       data-testid="session-usage-summary"
     >
       {isCompact ? (
-        <button
-          type="button"
-          className="flex w-full min-w-0 items-center gap-2 rounded-md text-left transition-colors hover:text-foreground focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2"
-          aria-label={usageToggleAriaLabel}
-          aria-expanded={usageOpen}
-          aria-controls="session-usage-details"
-          title={usageToggleLabel}
-          data-testid="session-usage-toggle"
-          onClick={() => setUsageOpen((open) => !open)}
-        >
-          {compactHeader}
-          <span
-            className="inline-flex min-w-0 shrink-0 items-center gap-1 text-[10px] text-muted-foreground"
-            title={costValue}
+        <div className="flex min-w-0 items-center gap-2">
+          <button
+            type="button"
+            className="flex min-w-0 flex-1 items-center gap-2 rounded-md text-left transition-colors hover:text-foreground focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2"
+            aria-label={usageToggleAriaLabel}
+            aria-expanded={usageOpen}
+            aria-controls="session-usage-details"
+            title={usageToggleLabel}
+            data-testid="session-usage-toggle"
+            onClick={() => setUsageOpen((open) => !open)}
           >
-            <Coins className="size-3 shrink-0" aria-hidden="true" />
-            <span className="truncate">{costValue}</span>
-          </span>
-          {usageOpen ? (
-            <ChevronUp
-              className="size-3.5 shrink-0 text-muted-foreground"
-              aria-hidden="true"
-            />
-          ) : (
-            <ChevronDown
-              className="size-3.5 shrink-0 text-muted-foreground"
-              aria-hidden="true"
-            />
-          )}
-        </button>
+            {compactHeader}
+            {usageOpen ? (
+              <ChevronUp
+                className="size-3.5 shrink-0 text-muted-foreground"
+                aria-hidden="true"
+              />
+            ) : (
+              <ChevronDown
+                className="size-3.5 shrink-0 text-muted-foreground"
+                aria-hidden="true"
+              />
+            )}
+          </button>
+          <UsageCostTooltip
+            status={costStatus}
+            replayInProgress={replayInProgress}
+          >
+            <span className="inline-flex min-w-0 shrink-0 items-center gap-1 text-[10px] text-muted-foreground">
+              <Coins className="size-3 shrink-0" aria-hidden="true" />
+              <span className="truncate">{costValue}</span>
+            </span>
+          </UsageCostTooltip>
+          <UsageQualityTooltip
+            partial={hasQualityDetails}
+            timeSemantics={detailTimeSemantics}
+            costStatus={costStatus}
+            replayInProgress={replayInProgress}
+          />
+        </div>
       ) : (
         expandedHeader
       )}
@@ -423,6 +483,8 @@ export function SessionUsageSummary({
               t={t}
               countUnavailableLabel={unavailableLabel}
               unavailableLabel={unavailableLabel}
+              costStatus={selfCostStatus}
+              replayInProgress={replayInProgress}
             />
             {descendantVisible && (
               <MeasureCard
@@ -432,95 +494,16 @@ export function SessionUsageSummary({
                     : descendantsLabel
                 }
                 measure={data.descendantUsage}
+                emptyMessage={descendantEmptyMessage}
                 language={language}
                 t={t}
                 countUnavailableLabel={unavailableLabel}
                 unavailableLabel={unavailableLabel}
+                costStatus={descendantCostStatus}
+                replayInProgress={replayInProgress}
               />
             )}
           </div>
-
-          {hasDataDetails && (
-            <div className="mt-2 min-w-0">
-              <button
-                type="button"
-                className="inline-flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground transition-colors hover:text-foreground"
-                aria-expanded={detailsOpen}
-                aria-controls="session-usage-data-details"
-                onClick={() => setDetailsOpen((open) => !open)}
-              >
-                {detailsOpen ? (
-                  <ChevronUp className="size-3 shrink-0" aria-hidden="true" />
-                ) : (
-                  <ChevronDown className="size-3 shrink-0" aria-hidden="true" />
-                )}
-                <span>
-                  {t(
-                    detailsOpen
-                      ? "sessionManager.usageDataDetailsClose"
-                      : "sessionManager.usageDataDetails",
-                    {
-                      defaultValue: detailsOpen
-                        ? "Hide data details"
-                        : "Data details",
-                    },
-                  )}
-                </span>
-              </button>
-              {detailsOpen && (
-                <div
-                  id="session-usage-data-details"
-                  data-testid="session-usage-data-details"
-                  className="mt-1.5 flex min-w-0 items-start gap-1.5 rounded-md border border-border/50 bg-background/30 px-2 py-1.5 text-[10px] text-muted-foreground"
-                >
-                  <AlertCircle
-                    className="mt-0.5 size-3 shrink-0"
-                    aria-hidden="true"
-                  />
-                  <div className="min-w-0 space-y-1">
-                    {(totalIsPartial ||
-                      measureHasPartial ||
-                      data.warnings.length > 0) && (
-                      <div>
-                        {t("sessionManager.usagePartialHint", {
-                          defaultValue:
-                            "Some usage fields are partial or unavailable.",
-                        })}
-                      </div>
-                    )}
-                    {syncWindow && (
-                      <div className="flex items-start gap-1">
-                        <MessageSquare
-                          className="mt-0.5 size-3 shrink-0"
-                          aria-hidden="true"
-                        />
-                        <span>
-                          {t("sessionManager.usageSyncWindowHint", {
-                            defaultValue:
-                              "Sync-window increment; not per-request.",
-                          })}
-                        </span>
-                      </div>
-                    )}
-                    {detailTimeSemantics === "session_time" && (
-                      <div>
-                        {t("sessionManager.usageSessionTimeHint", {
-                          defaultValue: "Usage is aggregated by session time.",
-                        })}
-                      </div>
-                    )}
-                    {detailTimeSemantics === "unavailable" && (
-                      <div>
-                        {t("sessionManager.usageTimeUnavailableHint", {
-                          defaultValue: "Source time is unavailable.",
-                        })}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
         </div>
       )}
     </section>

@@ -18,11 +18,20 @@ import {
   type AgentTaskUsageRow,
   type AgentUsageCapability,
   type AgentUsageMeasure,
+  type AgentUsageSourceDimension,
   type AgentUsageAppType,
   type UsageRangeSelection,
 } from "@/types/usage";
 import { resolveUsageRange } from "@/lib/usageRange";
-import { fmtInt, fmtUsd, formatKnownTokenTotal } from "./format";
+import {
+  fmtInt,
+  formatKnownTokenTotal,
+  formatUsageCost,
+  formatUsageCostWithStatus,
+  isCodexReplayInProgress,
+  resolveUsageCostStatusForMeasure,
+} from "./format";
+import { UsageCostTooltip, UsageQualityTooltip } from "./UsageQualityTooltip";
 import { Button } from "@/components/ui/button";
 import {
   Command,
@@ -107,9 +116,14 @@ function nullableInteger(value: number | null | undefined) {
   return value == null ? "—" : fmtInt(value);
 }
 
-function displayCost(measure: AgentUsageMeasure | null) {
-  if (!measure || measure.totalCostUsd == null) return "—";
-  return fmtUsd(measure.totalCostUsd, 4, "—");
+function displayMeasureCost(
+  measure: AgentUsageMeasure | null,
+  sourceDimensions: AgentUsageSourceDimension[] | undefined,
+) {
+  return formatUsageCostWithStatus(
+    measure,
+    resolveUsageCostStatusForMeasure(measure, sourceDimensions),
+  );
 }
 
 function shortSessionId(row: AgentTaskUsageRow) {
@@ -152,10 +166,16 @@ function projectBasename(projectDir: string) {
 function taskProject(row: AgentTaskUsageRow) {
   const projectDir = row.root?.projectDir?.trim();
   if (!projectDir) return null;
-  return {
-    name: projectBasename(projectDir),
-    path: projectDir,
-  };
+  return projectBasename(projectDir);
+}
+
+function taskAgentProjectLabel(
+  row: AgentTaskUsageRow,
+  t: (key: string, options?: { defaultValue?: string }) => string,
+) {
+  const agent = agentLabel(row.appType, t);
+  const project = taskProject(row);
+  return project ? `${agent} - ${project}` : agent;
 }
 
 function rowKey(row: AgentTaskUsageRow) {
@@ -335,65 +355,12 @@ function hasUsageQualityDetails(row: AgentTaskUsageRow) {
   );
 }
 
-function hasUsageDetails(row: AgentTaskUsageRow) {
-  return row.descendantSessionCount > 0 || hasUsageQualityDetails(row);
-}
-
-function UsageDataDetails({
-  row,
-  t,
-}: {
-  row: AgentTaskUsageRow;
-  t: (key: string, options?: { defaultValue?: string }) => string;
-}) {
+function usageTimeSemantics(row: AgentTaskUsageRow) {
   const measures = [row.totalUsage, row.selfUsage, row.descendantUsage];
-  const partial = Boolean(
-    row.partial ||
-      row.warnings.length > 0 ||
-      measures.some((measure) => measure?.partial || measure?.warnings.length),
-  );
-  const timeSemantics = measures.find(
+  return measures.find(
     (measure) =>
       measure?.timeSemantics && measure.timeSemantics !== "event_time",
   )?.timeSemantics;
-
-  if (!partial && !timeSemantics) return null;
-
-  return (
-    <div
-      data-testid={`task-data-details-${rowKey(row)}`}
-      className="rounded-md border border-border/50 bg-muted/20 p-2 text-xs text-muted-foreground"
-    >
-      {partial && (
-        <div>
-          {t("usage.task.partialHint", {
-            defaultValue: "Some usage fields are partial or unavailable.",
-          })}
-        </div>
-      )}
-      {timeSemantics === "sync_window_end" && (
-        <div className="mt-1">
-          {t("usage.task.syncWindowHint", {
-            defaultValue: "Sync-window increment; not per-request.",
-          })}
-        </div>
-      )}
-      {timeSemantics === "session_time" && (
-        <div className="mt-1">
-          {t("usage.task.sessionTimeHint", {
-            defaultValue: "Usage is aggregated by session time.",
-          })}
-        </div>
-      )}
-      {timeSemantics === "unavailable" && (
-        <div className="mt-1">
-          {t("usage.task.timeUnavailableHint", {
-            defaultValue: "Source time is unavailable.",
-          })}
-        </div>
-      )}
-    </div>
-  );
 }
 
 function TaskUsageDetails({
@@ -408,10 +375,7 @@ function TaskUsageDetails({
   t: (key: string, options?: { defaultValue?: string }) => string;
 }) {
   const key = rowKey(row);
-  const descendantEvidence = row.descendantSessionCount > 0;
-  const qualityDetails = hasUsageQualityDetails(row);
-
-  if (!hasUsageDetails(row)) return null;
+  if (row.descendantSessionCount <= 0) return null;
 
   return (
     <div className="mt-2 border-t border-border/50 pt-2">
@@ -429,23 +393,12 @@ function TaskUsageDetails({
         ) : (
           <ChevronDown className="h-3.5 w-3.5" />
         )}
-        {descendantEvidence
-          ? t("usage.task.viewBreakdown", {
-              defaultValue: "Self / descendants",
-            })
-          : t(
-              expanded
-                ? "usage.task.dataDetailsClose"
-                : "usage.task.dataDetails",
-              {
-                defaultValue: expanded ? "Hide data details" : "Data details",
-              },
-            )}
-        {descendantEvidence && (
-          <span className="text-muted-foreground">
-            ({row.descendantSessionCount})
-          </span>
-        )}
+        {t("usage.task.viewBreakdown", {
+          defaultValue: "Self / descendants",
+        })}
+        <span className="text-muted-foreground">
+          ({row.descendantSessionCount})
+        </span>
       </Button>
       {expanded && (
         <div
@@ -453,23 +406,30 @@ function TaskUsageDetails({
           className="mt-2 space-y-2"
           data-testid={`task-details-${key}`}
         >
-          {qualityDetails && <UsageDataDetails row={row} t={t} />}
-          {descendantEvidence && (
-            <div data-testid={`task-breakdown-${key}`} className="space-y-2">
-              <MeasureBreakdown
-                label={t("usage.task.self", { defaultValue: "Self" })}
-                measure={row.selfUsage}
-                t={t}
-              />
-              <MeasureBreakdown
-                label={t("usage.task.descendants", {
-                  defaultValue: "Descendants",
-                })}
-                measure={row.descendantUsage}
-                t={t}
-              />
-            </div>
-          )}
+          <div data-testid={`task-breakdown-${key}`} className="space-y-2">
+            <MeasureBreakdown
+              label={t("usage.task.self", { defaultValue: "Self" })}
+              measure={row.selfUsage}
+              sourceDimensions={row.sourceDimensions}
+              t={t}
+            />
+            <MeasureBreakdown
+              label={t("usage.task.descendants", {
+                defaultValue: "Descendants",
+              })}
+              measure={row.descendantUsage}
+              emptyMessage={
+                row.descendantUsageStatus === "no_activity_in_range"
+                  ? t("usage.task.noDescendantActivity", {
+                      defaultValue:
+                        "No descendant activity in the selected time range",
+                    })
+                  : undefined
+              }
+              sourceDimensions={row.sourceDimensions}
+              t={t}
+            />
+          </div>
         </div>
       )}
     </div>
@@ -479,20 +439,31 @@ function TaskUsageDetails({
 function MeasureBreakdown({
   label,
   measure,
+  emptyMessage,
+  sourceDimensions,
   t,
 }: {
   label: string;
   measure: AgentUsageMeasure | null;
+  emptyMessage?: string;
+  sourceDimensions: AgentUsageSourceDimension[];
   t: (key: string, options?: { defaultValue?: string }) => string;
 }) {
   if (!measure) {
     return (
       <div className="rounded-md border border-border/50 bg-muted/20 p-2 text-xs text-muted-foreground">
         <span className="font-medium text-foreground">{label}:</span>{" "}
-        {t("usage.task.unavailable", { defaultValue: "Usage unavailable" })}
+        {emptyMessage ??
+          t("usage.task.unavailable", { defaultValue: "Usage unavailable" })}
       </div>
     );
   }
+
+  const costStatus = resolveUsageCostStatusForMeasure(
+    measure,
+    sourceDimensions,
+  );
+  const replayInProgress = isCodexReplayInProgress(sourceDimensions);
 
   return (
     <div className="rounded-md border border-border/50 bg-muted/20 p-2 text-xs">
@@ -521,7 +492,13 @@ function MeasureBreakdown({
       </div>
       <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground">
         <span>
-          {t("usage.cost", { defaultValue: "Cost" })}: {displayCost(measure)}
+          {t("usage.cost", { defaultValue: "Cost" })}:{" "}
+          <UsageCostTooltip
+            status={costStatus}
+            replayInProgress={replayInProgress}
+          >
+            {displayMeasureCost(measure, sourceDimensions)}
+          </UsageCostTooltip>
         </span>
         <span>
           {measure.requestCount == null ? "—" : fmtInt(measure.requestCount)}{" "}
@@ -546,38 +523,33 @@ function TaskUsageRowView({
   const key = rowKey(row);
   const title = taskTitle(row, t);
   const titleTooltip = taskTitleTooltip(row);
-  const project = taskProject(row);
   const total = row.totalUsage;
+  const costStatus = resolveUsageCostStatusForMeasure(
+    total,
+    row.sourceDimensions,
+  );
+  const replayInProgress = isCodexReplayInProgress(row.sourceDimensions);
   const countLabel = total
     ? requestCountSemanticsLabel(total.requestCountSemantics, t)
     : requestCountSemanticsLabel("unavailable", t);
 
   return (
     <TableRow data-testid={`task-row-${key}`}>
-      <TableCell className="min-w-[220px] max-w-[360px] align-top">
-        <div className="truncate font-medium" title={titleTooltip}>
-          {title}
+      <TableCell className="min-w-[320px] max-w-[560px] align-top">
+        <div className="flex min-w-0 items-start gap-1.5">
+          <div className="min-w-0 truncate font-medium" title={titleTooltip}>
+            {title}
+          </div>
+          <UsageQualityTooltip
+            partial={hasUsageQualityDetails(row)}
+            timeSemantics={usageTimeSemantics(row)}
+            costStatus={costStatus}
+            replayInProgress={replayInProgress}
+          />
         </div>
-        <div className="mt-1 text-xs text-muted-foreground">
-          {agentLabel(row.appType, t)}
+        <div className="mt-1 truncate text-xs text-muted-foreground">
+          {taskAgentProjectLabel(row, t)}
         </div>
-      </TableCell>
-      <TableCell className="min-w-[200px] max-w-[360px] align-top">
-        {project ? (
-          <>
-            <div className="truncate font-medium" title={project.path}>
-              {project.name}
-            </div>
-            <div
-              className="mt-1 break-all text-xs text-muted-foreground"
-              title={project.path}
-            >
-              {project.path}
-            </div>
-          </>
-        ) : (
-          <span className="text-muted-foreground">—</span>
-        )}
       </TableCell>
       <TableCell className="min-w-[170px] align-top">
         <div className="font-semibold tabular-nums">
@@ -587,7 +559,12 @@ function TaskUsageRowView({
           </span>
         </div>
         <div className="mt-1 text-xs text-muted-foreground">
-          {displayCost(total)}
+          <UsageCostTooltip
+            status={costStatus}
+            replayInProgress={replayInProgress}
+          >
+            {formatUsageCost(total, row.sourceDimensions)}
+          </UsageCostTooltip>
         </div>
         <TaskUsageDetails
           row={row}
@@ -618,8 +595,12 @@ function TaskUsageCardView({
   const key = rowKey(row);
   const title = taskTitle(row, t);
   const titleTooltip = taskTitleTooltip(row);
-  const project = taskProject(row);
   const total = row.totalUsage;
+  const costStatus = resolveUsageCostStatusForMeasure(
+    total,
+    row.sourceDimensions,
+  );
+  const replayInProgress = isCodexReplayInProgress(row.sourceDimensions);
   const countLabel = total
     ? requestCountSemanticsLabel(total.requestCountSemantics, t)
     : requestCountSemanticsLabel("unavailable", t);
@@ -631,25 +612,23 @@ function TaskUsageCardView({
     >
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
-          <div
-            className="line-clamp-2 break-words font-medium"
-            title={titleTooltip}
-          >
-            {title}
-          </div>
-          <div className="mt-1 text-xs text-muted-foreground">
-            {agentLabel(row.appType, t)}
-          </div>
-          {project ? (
-            <div className="mt-2 min-w-0" title={project.path}>
-              <div className="truncate font-medium">{project.name}</div>
-              <div className="mt-1 break-all text-xs text-muted-foreground">
-                {project.path}
-              </div>
+          <div className="flex min-w-0 items-start gap-1.5">
+            <div
+              className="line-clamp-2 min-w-0 break-words font-medium"
+              title={titleTooltip}
+            >
+              {title}
             </div>
-          ) : (
-            <div className="mt-2 text-xs text-muted-foreground">—</div>
-          )}
+            <UsageQualityTooltip
+              partial={hasUsageQualityDetails(row)}
+              timeSemantics={usageTimeSemantics(row)}
+              costStatus={costStatus}
+              replayInProgress={replayInProgress}
+            />
+          </div>
+          <div className="mt-1 truncate text-xs text-muted-foreground">
+            {taskAgentProjectLabel(row, t)}
+          </div>
         </div>
       </div>
 
@@ -670,7 +649,12 @@ function TaskUsageCardView({
             {t("usage.cost", { defaultValue: "Cost" })}
           </div>
           <div className="mt-1 truncate font-semibold tabular-nums">
-            {displayCost(total)}
+            <UsageCostTooltip
+              status={costStatus}
+              replayInProgress={replayInProgress}
+            >
+              {formatUsageCost(total, row.sourceDimensions)}
+            </UsageCostTooltip>
           </div>
         </div>
         <div className="min-w-0">
@@ -764,7 +748,6 @@ export function TaskUsageTable({
   const projectOptions = (filterOptions?.projects ?? []).map((option) => ({
     value: option.projectDir,
     label: projectBasename(option.projectDir),
-    description: option.projectDir,
   }));
 
   const rows = data?.items ?? [];
@@ -787,11 +770,7 @@ export function TaskUsageTable({
   useEffect(() => {
     setTitle("");
     setProjectDir("");
-  }, [
-    agentAppType,
-    queryRange.startAt,
-    queryRange.endAt,
-  ]);
+  }, [agentAppType, queryRange.startAt, queryRange.endAt]);
 
   const toggleExpanded = (key: string) => {
     setExpandedRows((current) =>
@@ -941,9 +920,6 @@ export function TaskUsageTable({
                       {t("usage.task.task", { defaultValue: "Task" })}
                     </TableHead>
                     <TableHead>
-                      {t("usage.task.project", { defaultValue: "Project" })}
-                    </TableHead>
-                    <TableHead>
                       {t("usage.task.total", { defaultValue: "Derived total" })}
                     </TableHead>
                     <TableHead className="text-right">
@@ -955,7 +931,7 @@ export function TaskUsageTable({
                   {rows.length === 0 ? (
                     <TableRow>
                       <TableCell
-                        colSpan={4}
+                        colSpan={3}
                         className="h-32 text-center text-muted-foreground"
                       >
                         {t("usage.task.empty", {
