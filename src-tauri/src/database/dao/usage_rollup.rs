@@ -576,7 +576,9 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
-        assert_eq!(row, (70, 10, 20, 2));
+        // Total-inclusive input counts cache reads but keeps cache creation as
+        // its own component, so fresh input is 100 - 10 rather than 100 - 10 - 20.
+        assert_eq!(row, (90, 10, 20, 2));
 
         Ok(())
     }

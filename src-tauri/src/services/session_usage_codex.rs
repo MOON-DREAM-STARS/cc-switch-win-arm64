@@ -157,6 +157,45 @@ fn has_codex_storage_session_log_on_conn(
         .map_err(|error| AppError::Database(format!("读取 Codex 重放会话明细失败: {error}")))
 }
 
+/// Reserve a proxy request for this Codex canonical event immediately in the
+/// caller-owned transaction.  The matching SQL excludes rows with a proxy
+/// coverage marker, so writing the reservation before moving to the next event
+/// makes duplicate fingerprints in one batch claim distinct proxy rows (or
+/// fall back to a native compatibility row when no proxy row remains).
+///
+/// This intentionally runs on the same transaction as the canonical fact.  A
+/// later fact/coverage/cursor failure therefore rolls the reservation back with
+/// the rest of the batch instead of leaving an orphan marker.
+fn reserve_codex_proxy_coverage_on_conn(
+    conn: &Connection,
+    storage: CodexStorage,
+    request_id: &str,
+    session_id: &str,
+    marked_at: i64,
+) -> Result<(), AppError> {
+    let sql = format!(
+        "INSERT INTO {} (
+             app_type, data_source, request_id, canonical_session_id, marked_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(app_type, data_source, request_id) DO UPDATE SET
+             canonical_session_id = excluded.canonical_session_id,
+             marked_at = excluded.marked_at",
+        storage.coverage_table()
+    );
+    conn.execute(
+        &sql,
+        rusqlite::params![
+            storage.app_type(),
+            storage.coverage_source("proxy"),
+            request_id,
+            session_id,
+            marked_at
+        ],
+    )
+    .map_err(|error| AppError::Database(format!("写入 Codex 代理覆盖预留失败: {error}")))?;
+    Ok(())
+}
+
 /// 累计 token 用量（跟踪 total_token_usage 字段）
 #[derive(Debug, Clone, Default)]
 struct CumulativeTokens {
@@ -719,17 +758,17 @@ fn finish_codex_replay_if_ready(db: &Database, result: &SessionSyncResult) -> Re
         return Ok(());
     }
     let conn = lock_conn!(db.conn);
-    let staged_nodes: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM codex_replay_nodes",
+    // A replay is eligible when the scan is complete and it produced at least
+    // one durable, parsed session identity.  Rollups are intentionally not a
+    // requirement: valid metadata-only/zero-usage rollouts still need to
+    // publish their node generation and transition out of `replaying`.
+    let valid_identity_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM codex_replay_nodes
+         WHERE app_type = 'codex_replay' AND TRIM(COALESCE(session_id, '')) <> ''",
         [],
         |row| row.get(0),
     )?;
-    let staged_rollups: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM codex_replay_rollups",
-        [],
-        |row| row.get(0),
-    )?;
-    if staged_nodes == 0 || staged_rollups == 0 {
+    if valid_identity_count == 0 {
         return Ok(());
     }
     conn.execute("SAVEPOINT publish_codex_replay", [])
@@ -775,14 +814,43 @@ fn finish_codex_replay_if_ready(db: &Database, result: &SessionSyncResult) -> Re
 }
 
 /// Explicit manual rebuild shares the automatic replay state machine.
-pub fn rebuild_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
+/// Execute the explicit Codex rebuild.  `create_backup` is false only when a
+/// higher-level provider-scoped rebuild has already taken the single safety
+/// backup for the whole operation.  The replay state machine itself remains
+/// unchanged: parsing happens in the shadow generation and publication only
+/// occurs after a complete, eligible scan.
+pub(crate) fn rebuild_codex_usage_with_backup(
+    db: &Database,
+    create_backup: bool,
+) -> Result<SessionSyncResult, AppError> {
     let codex_dir = get_codex_config_dir();
     readable_codex_files(&codex_dir)?;
-    db.backup_database_file()?;
+    if create_backup {
+        db.backup_database_file()?;
+    }
     reset_codex_usage_and_mark_replaying(db)?;
     let result = sync_codex_usage_to_storage(db, CodexStorage::Replay)?;
     finish_codex_replay_if_ready(db, &result)?;
     Ok(result)
+}
+
+pub fn rebuild_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
+    rebuild_codex_usage_with_backup(db, true)
+}
+
+/// Source-only preflight used by the provider-scoped rebuild command.  It is
+/// intentionally read-only and does not touch replay state or the database.
+pub(crate) fn preflight_codex_usage() -> Result<(), AppError> {
+    let codex_dir = get_codex_config_dir();
+    readable_codex_files(&codex_dir).map(|_| ())
+}
+
+/// Report whether the most recent Codex replay reached the published state.
+/// A scan with errors, deferred files, or no valid identity leaves the state in
+/// `replaying`, allowing the caller to return `keptPrevious` without replacing
+/// the live generation.
+pub(crate) fn codex_rebuild_is_published(db: &Database) -> Result<bool, AppError> {
+    Ok(codex_replay_state(db)? == CODEX_REPLAY_COMPLETE)
 }
 
 impl Database {
@@ -2518,7 +2586,6 @@ fn sync_single_codex_file(
         let mut batch_suspected = 0u32;
         let mut canonical_observations: HashMap<CodexFactKey, CodexFactAccumulator> =
             HashMap::new();
-        let mut proxy_coverage: Vec<(String, String, i64)> = Vec::new();
         for (event, event_index) in batch {
             let request_id =
                 format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{root_thread_id}:{event_index}");
@@ -2562,6 +2629,19 @@ fn sync_single_codex_file(
                     &dedup_key,
                 )?
             };
+            if let Some(proxy_request_id) = matched_proxy.as_deref() {
+                // Reserve before looking at the next event.  The reservation
+                // is visible to this transaction's subsequent matcher call,
+                // which prevents two same-batch events from claiming one
+                // proxy row while still allowing a second proxy row to match.
+                reserve_codex_proxy_coverage_on_conn(
+                    &tx,
+                    storage,
+                    proxy_request_id,
+                    root_thread_id,
+                    created_at,
+                )?;
+            }
             let inserted_compatibility_row = if matched_proxy.is_some() {
                 false
             } else {
@@ -2588,40 +2668,12 @@ fn sync_single_codex_file(
                 remember_request_precision(&request_id, event.precision);
                 let aggregate = canonical_observations.entry(fact_key).or_default();
                 merge_codex_fact_accumulator(aggregate, fact_observation);
-                if let Some(proxy_request_id) = matched_proxy {
-                    proxy_coverage.push((
-                        proxy_request_id,
-                        root_thread_id.to_string(),
-                        created_at,
-                    ));
-                }
                 batch_imported = batch_imported.saturating_add(1);
             } else {
                 batch_skipped = batch_skipped.saturating_add(1);
             }
         }
         persist_codex_facts_on_conn(&tx, canonical_observations, storage)?;
-        for (request_id, session_id, marked_at) in proxy_coverage {
-            let sql = format!(
-                "INSERT INTO {} (
-                     app_type, data_source, request_id, canonical_session_id, marked_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(app_type, data_source, request_id) DO UPDATE SET
-                     canonical_session_id = excluded.canonical_session_id,
-                     marked_at = excluded.marked_at",
-                storage.coverage_table()
-            );
-            tx.execute(
-                &sql,
-                rusqlite::params![
-                    storage.app_type(),
-                    storage.coverage_source("proxy"),
-                    request_id,
-                    session_id,
-                    marked_at
-                ],
-            )?;
-        }
         if is_last_batch {
             // 游标推进与最后一批数据同事务提交：中途崩溃时两者一起回滚，
             // 不会出现"游标已推进但数据缺失"的丢数据窗口。
@@ -3782,6 +3834,182 @@ mod tests {
         )?;
         let conn = lock_conn!(db.conn);
         assert_eq!(codex_replay_state_on_conn(&conn)?, CODEX_REPLAY_COMPLETE);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn metadata_only_replay_publishes_without_rollup() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        reset_codex_usage_and_mark_replaying(&db)?;
+
+        // A scan with no parsed identity must not replace the published
+        // generation, even when it has no explicit deferred/error marker.
+        finish_codex_replay_if_ready(
+            &db,
+            &SessionSyncResult {
+                files_scanned: 1,
+                ..Default::default()
+            },
+        )?;
+        {
+            let conn = lock_conn!(db.conn);
+            assert_eq!(codex_replay_state_on_conn(&conn)?, CODEX_REPLAYING);
+        }
+
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO codex_replay_nodes (
+                     app_type, session_id, root_session_id, node_kind,
+                     relation_confidence, title, source_path, last_synced_at
+                 ) VALUES ('codex_replay', 'metadata-only', 'metadata-only', 'root',
+                           'explicit', 'Metadata only', '/codex/rollout.jsonl', 1)",
+                [],
+            )?;
+        }
+
+        finish_codex_replay_if_ready(
+            &db,
+            &SessionSyncResult {
+                files_scanned: 1,
+                ..Default::default()
+            },
+        )?;
+
+        let conn = lock_conn!(db.conn);
+        assert_eq!(codex_replay_state_on_conn(&conn)?, CODEX_REPLAY_COMPLETE);
+        let published_nodes: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_nodes
+             WHERE app_type = 'codex' AND session_id = 'metadata-only'",
+            [],
+            |row| row.get(0),
+        )?;
+        let published_rollups: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_usage_rollups
+             WHERE app_type = 'codex' AND session_id = 'metadata-only'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(published_nodes, 1);
+        assert_eq!(published_rollups, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_proxy_reservation_is_immediate_and_distinct_per_event() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let file = rollout_path(temp.path(), PARENT_ID);
+        let first_time = "2026-07-10T03:00:02Z";
+        let second_time = "2026-07-10T03:00:03Z";
+        {
+            let conn = lock_conn!(db.conn);
+            for request_id in ["proxy-match-a", "proxy-match-b"] {
+                conn.execute(
+                    "INSERT INTO proxy_request_logs (
+                        request_id, provider_id, app_type, model, request_model,
+                        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                        total_cost_usd, latency_ms, status_code, created_at, data_source
+                    ) VALUES (?, 'openai', 'codex', 'gpt-5.6-sol', 'gpt-5.6-sol',
+                              10, 2, 1, 0, '0.01', 100, 200, ?, 'proxy')",
+                    rusqlite::params![
+                        request_id,
+                        DateTime::parse_from_rfc3339(first_time)
+                            .expect("valid proxy timestamp")
+                            .timestamp()
+                    ],
+                )?;
+            }
+        }
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                // Different cumulative totals make these two events distinct
+                // snapshots, while each exact request delta matches both proxy
+                // rows in the ten-minute dedup window.
+                token_count_with_last_at(100, 10, 20, 10, 1, 2, "codex", first_time),
+                token_count_with_last_at(200, 20, 40, 10, 1, 2, "codex", second_time),
+            ],
+        );
+
+        let result = sync_test_file(&db, &file, &[&file])?;
+        assert_eq!(result.imported, 2);
+        let conn = lock_conn!(db.conn);
+        let claimed = conn
+            .prepare(
+                "SELECT request_id FROM agent_session_canonical_coverage
+                 WHERE app_type = 'codex' AND data_source = 'proxy'
+                 ORDER BY request_id",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            claimed,
+            vec!["proxy-match-a".to_string(), "proxy-match-b".to_string()]
+        );
+        let (request_count, input_tokens): (i64, i64) = conn.query_row(
+            "SELECT request_count, input_tokens
+             FROM agent_session_usage_rollups
+             WHERE app_type = 'codex' AND data_source = 'codex_session'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!((request_count, input_tokens), (2, 20));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_proxy_reservation_rolls_back_when_fact_write_fails() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let file = rollout_path(temp.path(), PARENT_ID);
+        let event_time = "2026-07-10T03:00:02Z";
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, request_model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    total_cost_usd, latency_ms, status_code, created_at, data_source
+                ) VALUES ('proxy-failing-fact', 'openai', 'codex', 'gpt-5.6-sol',
+                          'gpt-5.6-sol', 10, 2, 1, 0, '0.01', 100, 200, ?, 'proxy')",
+                [DateTime::parse_from_rfc3339(event_time)
+                    .expect("valid proxy timestamp")
+                    .timestamp()],
+            )?;
+            conn.execute_batch(
+                "CREATE TRIGGER fail_codex_fact BEFORE INSERT ON agent_session_usage_rollups
+                 WHEN NEW.app_type = 'codex'
+                 BEGIN SELECT RAISE(ABORT, 'forced Codex fact failure'); END;",
+            )?;
+        }
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count_at(10, 1, 2, event_time),
+            ],
+        );
+
+        let error = sync_test_file(&db, &file, &[&file])
+            .expect_err("fact failure must abort the batch transaction");
+        assert!(error.to_string().contains("forced Codex fact failure"));
+        let conn = lock_conn!(db.conn);
+        let proxy_coverage: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_canonical_coverage
+             WHERE app_type = 'codex' AND data_source = 'proxy'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(proxy_coverage, 0);
         Ok(())
     }
 

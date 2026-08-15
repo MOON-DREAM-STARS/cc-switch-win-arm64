@@ -24,6 +24,7 @@ pub mod session_usage_grokbuild;
 pub mod session_usage_hermes;
 pub mod session_usage_openclaw;
 pub mod session_usage_opencode;
+pub mod session_usage_rebuild;
 pub mod skill;
 pub mod speedtest;
 pub mod sql_helpers;

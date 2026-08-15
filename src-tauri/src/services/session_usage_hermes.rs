@@ -80,8 +80,11 @@ pub(crate) struct HermesUsageDelta {
     pub cost_delta_kind: CostDeltaKind,
     pub cost_status: Option<String>,
     pub cost_source: Option<String>,
-    pub first_seen: Option<i64>,
-    pub last_seen: Option<i64>,
+    /// Hermes source timestamps are normalized to milliseconds for node/UI
+    /// metadata. They are converted to Unix seconds only when facts are
+    /// persisted to `first_event_at`/`last_event_at`.
+    pub first_seen_ms: Option<i64>,
+    pub last_seen_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,8 +131,9 @@ pub(crate) struct HermesSessionIdentity {
     pub task: String,
     pub title: Option<String>,
     pub project_dir: Option<String>,
-    pub first_seen: Option<i64>,
-    pub last_seen: Option<i64>,
+    /// Source/UI timestamps remain milliseconds; facts use explicit seconds.
+    pub first_seen_ms: Option<i64>,
+    pub last_seen_ms: Option<i64>,
 }
 
 impl HermesSyncResult {
@@ -175,8 +179,8 @@ struct HermesSourceRow {
     actual_cost_usd: Option<Decimal>,
     cost_status: Option<String>,
     cost_source: Option<String>,
-    first_seen: Option<i64>,
-    last_seen: Option<i64>,
+    first_seen_ms: Option<i64>,
+    last_seen_ms: Option<i64>,
     selected_cost_usd: Option<Decimal>,
     selected_cost_kind: CostKind,
 }
@@ -281,8 +285,8 @@ pub(crate) fn hermes_standalone_session_claims(
                         "sqlite:{}#{}",
                         session.database_identity, session.session_id
                     )),
-                    created_at: session.first_seen,
-                    last_active_at: session.last_seen,
+                    created_at: session.first_seen_ms,
+                    last_active_at: session.last_seen_ms,
                     last_synced_at: result.observed_at,
                 },
             })
@@ -549,8 +553,8 @@ fn import_hermes_database(
             project_dir: native_metadata
                 .get(&row.session_id)
                 .and_then(|metadata| metadata.project_dir.clone()),
-            first_seen: row.first_seen,
-            last_seen: row.last_seen,
+            first_seen_ms: row.first_seen_ms,
+            last_seen_ms: row.last_seen_ms,
         })
         .collect::<Vec<_>>();
 
@@ -748,8 +752,8 @@ fn upsert_snapshot(
         cache_read_tokens: counters.cache_read_tokens,
         cache_write_tokens: counters.cache_write_tokens,
         reasoning_tokens: counters.reasoning_tokens,
-        first_seen: row.first_seen,
-        last_seen: row.last_seen,
+        first_seen: row.first_seen_ms,
+        last_seen: row.last_seen_ms,
         last_synced_at: observed_at,
         estimated_cost_usd: row
             .estimated_cost_usd
@@ -788,8 +792,8 @@ fn normalized_snapshot(
         cache_read_tokens: counters.cache_read_tokens,
         cache_write_tokens: counters.cache_write_tokens,
         reasoning_tokens: counters.reasoning_tokens,
-        first_seen: row.first_seen,
-        last_seen: row.last_seen,
+        first_seen: row.first_seen_ms,
+        last_seen: row.last_seen_ms,
         last_synced_at: observed_at,
         estimated_cost_usd: row
             .estimated_cost_usd
@@ -857,8 +861,8 @@ fn build_fact(
                 delta.emitted_cost_balance_usd,
             )
         }),
-        first_event_at: row.first_seen,
-        last_event_at: row.last_seen,
+        first_event_at: unix_seconds_from_timestamp_ms(row.first_seen_ms),
+        last_event_at: unix_seconds_from_timestamp_ms(row.last_seen_ms),
     }
 }
 
@@ -921,12 +925,20 @@ fn build_delta(
         cost_delta_kind: delta.cost_delta_kind,
         cost_status: row.cost_status.clone(),
         cost_source: row.cost_source.clone(),
-        first_seen: row.first_seen,
-        last_seen: row.last_seen,
+        first_seen_ms: row.first_seen_ms,
+        last_seen_ms: row.last_seen_ms,
     }
 }
 
-fn canonical_session_id(profile_id: &str, database_identity: &str, session_id: &str) -> String {
+/// Build the canonical Hermes usage/node ID shared by ingestion and Session
+/// Manager scanning. `session_id` remains the raw Hermes identity; only its
+/// digest is placed in the canonical key so path/profile identities cannot
+/// collide or leak into a user-facing ID.
+pub(crate) fn canonical_session_id(
+    profile_id: &str,
+    database_identity: &str,
+    session_id: &str,
+) -> String {
     format!(
         "hermes:{}:{}:{}",
         profile_id,
@@ -1158,8 +1170,8 @@ fn parse_source_row(row: &Row<'_>) -> Result<HermesSourceRow, AppError> {
         actual_cost_usd,
         cost_status,
         cost_source,
-        first_seen: optional_timestamp(row, 16)?,
-        last_seen: optional_timestamp(row, 17)?,
+        first_seen_ms: optional_timestamp_ms(row, 16)?,
+        last_seen_ms: optional_timestamp_ms(row, 17)?,
         selected_cost_usd,
         selected_cost_kind,
     })
@@ -1213,9 +1225,19 @@ fn optional_decimal(row: &Row<'_>, index: usize, name: &str) -> Result<Option<De
         .transpose()
 }
 
-fn optional_timestamp(row: &Row<'_>, index: usize) -> Result<Option<i64>, AppError> {
+/// Parse a Hermes source timestamp into milliseconds. The source accepts
+/// either Unix seconds/milliseconds or RFC3339 text; callers must keep the
+/// unit suffix explicit when routing it to node metadata versus facts.
+fn optional_timestamp_ms(row: &Row<'_>, index: usize) -> Result<Option<i64>, AppError> {
     let value = optional_text(row, index)?;
     Ok(value.and_then(|value| parse_timestamp_ms(&value)))
+}
+
+/// Canonical usage queries compare event boundaries as inclusive Unix
+/// seconds. Hermes node display metadata intentionally remains milliseconds,
+/// so this conversion is only used by `NormalizedUsageRollupFact` writes.
+fn unix_seconds_from_timestamp_ms(timestamp_ms: Option<i64>) -> Option<i64> {
+    timestamp_ms.map(|value| value.div_euclid(1_000))
 }
 
 fn parse_timestamp_ms(value: &str) -> Option<i64> {
@@ -1358,7 +1380,10 @@ fn digest_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn source_file_identity(path: &Path) -> Result<String, AppError> {
+/// Return the replacement-safe identity used to namespace a Hermes database.
+/// Session Manager must call this helper instead of reimplementing the
+/// platform-specific inode/file-index digest logic.
+pub(crate) fn source_file_identity(path: &Path) -> Result<String, AppError> {
     let metadata = fs::metadata(path).map_err(|error| AppError::io(path, error))?;
     let identity = {
         #[cfg(unix)]
@@ -1627,6 +1652,80 @@ mod tests {
     }
 
     #[test]
+    fn source_milliseconds_are_kept_for_nodes_but_facts_use_unix_seconds() {
+        assert_eq!(parse_timestamp_ms("1700000000"), Some(1_700_000_000_000));
+        assert_eq!(
+            parse_timestamp_ms("2023-11-14T22:13:20.250Z"),
+            Some(1_700_000_000_250)
+        );
+        let first_seen_ms = 1_700_000_000_250;
+        let last_seen_ms = 1_700_000_060_999;
+        let row = HermesSourceRow {
+            session_id: "s".into(),
+            model: "m".into(),
+            provider_id: "p".into(),
+            base_url_digest: "b".into(),
+            billing_mode: "chat".into(),
+            task: "task".into(),
+            api_call_count: 1,
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            estimated_cost_usd: None,
+            actual_cost_usd: None,
+            cost_status: None,
+            cost_source: None,
+            first_seen_ms: Some(first_seen_ms),
+            last_seen_ms: Some(last_seen_ms),
+            selected_cost_usd: None,
+            selected_cost_kind: CostKind::Unknown,
+        };
+        let delta = HermesSnapshotDelta {
+            api_call_count: 1,
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            cost_usd: None,
+            cost_baseline_usd: None,
+            emitted_cost_balance_usd: Decimal::ZERO,
+            cost_delta_kind: CostDeltaKind::None,
+        };
+
+        let fact = build_fact("source", "default", "database", &row, &delta, 1, 2);
+        assert_eq!(fact.first_event_at, Some(1_700_000_000));
+        assert_eq!(fact.last_event_at, Some(1_700_000_060));
+
+        let result = HermesSyncResult {
+            observed_at: 2,
+            sessions: vec![HermesSessionIdentity {
+                profile_id: "default".into(),
+                database_identity: "database".into(),
+                session_id: row.session_id,
+                canonical_session_id: canonical_session_id("default", "database", "s"),
+                model: row.model,
+                provider_id: row.provider_id,
+                base_url_digest: row.base_url_digest,
+                billing_mode: row.billing_mode,
+                task: row.task,
+                title: Some("Hermes".into()),
+                project_dir: Some("/workspace/hermes".into()),
+                first_seen_ms: Some(first_seen_ms),
+                last_seen_ms: Some(last_seen_ms),
+            }],
+            ..HermesSyncResult::default()
+        };
+        let claim = hermes_standalone_session_claims(&result)
+            .pop()
+            .expect("Hermes node claim");
+        assert_eq!(claim.metadata.created_at, Some(first_seen_ms));
+        assert_eq!(claim.metadata.last_active_at, Some(last_seen_ms));
+    }
+
+    #[test]
     fn delta_is_non_negative_and_cost_correction_is_bounded() {
         let previous = SnapshotCounters {
             api_call_count: 1,
@@ -1687,8 +1786,8 @@ mod tests {
             actual_cost_usd: None,
             cost_status: None,
             cost_source: None,
-            first_seen: None,
-            last_seen: None,
+            first_seen_ms: None,
+            last_seen_ms: None,
             selected_cost_usd: None,
             selected_cost_kind: CostKind::Unknown,
         };

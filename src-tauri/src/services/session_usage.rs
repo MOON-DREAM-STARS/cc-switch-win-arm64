@@ -22,11 +22,14 @@ use crate::services::agent_session_usage::{
     TimeSemantics, UsagePrecision,
 };
 use crate::services::usage_stats::{
-    effective_usage_log_filter, find_model_pricing, should_skip_session_insert, DedupKey,
+    effective_usage_log_filter, find_model_pricing,
+    has_matching_proxy_usage_coverage_for_session, session_insert_outcome,
+    session_insert_outcome_excluding_claimed, DedupKey, MatchingProxyUsageLog,
+    SessionInsertOutcome,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -398,6 +401,8 @@ struct PreparedClaudeMessage {
     request_id: String,
     message: ParsedAssistantUsage,
     raw_exists: bool,
+    matched_proxy: Option<MatchingProxyUsageLog>,
+    skip_raw: bool,
 }
 
 /// 同步 Claude Code 会话日志到使用统计数据库
@@ -846,6 +851,9 @@ fn sync_single_file_with_context(
 
     let mut rollups: HashMap<ClaudeRollupKey, NormalizedUsageRollupFact> = HashMap::new();
     let mut canonical_request_ids: HashMap<ClaudeRollupKey, Vec<String>> = HashMap::new();
+    let mut proxy_request_ids: HashMap<ClaudeRollupKey, Vec<MatchingProxyUsageLog>> =
+        HashMap::new();
+    let mut claimed_proxy_request_ids = HashSet::new();
     let mut prepared_messages = Vec::new();
     for parsed in messages.values() {
         let mut msg = parsed.clone();
@@ -875,7 +883,7 @@ fn sync_single_file_with_context(
             msg.message_id
         );
 
-        let (raw_exists, covered) = {
+        let (raw_exists, covered, matched_proxy, skip_raw) = {
             let conn = lock_conn!(db.conn);
             let raw_exists = claude_raw_request_exists(&conn, &request_id)?;
             let covered = Database::has_agent_session_canonical_coverage_on_conn(
@@ -884,9 +892,9 @@ fn sync_single_file_with_context(
                 "session_log",
                 &request_id,
             )?;
-            if !raw_exists && !covered && all_source_token_components_known(&msg) {
+            let dedup_key = all_source_token_components_known(&msg).then(|| {
                 let event_at = parsed_event_timestamp(&msg).expect("validated above");
-                let dedup_key = DedupKey {
+                DedupKey {
                     app_type: "claude",
                     model: &msg.model,
                     input_tokens: token_value_for_raw(msg.input_tokens),
@@ -894,13 +902,54 @@ fn sync_single_file_with_context(
                     cache_read_tokens: token_value_for_raw(msg.cache_read_tokens),
                     cache_creation_tokens: token_value_for_raw(msg.cache_creation_tokens),
                     created_at: event_at,
-                };
-                if should_skip_session_insert(&conn, &request_id, &dedup_key)? {
-                    skipped += 1;
-                    continue;
                 }
+            });
+            // A takeover deliberately has no native `session_log` raw row.
+            // Replay repair may suppress that row only when the *current*
+            // message fingerprint/time maps to its proxy coverage marker;
+            // another takeover in the same canonical session must not hide a
+            // normal covered message's missing raw row.
+            let skip_raw = if covered && !raw_exists {
+                match dedup_key.as_ref() {
+                    Some(key) => has_matching_proxy_usage_coverage_for_session(
+                        &conn,
+                        key,
+                        msg.session_id.as_deref().unwrap_or_default(),
+                    )?,
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if !raw_exists && !covered {
+                if let Some(dedup_key) = dedup_key {
+                    let matched_proxy = match session_insert_outcome_excluding_claimed(
+                        &conn,
+                        &request_id,
+                        &dedup_key,
+                        &claimed_proxy_request_ids,
+                    )? {
+                            SessionInsertOutcome::Insert => None,
+                            SessionInsertOutcome::ExistingRequest => {
+                                skipped += 1;
+                                continue;
+                            }
+                            SessionInsertOutcome::MatchedProxy(proxy) => {
+                                // A single proxy request can be fingerprint-identical
+                                // to multiple transcript rows in one batch.  The
+                                // matcher already excludes earlier claims, so this
+                                // insertion records the selected proxy row exactly once.
+                                claimed_proxy_request_ids.insert(proxy.request_id.clone());
+                                Some(proxy)
+                            }
+                        };
+                    (raw_exists, covered, matched_proxy, skip_raw)
+                } else {
+                    (raw_exists, covered, None, skip_raw)
+                }
+            } else {
+                (raw_exists, covered, None, skip_raw)
             }
-            (raw_exists, covered)
         };
 
         // Existing raw rows are only repaired/covered when a durable fact is
@@ -924,37 +973,32 @@ fn sync_single_file_with_context(
                 .entry(rollup_key)
                 .or_default()
                 .push(request_id.clone());
+            if let Some(proxy) = matched_proxy.as_ref() {
+                proxy_request_ids
+                    .entry(claude_rollup_key(fact))
+                    .or_default()
+                    .push(proxy.clone());
+            }
         }
         prepared_messages.push(PreparedClaudeMessage {
             request_id,
             message: msg,
             raw_exists,
+            matched_proxy,
+            skip_raw,
         });
     }
 
-    if !rollups.is_empty() {
-        flush_claude_rollups(db, rollups, canonical_request_ids)?;
-    }
-
-    for prepared in prepared_messages {
-        if prepared.raw_exists {
-            skipped += 1;
-            continue;
-        }
-        // A newly admitted raw row is inserted only after the fact+marker
-        // transaction above has committed.  This ordering makes an unsafe
-        // unmarked raw row impossible even if the legacy insert fails.
-        match insert_session_log_entry(db, &prepared.request_id, &prepared.message) {
-            Ok(true) => imported += 1,
-            Ok(false) => skipped += 1,
-            Err(error) => {
-                log::warn!(
-                    "[SESSION-SYNC] 插入失败 ({}): {error}",
-                    prepared.message.message_id
-                );
-                skipped += 1;
-            }
-        }
+    if !prepared_messages.is_empty() {
+        let (new_imported, new_skipped) = flush_claude_rollups(
+            db,
+            rollups,
+            canonical_request_ids,
+            proxy_request_ids,
+            &prepared_messages,
+        )?;
+        imported = imported.saturating_add(new_imported);
+        skipped = skipped.saturating_add(new_skipped);
     }
 
     // Advance the cursor only after the durable session buckets have been
@@ -1141,7 +1185,9 @@ fn flush_claude_rollups(
     db: &Database,
     rollups: HashMap<ClaudeRollupKey, NormalizedUsageRollupFact>,
     canonical_request_ids: HashMap<ClaudeRollupKey, Vec<String>>,
-) -> Result<(), AppError> {
+    proxy_request_ids: HashMap<ClaudeRollupKey, Vec<MatchingProxyUsageLog>>,
+    prepared_messages: &[PreparedClaudeMessage],
+) -> Result<(u32, u32), AppError> {
     let conn = lock_conn!(db.conn);
     let tx = conn.unchecked_transaction().map_err(|error| {
         AppError::Database(format!("开启 Claude canonical 覆盖事务失败: {error}"))
@@ -1252,11 +1298,52 @@ fn flush_claude_rollups(
                 Database::upsert_agent_session_canonical_coverage_on_conn(&tx, &marker)?;
             }
         }
+        if let Some(proxy_matches) = proxy_request_ids.get(&key) {
+            for proxy in proxy_matches {
+                // The proxy row is retained as the global request record, but
+                // this marker makes the native transcript's canonical bucket
+                // the sole session/task owner.  Use the row's stored app type
+                // (Claude Desktop may be `claude-desktop`) so the marker key
+                // matches the raw row exactly.
+                let marker = AgentSessionCanonicalCoverageMarker {
+                    app_type: proxy.app_type.clone(),
+                    data_source: "proxy".to_string(),
+                    request_id: proxy.request_id.clone(),
+                    canonical_session_id: Some(merged.session_id.clone()),
+                    marked_at,
+                };
+                Database::upsert_agent_session_canonical_coverage_on_conn(&tx, &marker)?;
+            }
+        }
+    }
+
+    // Raw compatibility rows, canonical facts, and both source coverage
+    // markers share this transaction.  A matched proxy event intentionally
+    // skips its duplicate native raw row while still publishing the fact and
+    // markers above.  Existing source rows remain idempotent no-ops.
+    let mut imported = 0u32;
+    let mut skipped = 0u32;
+    for prepared in prepared_messages {
+        if prepared.raw_exists || prepared.matched_proxy.is_some() || prepared.skip_raw {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
+        match insert_session_log_entry_on_conn(&tx, &prepared.request_id, &prepared.message, false)
+        {
+            Ok(true) => imported = imported.saturating_add(1),
+            Ok(false) => skipped = skipped.saturating_add(1),
+            Err(error) => {
+                return Err(AppError::Database(format!(
+                    "插入 Claude 会话日志失败 ({}): {error}",
+                    prepared.message.message_id
+                )));
+            }
+        }
     }
     tx.commit().map_err(|error| {
         AppError::Database(format!("提交 Claude canonical 覆盖事务失败: {error}"))
     })?;
-    Ok(())
+    Ok((imported, skipped))
 }
 
 /// 获取 session_log_sync 表中某条目的同步进度。
@@ -1341,7 +1428,19 @@ fn insert_session_log_entry(
     msg: &ParsedAssistantUsage,
 ) -> Result<bool, AppError> {
     let conn = lock_conn!(db.conn);
+    insert_session_log_entry_on_conn(&conn, request_id, msg, true)
+}
 
+/// Connection-scoped Claude raw writer used by the canonical transaction.
+/// `check_dedup` remains enabled for the standalone compatibility helper but
+/// is disabled after the batch arbitration has already reserved a message's
+/// outcome under the same transaction.
+fn insert_session_log_entry_on_conn(
+    conn: &rusqlite::Connection,
+    request_id: &str,
+    msg: &ParsedAssistantUsage,
+    check_dedup: bool,
+) -> Result<bool, AppError> {
     let created_at = parsed_event_timestamp(msg).ok_or_else(|| {
         AppError::InvalidInput("Claude session log 缺少 RFC3339 event timestamp".into())
     })?;
@@ -1361,8 +1460,12 @@ fn insert_session_log_entry(
         cache_creation_tokens: token_value_for_raw(msg.cache_creation_tokens),
         created_at,
     };
-    if all_source_token_components_known(msg)
-        && should_skip_session_insert(&conn, request_id, &dedup_key)?
+    if check_dedup
+        && all_source_token_components_known(msg)
+        && !matches!(
+            session_insert_outcome(conn, request_id, &dedup_key)?,
+            SessionInsertOutcome::Insert
+        )
     {
         return Ok(false);
     }
@@ -1487,6 +1590,7 @@ pub fn get_data_source_breakdown(db: &Database) -> Result<Vec<DataSourceSummary>
 mod tests {
     use super::*;
     use crate::services::usage_stats::effective_session_usage_log_filter;
+    use std::io::Write;
 
     #[test]
     fn sync_result_notification_is_coalesced_to_one_call() {
@@ -1582,8 +1686,8 @@ mod tests {
             cost_delta_kind: crate::services::session_usage_hermes::CostDeltaKind::None,
             cost_status: None,
             cost_source: None,
-            first_seen: Some(100),
-            last_seen: Some(200),
+            first_seen_ms: Some(100),
+            last_seen_ms: Some(200),
         };
         let detailed = crate::services::session_usage_hermes::HermesSyncResult {
             profiles_scanned: 3,
@@ -1800,6 +1904,349 @@ mod tests {
         })?;
         assert_eq!(count, 1);
 
+        Ok(())
+    }
+
+    #[test]
+    fn claude_proxy_takeover_writes_canonical_and_both_coverage_markers() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, request_model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    total_cost_usd, latency_ms, status_code, session_id, created_at, data_source
+                ) VALUES ('proxy-null-session', 'gateway', 'claude', 'fixture-unknown',
+                          'fixture-unknown', 100, 20, 10, 5, '0.10', 0, 200, NULL, 1000, 'proxy')",
+                [],
+            )?;
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "cc-switch-claude-proxy-takeover-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let projects = tmp.join("projects");
+        let project = projects.join("fixture-project");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("takeover.jsonl");
+        let line = r#"{"type":"assistant","sessionId":"takeover-session","timestamp":"1970-01-01T00:16:45Z","message":{"id":"takeover-msg","model":"fixture-unknown","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":10,"cache_creation_input_tokens":5},"stop_reason":"end_turn"}}"#;
+        fs::write(&path, format!("{line}\n")).unwrap();
+
+        let first = sync_claude_files(&db, &projects)?;
+        assert_eq!(
+            first.imported, 0,
+            "the duplicate native raw row is suppressed"
+        );
+
+        let conn = lock_conn!(db.conn);
+        let raw_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE app_type = 'claude'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            raw_count, 1,
+            "the original proxy raw row remains the only raw row"
+        );
+        let native_raw_exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM proxy_request_logs WHERE request_id = 'session:takeover-msg'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(!native_raw_exists);
+
+        let rollup: (i64, i64, i64, i64) = conn.query_row(
+            "SELECT request_count, input_tokens, output_tokens, cache_read_tokens
+             FROM agent_session_usage_rollups
+             WHERE app_type = 'claude' AND session_id = 'takeover-session'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(rollup, (1, 100, 20, 10));
+
+        let session_marker: (String, Option<String>) = conn.query_row(
+            "SELECT data_source, canonical_session_id
+             FROM agent_session_canonical_coverage
+             WHERE app_type = 'claude' AND request_id = 'session:takeover-msg'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            session_marker,
+            ("session_log".into(), Some("takeover-session".into()))
+        );
+        let proxy_marker: (String, Option<String>) = conn.query_row(
+            "SELECT data_source, canonical_session_id
+             FROM agent_session_canonical_coverage
+             WHERE app_type = 'claude' AND request_id = 'proxy-null-session'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            proxy_marker,
+            ("proxy".into(), Some("takeover-session".into()))
+        );
+
+        // Global raw usage remains exactly one request, while the task/session
+        // query owns the canonical transcript bucket.
+        let effective_filter = effective_usage_log_filter("l");
+        let visible_global: (i64, i64) = conn.query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0)
+                 FROM proxy_request_logs l
+                 WHERE {effective_filter} AND l.app_type = 'claude'"
+            ),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(visible_global, (1, 100));
+
+        drop(conn);
+        // Force a cursor replay with the same source message.  The takeover's
+        // proxy marker must suppress raw repair and preserve one canonical
+        // request, even though the transcript line is seen again.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(format!("{line}\n").as_bytes())
+            .unwrap();
+        let second = sync_claude_files(&db, &projects)?;
+        assert_eq!(second.imported, 0);
+        let conn = lock_conn!(db.conn);
+        let repeat_rollup_count: i64 = conn.query_row(
+            "SELECT request_count FROM agent_session_usage_rollups
+             WHERE app_type = 'claude' AND session_id = 'takeover-session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(repeat_rollup_count, 1);
+        let repeat_raw_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE app_type = 'claude'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(repeat_raw_count, 1);
+
+        drop(conn);
+        fs::remove_dir_all(&tmp).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn claude_batch_claims_distinct_matching_proxy_rows() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            for request_id in ["proxy-batch-a", "proxy-batch-b"] {
+                conn.execute(
+                    "INSERT INTO proxy_request_logs (
+                        request_id, provider_id, app_type, model, request_model,
+                        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                        total_cost_usd, latency_ms, status_code, session_id, created_at, data_source
+                    ) VALUES (?1, 'gateway', 'claude', 'fixture-unknown',
+                              'fixture-unknown', 100, 20, 10, 5, '0.10', 0, 200, NULL, 1000, 'proxy')",
+                    [request_id],
+                )?;
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "cc-switch-claude-proxy-batch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let projects = tmp.join("projects");
+        let project = projects.join("fixture-project");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("batch.jsonl");
+        let message = |message_id: &str| {
+            format!(
+                r#"{{"type":"assistant","sessionId":"batch-session","timestamp":"1970-01-01T00:16:45Z","message":{{"id":"{message_id}","model":"fixture-unknown","usage":{{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":10,"cache_creation_input_tokens":5}},"stop_reason":"end_turn"}}}}"#
+            )
+        };
+        fs::write(
+            &path,
+            format!("{}\n{}\n", message("batch-message-a"), message("batch-message-b")),
+        )
+        .unwrap();
+
+        let result = sync_claude_files(&db, &projects)?;
+        assert_eq!(result.imported, 0, "both native rows take over proxy rows");
+
+        let conn = lock_conn!(db.conn);
+        let raw_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE app_type = 'claude'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(raw_count, 2);
+        let rollup_count: i64 = conn.query_row(
+            "SELECT request_count FROM agent_session_usage_rollups
+             WHERE app_type = 'claude' AND session_id = 'batch-session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rollup_count, 2, "each native message contributes once");
+        let covered_proxy_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_canonical_coverage
+             WHERE app_type = 'claude' AND data_source = 'proxy'
+               AND canonical_session_id = 'batch-session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(covered_proxy_count, 2, "both proxy rows are claimed once");
+
+        drop(conn);
+        fs::remove_dir_all(&tmp).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn claude_batch_admits_distinct_native_event_after_proxy_claim() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, request_model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    total_cost_usd, latency_ms, status_code, session_id, created_at, data_source
+                ) VALUES ('proxy-single-batch', 'gateway', 'claude', 'fixture-unknown',
+                          'fixture-unknown', 100, 20, 10, 5, '0.10', 0, 200, NULL, 1000, 'proxy')",
+                [],
+            )?;
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "cc-switch-claude-proxy-single-batch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let projects = tmp.join("projects");
+        let project = projects.join("fixture-project");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("single-batch.jsonl");
+        let message = |message_id: &str| {
+            format!(
+                r#"{{"type":"assistant","sessionId":"single-batch-session","timestamp":"1970-01-01T00:16:45Z","message":{{"id":"{message_id}","model":"fixture-unknown","usage":{{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":10,"cache_creation_input_tokens":5}},"stop_reason":"end_turn"}}}}"#
+            )
+        };
+        fs::write(
+            &path,
+            format!("{}\n{}\n", message("single-message-a"), message("single-message-b")),
+        )
+        .unwrap();
+
+        let result = sync_claude_files(&db, &projects)?;
+        assert_eq!(result.imported, 1, "the second native event owns a raw row");
+        assert_eq!(result.skipped, 1, "the first native event takes over the proxy");
+
+        let conn = lock_conn!(db.conn);
+        let counts: (i64, i64, i64, i64) = conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM proxy_request_logs WHERE app_type = 'claude'),
+                (SELECT request_count FROM agent_session_usage_rollups
+                 WHERE app_type = 'claude' AND session_id = 'single-batch-session'),
+                (SELECT COUNT(*) FROM agent_session_canonical_coverage
+                 WHERE app_type = 'claude' AND data_source = 'proxy'
+                   AND canonical_session_id = 'single-batch-session'),
+                (SELECT COUNT(*) FROM agent_session_canonical_coverage
+                 WHERE app_type = 'claude' AND data_source = 'session_log'
+                   AND canonical_session_id = 'single-batch-session')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        // The two raw rows represent two distinct transcript events: one
+        // proxy takeover plus one native-owned event.  Only the takeover gets
+        // a proxy coverage marker; both canonical facts are session-owned.
+        assert_eq!(counts, (2, 2, 1, 2));
+
+        drop(conn);
+        fs::remove_dir_all(&tmp).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn claude_proxy_coverage_repair_is_specific_to_current_message() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, request_model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    total_cost_usd, latency_ms, status_code, session_id, created_at, data_source
+                ) VALUES ('proxy-a', 'gateway', 'claude', 'fixture-unknown',
+                          'fixture-unknown', 100, 20, 10, 5, '0.10', 0, 200, NULL, 1000, 'proxy')",
+                [],
+            )?;
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "cc-switch-claude-proxy-specific-repair-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let projects = tmp.join("projects");
+        let project = projects.join("fixture-project");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("mixed.jsonl");
+        let takeover = r#"{"type":"assistant","sessionId":"shared-session","timestamp":"1970-01-01T00:16:45Z","message":{"id":"message-a","model":"fixture-unknown","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":10,"cache_creation_input_tokens":5},"stop_reason":"end_turn"}}"#;
+        let normal = r#"{"type":"assistant","sessionId":"shared-session","timestamp":"1970-01-01T00:16:50Z","message":{"id":"message-b","model":"fixture-unknown","usage":{"input_tokens":200,"output_tokens":30,"cache_read_input_tokens":11,"cache_creation_input_tokens":6},"stop_reason":"end_turn"}}"#;
+        fs::write(&path, format!("{takeover}\n{normal}\n")).unwrap();
+
+        let first = sync_claude_files(&db, &projects)?;
+        assert_eq!(first.imported, 1, "only the unmatched normal message writes raw");
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "DELETE FROM proxy_request_logs WHERE request_id = 'session:message-b'",
+                [],
+            )?;
+            let b_coverage: bool = conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM agent_session_canonical_coverage
+                    WHERE app_type = 'claude' AND data_source = 'session_log'
+                      AND request_id = 'session:message-b'
+                 )",
+                [],
+                |row| row.get(0),
+            )?;
+            assert!(b_coverage, "B keeps its canonical coverage after raw loss");
+        }
+
+        // Replay only B.  A's proxy coverage belongs to the same session but
+        // has a different fingerprint; B's missing raw row must be repaired.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(format!("{normal}\n").as_bytes())
+            .unwrap();
+        let second = sync_claude_files(&db, &projects)?;
+        assert_eq!(second.imported, 1, "normal B raw row is repaired");
+
+        let conn = lock_conn!(db.conn);
+        let b_raw: (i64, i64) = conn.query_row(
+            "SELECT input_tokens, output_tokens
+             FROM proxy_request_logs WHERE request_id = 'session:message-b'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(b_raw, (200, 30));
+        let proxy_coverage: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_canonical_coverage
+             WHERE app_type = 'claude' AND data_source = 'proxy'
+               AND request_id = 'proxy-a' AND canonical_session_id = 'shared-session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(proxy_coverage, 1);
+
+        drop(conn);
+        fs::remove_dir_all(&tmp).ok();
         Ok(())
     }
 

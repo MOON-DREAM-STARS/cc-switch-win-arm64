@@ -7,6 +7,9 @@ use crate::services::agent_session_usage::{
     AgentUsageCapability,
 };
 use crate::services::model_pricing::{ModelPricingInfo, ModelsDevSyncConfig, ModelsDevSyncState};
+use crate::services::session_usage_rebuild::{
+    AgentUsageRebuildApp, RebuildAgentSessionUsageRequest, RebuildAgentSessionUsageResult,
+};
 use crate::services::usage_stats::*;
 use crate::store::AppState;
 use tauri::State;
@@ -324,11 +327,41 @@ pub async fn rebuild_codex_usage(
         .lock()
         .await;
     tauri::async_runtime::spawn_blocking(move || {
-        let result = crate::services::session_usage_codex::rebuild_codex_usage(&db);
-        finish_codex_rebuild(result)
+        let request = RebuildAgentSessionUsageRequest {
+            app_types: vec![AgentUsageRebuildApp::Codex],
+        };
+        match crate::services::session_usage_rebuild::rebuild_agent_session_usage_without_event(
+            &db, &request,
+        ) {
+            Ok(result) => {
+                let provider_result = result.providers.into_iter().next().ok_or_else(|| {
+                    AppError::Message("Codex provider rebuild returned no result".to_string())
+                });
+                finish_codex_rebuild(provider_result.map(|provider| provider.sync_result))
+            }
+            Err(error) => finish_codex_rebuild(Err(error)),
+        }
     })
     .await
     .map_err(|error| AppError::Message(format!("Codex 用量重建任务失败: {error}")))?
+}
+
+/// 显式按 provider 重建历史会话用量。每个 provider 独立暂存并发布，
+/// 失败只保留该 provider 的已发布 generation，不影响同次其它选择。
+#[tauri::command]
+pub async fn rebuild_agent_session_usage(
+    state: State<'_, AppState>,
+    request: RebuildAgentSessionUsageRequest,
+) -> Result<RebuildAgentSessionUsageResult, AppError> {
+    let db = state.db.clone();
+    let _guard = crate::services::session_usage::session_sync_mutex()
+        .lock()
+        .await;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::services::session_usage_rebuild::rebuild_agent_session_usage(&db, &request)
+    })
+    .await
+    .map_err(|error| AppError::Message(format!("Agent 用量重建任务失败: {error}")))?
 }
 
 /// 获取数据来源分布

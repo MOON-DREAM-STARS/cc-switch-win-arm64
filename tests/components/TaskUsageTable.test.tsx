@@ -7,8 +7,8 @@ import {
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TaskUsageTable } from "@/components/usage/TaskUsageTable";
+import type { AgentTaskUsageQueryFilter } from "@/lib/query/usage";
 import type {
-  AgentTaskUsageFilter,
   AgentTaskUsageRow,
   AgentUsageCapability,
   AgentUsageMeasure,
@@ -159,8 +159,8 @@ const installQueryResult = (
   });
 };
 
-const lastFilter = (): AgentTaskUsageFilter =>
-  useAgentTaskUsageMock.mock.calls.at(-1)?.[0] as AgentTaskUsageFilter;
+const lastFilter = (): AgentTaskUsageQueryFilter =>
+  useAgentTaskUsageMock.mock.calls.at(-1)?.[0] as AgentTaskUsageQueryFilter;
 
 const setContainerWidth = (width: number) => {
   const descriptor = Object.getOwnPropertyDescriptor(
@@ -233,7 +233,11 @@ describe("TaskUsageTable", () => {
     );
 
     expect(lastFilter()).toMatchObject({
-      range: { startAt: 100, endAt: 200 },
+      rangeSelection: {
+        preset: "custom",
+        customStartDate: 100,
+        customEndDate: 200,
+      },
       limit: 20,
       offset: 0,
     });
@@ -251,7 +255,11 @@ describe("TaskUsageTable", () => {
         appType: "codex",
         titleExact: "Build title",
         projectDirExact: "/workspace/cc-switch",
-        range: { startAt: 100, endAt: 200 },
+        rangeSelection: {
+          preset: "custom",
+          customStartDate: 100,
+          customEndDate: 200,
+        },
         offset: 0,
       }),
     );
@@ -352,7 +360,11 @@ describe("TaskUsageTable", () => {
     );
     await waitFor(() =>
       expect(lastFilter()).toMatchObject({
-        range: { startAt: 101, endAt: 201 },
+        rangeSelection: {
+          preset: "custom",
+          customStartDate: 101,
+          customEndDate: 201,
+        },
         titleExact: undefined,
         projectDirExact: undefined,
       }),
@@ -451,7 +463,7 @@ describe("TaskUsageTable", () => {
       totalCostUsd: "1.25",
       requestCountSemantics: "http_request",
     });
-    useAgentTaskUsageMock.mockImplementation((currentFilter: AgentTaskUsageFilter) => ({
+    useAgentTaskUsageMock.mockImplementation((currentFilter: AgentTaskUsageQueryFilter) => ({
       data: {
         items: [],
         total: 0,

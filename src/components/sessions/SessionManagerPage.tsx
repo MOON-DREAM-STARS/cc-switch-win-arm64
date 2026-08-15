@@ -1585,6 +1585,7 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                     <SessionUsageSummary
                       appType={selectedSession.providerId as AgentUsageAppType}
                       sessionId={selectedSession.sessionId}
+                      usageSessionId={selectedSession.usageSessionId}
                       detailContainerRef={detailRef}
                     />
 

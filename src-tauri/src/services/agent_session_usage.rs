@@ -1290,6 +1290,104 @@ fn measure_cost(value: Option<&String>) -> (Option<String>, bool) {
     }
 }
 
+const COST_VALUE_SEPARATOR: char = '\u{1f}';
+
+/// Correction/reconciliation metadata describes a source adjustment rather
+/// than a billable user expense. Hermes also stores a JSON baseline/emitted
+/// state in `correction_state` for ordinary increases, so only explicit
+/// correction-like values are treated as an adjustment marker here.
+fn has_cost_correction_metadata(
+    cost_delta_kind: Option<&str>,
+    correction_state: Option<&str>,
+) -> bool {
+    let kind_is_correction = cost_delta_kind.is_some_and(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        value == "reconciliation"
+            || value.contains("correction")
+            || value.contains("reconcil")
+            || value.contains("adjust")
+            || value.contains("rollback")
+    });
+    let state_is_correction = correction_state.is_some_and(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        value.contains("correction")
+            || value.contains("reconcil")
+            || value.contains("adjust")
+            || value.contains("rollback")
+    });
+    kind_is_correction || state_is_correction
+}
+
+/// Aggregate persisted/raw cost text without delegating decimal arithmetic to
+/// SQLite's REAL conversion. Invalid/negative values and explicit correction
+/// groups are excluded from reported spend, but still make the result partial
+/// and carry a warning. `known_cost_count` is the SQL COUNT of non-NULL cost
+/// values; a missing value therefore remains observable even when another row
+/// in the group has a valid positive cost.
+fn aggregate_reported_cost(
+    values: Option<&str>,
+    row_count: i64,
+    known_cost_count: i64,
+    cost_delta_kind: Option<&str>,
+    correction_state: Option<&str>,
+) -> (Option<String>, bool, Vec<String>) {
+    let mut partial = known_cost_count < row_count;
+    let mut warnings = Vec::new();
+    let correction_metadata = has_cost_correction_metadata(cost_delta_kind, correction_state);
+
+    let mut total = Decimal::ZERO;
+    let mut has_valid_cost = false;
+    let mut has_invalid_cost = false;
+    if let Some(values) = values {
+        for raw_value in values.split(COST_VALUE_SEPARATOR) {
+            let value = raw_value.trim().to_string();
+            let (cost, cost_correction) = measure_cost(Some(&value));
+            if cost_correction {
+                has_invalid_cost = true;
+                partial = true;
+                continue;
+            }
+            if let Some(cost) = cost {
+                // `measure_cost` has already rejected negative/invalid text;
+                // this parse is infallible for the same trimmed decimal.
+                if let Ok(cost) = Decimal::from_str(&cost) {
+                    total += cost;
+                    has_valid_cost = true;
+                } else {
+                    has_invalid_cost = true;
+                    partial = true;
+                }
+            }
+        }
+    }
+    if has_invalid_cost {
+        warnings.push("negative or invalid cost was excluded from reported spend".to_string());
+    }
+    if correction_metadata {
+        warnings
+            .push("correction or reconciliation cost was excluded from reported spend".to_string());
+        return (None, true, warnings);
+    }
+    if has_valid_cost {
+        (Some(canonical_decimal_text(total)), partial, warnings)
+    } else {
+        (None, true, warnings)
+    }
+}
+
+fn canonical_decimal_text(value: Decimal) -> String {
+    let mut text = value.to_string();
+    if let Some((whole, fraction)) = text.split_once('.') {
+        let trimmed_fraction = fraction.trim_end_matches('0');
+        text = if trimmed_fraction.is_empty() {
+            whole.to_string()
+        } else {
+            format!("{whole}.{trimmed_fraction}")
+        };
+    }
+    text
+}
+
 /// Canonical cumulative-source snapshot used with the Hermes fact+snapshot
 /// atomic bridge. Snapshot counters are source totals, not a user-facing task
 /// total; the adapter computes the sync-window delta before constructing a
@@ -1565,10 +1663,15 @@ impl UsageMeasure {
         let cache_read_tokens = add_optional(self.cache_read_tokens, other.cache_read_tokens);
         let cache_creation_tokens =
             add_optional(self.cache_creation_tokens, other.cache_creation_tokens);
-        let total_cost_usd = add_cost(
+        let total_cost_usd = match (
             self.total_cost_usd.as_deref(),
             other.total_cost_usd.as_deref(),
-        );
+        ) {
+            (Some(left), Some(right)) => add_cost(Some(left), Some(right)),
+            (Some(left), None) if other.cost_was_excluded() => Some(left.to_string()),
+            (None, Some(right)) if self.cost_was_excluded() => Some(right.to_string()),
+            _ => None,
+        };
         let total_cost_known = total_cost_usd.is_some();
         let mut warnings = self.warnings.clone();
         warnings.extend(other.warnings.iter().cloned());
@@ -1619,6 +1722,13 @@ impl UsageMeasure {
             && self.output_tokens.is_some()
             && self.cache_read_tokens.is_some()
             && self.cache_creation_tokens.is_some()
+    }
+
+    fn cost_was_excluded(&self) -> bool {
+        self.warnings.iter().any(|warning| {
+            warning.contains("excluded from reported spend")
+                || warning.contains("retained only as source correction metadata")
+        })
     }
 }
 
@@ -2102,7 +2212,7 @@ fn usage_measure_from_group_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Usa
     let cache_creation_tokens: Option<i64> = row.get(25)?;
     let cache_write_tokens: Option<i64> = row.get(26)?;
     let reasoning_tokens: Option<i64> = row.get(27)?;
-    let total_cost_usd: Option<String> = row.get(28)?;
+    let total_cost_values: Option<String> = row.get(28)?;
     let cost_status: Option<String> = row.get(29)?;
     let cost_source: Option<String> = row.get(30)?;
     let cost_delta_kind: Option<String> = row.get(31)?;
@@ -2110,11 +2220,20 @@ fn usage_measure_from_group_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Usa
     let _first_event_at: Option<i64> = row.get(33)?;
     let _last_event_at: Option<i64> = row.get(34)?;
     let range_partial: i64 = row.get(35)?;
+    let cost_row_count: i64 = row.get(36)?;
+    let cost_known_count: i64 = row.get(37)?;
 
     let precision = UsagePrecision::from_str(&precision_text).unwrap_or_default();
     let time_semantics = TimeSemantics::from_str(&time_text).unwrap_or_default();
     let request_count_semantics = RequestCountSemantics::from_str(&count_text).unwrap_or_default();
-    let mut warnings = Vec::new();
+    let (total_cost_usd, cost_partial, cost_warnings) = aggregate_reported_cost(
+        total_cost_values.as_deref(),
+        cost_row_count,
+        cost_known_count,
+        cost_delta_kind.as_deref(),
+        correction_state.as_deref(),
+    );
+    let mut warnings = cost_warnings;
     if precision == UsagePrecision::Unavailable {
         warnings.push("usage fact precision is unavailable".to_string());
     }
@@ -2145,6 +2264,7 @@ fn usage_measure_from_group_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Usa
             || output_tokens.is_none()
             || cache_read_tokens.is_none()
             || cache_creation_tokens.is_none()
+            || cost_partial
             || cost_missing,
         warnings,
     };
@@ -2506,10 +2626,11 @@ fn query_usage_groups(
                 CASE WHEN COUNT(cache_creation_tokens) = COUNT(*) THEN SUM(cache_creation_tokens) END,
                 CASE WHEN COUNT(cache_write_tokens) = COUNT(*) THEN SUM(cache_write_tokens) END,
                 CASE WHEN COUNT(reasoning_tokens) = COUNT(*) THEN SUM(reasoning_tokens) END,
-                CASE WHEN COUNT(total_cost_usd) = COUNT(*)
-                     THEN CAST(SUM(CAST(total_cost_usd AS REAL)) AS TEXT) END,
+                CASE WHEN COUNT(total_cost_usd) > 0
+                     THEN GROUP_CONCAT(CAST(total_cost_usd AS TEXT), char(31)) END,
                 cost_status, cost_source, cost_delta_kind, correction_state,
-                MIN(first_event_at), MAX(last_event_at), MAX(range_partial)
+                MIN(first_event_at), MAX(last_event_at), MAX(range_partial),
+                COUNT(*), COUNT(total_cost_usd)
          FROM filtered
          GROUP BY root_session_id, is_descendant, provider_id, model,
                   request_model, pricing_model, data_source, precision,
@@ -2545,6 +2666,10 @@ fn enrich_codex_session_costs(conn: &Connection, app_type: &str, groups: &mut [U
     for group in groups {
         if group.measure.total_cost_usd.is_some()
             || group.source_dimension.data_source != "codex_session"
+            || has_cost_correction_metadata(
+                group.source_dimension.cost_delta_kind.as_deref(),
+                group.source_dimension.correction_state.as_deref(),
+            )
         {
             continue;
         }
@@ -2907,6 +3032,12 @@ fn query_unattributed_codex_usage(
               AND coverage.data_source = 'proxy'
               AND coverage.request_id = l.request_id
         )".to_string(),
+        "NOT EXISTS (
+            SELECT 1 FROM agent_session_nodes mapped_node
+            WHERE mapped_node.app_type = 'codex'
+              AND mapped_node.session_id = l.session_id
+        )"
+        .to_string(),
     ];
     let mut params_vec: Vec<Box<dyn ToSql>> = Vec::new();
     if let Some(start_at) = range.start_at {
@@ -2925,20 +3056,30 @@ fn query_unattributed_codex_usage(
                 CASE WHEN COUNT(l.cache_read_tokens) = COUNT(*) THEN SUM(l.cache_read_tokens) END,
                 CASE WHEN COUNT(l.cache_creation_tokens) = COUNT(*)
                      THEN SUM(l.cache_creation_tokens) END,
-                CASE WHEN COUNT(l.total_cost_usd) = COUNT(*)
-                     THEN CAST(SUM(CAST(l.total_cost_usd AS REAL)) AS TEXT) END
+                CASE WHEN COUNT(l.total_cost_usd) > 0
+                     THEN GROUP_CONCAT(CAST(l.total_cost_usd AS TEXT), char(31)) END,
+                COUNT(l.total_cost_usd)
          FROM proxy_request_logs l
          WHERE {}",
         conditions.join(" AND ")
     );
     let refs: Vec<&dyn ToSql> = params_vec.iter().map(|value| value.as_ref()).collect();
-    let (request_count, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost): (
+    let (
+        request_count,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        cost_values,
+        cost_known_count,
+    ): (
         i64,
         Option<i64>,
         Option<i64>,
         Option<i64>,
         Option<i64>,
         Option<String>,
+        i64,
     ) = conn.query_row(&sql, refs.as_slice(), |row| {
         Ok((
             row.get(0)?,
@@ -2947,16 +3088,25 @@ fn query_unattributed_codex_usage(
             row.get(3)?,
             row.get(4)?,
             row.get(5)?,
+            row.get(6)?,
         ))
     })?;
     if request_count == 0 {
         return Ok(None);
     }
-    let mut warnings = Vec::new();
+    let (cost, cost_partial, cost_warnings) = aggregate_reported_cost(
+        cost_values.as_deref(),
+        request_count,
+        cost_known_count,
+        None,
+        None,
+    );
+    let mut warnings = cost_warnings;
     let partial = input_tokens.is_none()
         || output_tokens.is_none()
         || cache_read_tokens.is_none()
         || cache_creation_tokens.is_none()
+        || cost_partial
         || cost.is_none();
     if partial {
         warnings.push("unattributed Codex proxy usage has missing fields".to_string());
@@ -3760,6 +3910,81 @@ mod tests {
         assert_eq!(measure.total_cost_usd, None);
         assert!(measure.partial);
         assert_eq!(measure.warnings.len(), 1);
+    }
+
+    #[test]
+    fn query_excludes_negative_reconciliation_cost_and_marks_mixed_cost_partial(
+    ) -> Result<(), AppError> {
+        let db = Database::memory()?;
+        write_agent_session_node(
+            &db,
+            &query_node(
+                "codex",
+                "cost-correction-root",
+                "cost-correction-root",
+                SessionNodeKind::Root,
+            ),
+        )?;
+
+        let mut correction = codex_fact_fixture("cost-correction-root", 10, 2, 4);
+        correction.total_cost_usd = Some("-0.25".into());
+        correction.cost_delta_kind = Some("reconciliation".into());
+        correction.correction_state = Some("reconciled".into());
+        write_agent_session_usage_rollup_fact(&db, &correction)?;
+
+        let only_correction = get_agent_session_usage(
+            &db,
+            &AgentSessionUsageRequest {
+                app_type: "codex".into(),
+                session_id: "cost-correction-root".into(),
+                range: None,
+            },
+        )?;
+        let correction_usage = only_correction.total_usage.unwrap();
+        assert_eq!(correction_usage.total_cost_usd, None);
+        assert!(correction_usage.partial);
+        assert!(correction_usage
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("correction") || warning.contains("reconciliation")));
+
+        let mut positive = codex_fact_fixture("cost-correction-root", 20, 3, 5);
+        positive.date = "2026-08-14".into();
+        positive.total_cost_usd = Some("1.25".into());
+        write_agent_session_usage_rollup_fact(&db, &positive)?;
+
+        let mixed = get_agent_session_usage(
+            &db,
+            &AgentSessionUsageRequest {
+                app_type: "codex".into(),
+                session_id: "cost-correction-root".into(),
+                range: None,
+            },
+        )?;
+        let mixed_usage = mixed.total_usage.unwrap();
+        assert_eq!(mixed_usage.total_cost_usd.as_deref(), Some("1.25"));
+        assert!(mixed_usage.partial);
+        assert!(mixed_usage
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("correction") || warning.contains("reconciliation")));
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_cost_keeps_decimal_positive_values_and_warns_for_invalid_rows() {
+        let (cost, partial, warnings) = aggregate_reported_cost(
+            Some("1.10\u{1f}0.20\u{1f}-0.50\u{1f}not-a-cost"),
+            4,
+            4,
+            None,
+            None,
+        );
+        assert_eq!(cost.as_deref(), Some("1.3"));
+        assert!(partial);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("negative or invalid")));
     }
 
     #[test]
@@ -5262,6 +5487,15 @@ mod tests {
     #[test]
     fn task_page_reports_only_uncovered_codex_proxy_usage_as_unattributed() -> Result<(), AppError> {
         let db = Database::memory()?;
+        write_agent_session_node(
+            &db,
+            &query_node(
+                "codex",
+                "mapped-session",
+                "mapped-session",
+                SessionNodeKind::Root,
+            ),
+        )?;
         {
             let conn = crate::database::lock_conn!(db.conn);
             conn.execute(
@@ -5279,20 +5513,11 @@ mod tests {
                     request_id, provider_id, app_type, model, request_model,
                     input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
                     input_token_semantics, total_cost_usd, latency_ms, status_code,
-                    created_at, data_source
-                 ) VALUES ('claimed-proxy', 'openai', 'codex', 'gpt-5.6-sol',
-                           'gpt-5.6-sol', 50, 10, 5, 0, 1, '0.50', 0, 200, 160, 'proxy')",
+                    created_at, session_id, data_source
+                 ) VALUES ('mapped-proxy', 'openai', 'codex', 'gpt-5.6-sol',
+                           'gpt-5.6-sol', 50, 10, 5, 0, 1, '0.50', 0, 200, 160,
+                           'mapped-session', 'proxy')",
                 [],
-            )?;
-            Database::upsert_agent_session_canonical_coverage_on_conn(
-                &conn,
-                &crate::database::AgentSessionCanonicalCoverageMarker {
-                    app_type: "codex".into(),
-                    data_source: "proxy".into(),
-                    request_id: "claimed-proxy".into(),
-                    canonical_session_id: Some("native-session".into()),
-                    marked_at: 160,
-                },
             )?;
         }
         let filter = AgentTaskUsageFilter {
@@ -5304,7 +5529,15 @@ mod tests {
             ..Default::default()
         };
         let page = list_agent_task_usage(&db, &filter)?;
-        assert!(page.items.is_empty());
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].session_id, "mapped-session");
+        assert_eq!(
+            page.items[0]
+                .self_usage
+                .as_ref()
+                .and_then(|usage| usage.request_count),
+            Some(1)
+        );
         let usage = page.unattributed_usage.expect("unclaimed proxy summary");
         assert_eq!(usage.request_count, Some(1));
         assert_eq!(usage.input_tokens, Some(70));

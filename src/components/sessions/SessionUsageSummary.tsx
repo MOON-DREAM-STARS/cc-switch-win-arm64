@@ -33,6 +33,7 @@ import {
 type SessionUsageSummaryProps = {
   appType: AgentUsageAppType;
   sessionId: string;
+  usageSessionId?: string;
   detailContainerRef?: RefObject<HTMLElement | null>;
 };
 
@@ -241,10 +242,15 @@ function UsageUnavailable({
 export function SessionUsageSummary({
   appType,
   sessionId,
+  usageSessionId,
   detailContainerRef,
 }: SessionUsageSummaryProps) {
   const { t, i18n } = useTranslation();
-  const { data, isLoading, isError } = useAgentSessionUsage(appType, sessionId);
+  const querySessionId = usageSessionId ?? sessionId;
+  const { data, isLoading, isError } = useAgentSessionUsage(
+    appType,
+    querySessionId,
+  );
   const isCompact = useCompactDetailLayout(detailContainerRef);
   const [usageOpen, setUsageOpen] = useState(false);
   const previousCompactRef = useRef(false);
@@ -255,7 +261,7 @@ export function SessionUsageSummary({
 
   useEffect(() => {
     setUsageOpen(false);
-  }, [appType, sessionId]);
+  }, [appType, querySessionId, sessionId]);
 
   useEffect(() => {
     if (isCompact && !previousCompactRef.current) {

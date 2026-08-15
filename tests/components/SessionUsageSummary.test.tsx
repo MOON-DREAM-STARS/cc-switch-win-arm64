@@ -173,6 +173,21 @@ describe("SessionUsageSummary", () => {
     });
   });
 
+  it("uses the optional canonical usage identity for its query", () => {
+    render(
+      <SessionUsageSummary
+        appType="hermes"
+        sessionId="raw-hermes-session"
+        usageSessionId="hermes:default:database:digest"
+      />,
+    );
+
+    expect(useAgentSessionUsageMock).toHaveBeenCalledWith(
+      "hermes",
+      "hermes:default:database:digest",
+    );
+  });
+
   afterEach(() => {
     vi.unstubAllGlobals();
   });

@@ -1647,6 +1647,27 @@
       "completed": "重建完成：导入 {{imported}} 条，错误 {{errors}}，疑似重复 {{suspected}}，暂缓文件 {{deferred}}",
       "failed": "Codex 用量重建失败：{{error}}"
     },
+    "rebuildAgentSessionUsage": {
+      "title": "Agent 会话用量维护",
+      "description": "从本地来源为选定 Provider 重建历史会话用量",
+      "selectionLabel": "选择要重建的 Provider",
+      "warning": "重建前会创建安全备份。若某个 Provider 失败，将保留其之前已发布的数据。",
+      "action": "重建选定用量",
+      "confirmTitle": "确认重建选定 Provider 的用量？",
+      "confirmMessage": "选定 Provider：{{providers}}。重建前会创建安全备份；若某个 Provider 失败，将保留其之前已发布的数据代次。",
+      "confirmAction": "备份并重建",
+      "completed": "重建完成。已发布：{{published}}。保留之前数据：{{keptPrevious}}。",
+      "syncDetails": "同步详情：{{errors}} 个错误，{{deferred}} 个暂缓文件。",
+      "failed": "Agent 会话用量重建失败：{{error}}",
+      "none": "无",
+      "providers": {
+        "claude": "Claude",
+        "codex": "Codex",
+        "grokbuild": "Grok Build",
+        "opencode": "OpenCode",
+        "hermes": "Hermes"
+      }
+    },
     "totalRecords": "共 {{total}} 条记录",
     "goToPage": "跳转",
     "pageInputPlaceholder": "页码",

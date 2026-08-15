@@ -1647,6 +1647,27 @@
       "completed": "Rebuild complete: {{imported}} imported, {{errors}} errors, {{suspected}} suspected duplicates, {{deferred}} deferred files",
       "failed": "Codex usage rebuild failed: {{error}}"
     },
+    "rebuildAgentSessionUsage": {
+      "title": "Agent Session Usage Maintenance",
+      "description": "Rebuild historical session usage for selected providers from local sources",
+      "selectionLabel": "Providers to rebuild",
+      "warning": "A safety backup is created before rebuilding. Providers that fail keep their previous published data.",
+      "action": "Rebuild selected usage",
+      "confirmTitle": "Rebuild selected provider usage?",
+      "confirmMessage": "Selected providers: {{providers}}. A safety backup will be created before rebuilding. If a provider fails, its previous published generation will be kept.",
+      "confirmAction": "Back Up and Rebuild",
+      "completed": "Rebuild complete. Published: {{published}}. Kept previous: {{keptPrevious}}.",
+      "syncDetails": "Sync details: {{errors}} errors, {{deferred}} deferred files.",
+      "failed": "Agent session usage rebuild failed: {{error}}",
+      "none": "none",
+      "providers": {
+        "claude": "Claude",
+        "codex": "Codex",
+        "grokbuild": "Grok Build",
+        "opencode": "OpenCode",
+        "hermes": "Hermes"
+      }
+    },
     "totalRecords": "{{total}} records total",
     "goToPage": "Go",
     "pageInputPlaceholder": "Page",

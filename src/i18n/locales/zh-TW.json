@@ -1648,6 +1648,27 @@
       "completed": "重建完成：匯入 {{imported}} 筆，錯誤 {{errors}}，疑似重複 {{suspected}}，暫緩檔案 {{deferred}}",
       "failed": "Codex 用量重建失敗：{{error}}"
     },
+    "rebuildAgentSessionUsage": {
+      "title": "Agent 工作階段用量維護",
+      "description": "從本機來源為選取的 Provider 重建歷史工作階段用量",
+      "selectionLabel": "選擇要重建的 Provider",
+      "warning": "重建前會建立安全備份。若某個 Provider 失敗，將保留其先前已發布的資料。",
+      "action": "重建選取的用量",
+      "confirmTitle": "確認重建選取的 Provider 用量？",
+      "confirmMessage": "選取的 Provider：{{providers}}。重建前會建立安全備份；若某個 Provider 失敗，將保留其先前已發布的資料代次。",
+      "confirmAction": "備份並重建",
+      "completed": "重建完成。已發布：{{published}}。保留先前資料：{{keptPrevious}}。",
+      "syncDetails": "同步詳情：{{errors}} 個錯誤，{{deferred}} 個暫緩檔案。",
+      "failed": "Agent 工作階段用量重建失敗：{{error}}",
+      "none": "無",
+      "providers": {
+        "claude": "Claude",
+        "codex": "Codex",
+        "grokbuild": "Grok Build",
+        "opencode": "OpenCode",
+        "hermes": "Hermes"
+      }
+    },
     "totalRecords": "共 {{total}} 筆紀錄",
     "goToPage": "跳轉",
     "pageInputPlaceholder": "頁碼",

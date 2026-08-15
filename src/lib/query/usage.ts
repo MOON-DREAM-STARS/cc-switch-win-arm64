@@ -47,6 +47,32 @@ export interface NormalizedAgentUsageRange {
   endAt: number | null;
 }
 
+/**
+ * Stable query identity for a UI range selection. The resolved end time is
+ * deliberately not part of this shape: moving ranges are resolved by the
+ * query function for every fetch, including polling/refetches.
+ */
+export interface NormalizedUsageRangeSelection {
+  preset: UsageRangeSelection["preset"];
+  customStartDate: number | null;
+  customEndDate: number | null;
+  liveEndTime: boolean;
+}
+
+/** Query-only filter envelope that keeps the public backend wire shape intact. */
+export interface AgentTaskUsageQueryFilter
+  extends Omit<AgentTaskUsageFilter, "range"> {
+  range?: AgentUsageRange | null;
+  rangeSelection?: UsageRangeSelection | null;
+}
+
+/** Query-only filter-options envelope; `rangeSelection` is never sent to Tauri. */
+export interface AgentTaskUsageFilterOptionsQueryRequest
+  extends Omit<AgentTaskUsageFilterOptionsRequest, "range"> {
+  range?: AgentUsageRange | null;
+  rangeSelection?: UsageRangeSelection | null;
+}
+
 /** Treat omitted/empty ranges as the same cache identity. */
 export function normalizeAgentUsageRange(
   range?: AgentUsageRange | null,
@@ -67,6 +93,47 @@ function denormalizeAgentUsageRange(
   };
 }
 
+export function normalizeUsageRangeSelection(
+  selection?: UsageRangeSelection | null,
+): NormalizedUsageRangeSelection | null {
+  if (!selection) return null;
+  return {
+    preset: selection.preset,
+    customStartDate: selection.customStartDate ?? null,
+    customEndDate: selection.customEndDate ?? null,
+    liveEndTime: selection.liveEndTime ?? false,
+  };
+}
+
+function denormalizeUsageRangeSelection(
+  selection: NormalizedUsageRangeSelection,
+): UsageRangeSelection {
+  return {
+    preset: selection.preset,
+    ...(selection.customStartDate === null
+      ? {}
+      : { customStartDate: selection.customStartDate }),
+    ...(selection.customEndDate === null
+      ? {}
+      : { customEndDate: selection.customEndDate }),
+    ...(selection.liveEndTime ? { liveEndTime: true } : {}),
+  };
+}
+
+/** Resolve a query-only range at fetch time, never while constructing a key. */
+function resolveAgentUsageQueryRange(
+  selection: NormalizedUsageRangeSelection | null,
+  range: NormalizedAgentUsageRange,
+): AgentUsageRange | undefined {
+  if (selection) {
+    const { startDate, endDate } = resolveUsageRange(
+      denormalizeUsageRangeSelection(selection),
+    );
+    return { startAt: startDate, endAt: endDate };
+  }
+  return denormalizeAgentUsageRange(range);
+}
+
 export interface NormalizedAgentTaskUsageFilter {
   appType: AgentUsageAppType | null;
   title: string | null;
@@ -75,13 +142,15 @@ export interface NormalizedAgentTaskUsageFilter {
   titleExact: string | null;
   projectDirExact: string | null;
   range: NormalizedAgentUsageRange;
+  rangeSelection: NormalizedUsageRangeSelection | null;
   limit: number;
   offset: number;
 }
 
 export function normalizeAgentTaskUsageFilter(
-  filter: AgentTaskUsageFilter = {},
+  filter: AgentTaskUsageQueryFilter = {},
 ): NormalizedAgentTaskUsageFilter {
+  const rangeSelection = normalizeUsageRangeSelection(filter.rangeSelection);
   return {
     appType: filter.appType ?? null,
     title: filter.title ?? null,
@@ -89,7 +158,10 @@ export function normalizeAgentTaskUsageFilter(
     projectDir: filter.projectDir ?? null,
     titleExact: filter.titleExact ?? null,
     projectDirExact: filter.projectDirExact ?? null,
-    range: normalizeAgentUsageRange(filter.range),
+    // A selection is authoritative. Ignoring any concurrently supplied
+    // resolved range keeps moving timestamps out of the cache identity.
+    range: normalizeAgentUsageRange(rangeSelection ? undefined : filter.range),
+    rangeSelection,
     limit: filter.limit ?? AGENT_TASK_USAGE_DEFAULT_LIMIT,
     offset: filter.offset ?? 0,
   };
@@ -115,13 +187,22 @@ export const usageKeys = {
       filter.titleExact,
       filter.projectDirExact,
       filter.range,
+      filter.rangeSelection,
       filter.limit,
       filter.offset,
     ] as const,
   agentTaskFilterOptions: (
     appType: AgentUsageAppType | null,
     range: NormalizedAgentUsageRange,
-  ) => [...usageKeys.agent, "task-filter-options", appType, range] as const,
+    rangeSelection: NormalizedUsageRangeSelection | null = null,
+  ) =>
+    [
+      ...usageKeys.agent,
+      "task-filter-options",
+      appType,
+      range,
+      rangeSelection,
+    ] as const,
   agentCapabilities: () => [...usageKeys.agent, "capabilities"] as const,
   summary: (
     preset: UsageRangeSelection["preset"],
@@ -514,24 +595,31 @@ export function useAgentSessionUsage(
 
 /** Query root/standalone task rows with every filter represented in its key. */
 export function useAgentTaskUsage(
-  filter: AgentTaskUsageFilter = {},
+  filter: AgentTaskUsageQueryFilter = {},
   options?: AgentUsageQueryOptions,
 ) {
   const normalizedFilter = normalizeAgentTaskUsageFilter(filter);
   return useQuery<AgentTaskUsagePage>({
     queryKey: usageKeys.agentTasks(normalizedFilter),
-    queryFn: () =>
-      usageApi.listAgentTaskUsage({
+    queryFn: () => {
+      // Resolve the selection at fetch time so moving ranges advance on every
+      // poll/refetch while the key remains bounded by stable fields.
+      const range = resolveAgentUsageQueryRange(
+        normalizedFilter.rangeSelection,
+        normalizedFilter.range,
+      );
+      return usageApi.listAgentTaskUsage({
         appType: normalizedFilter.appType ?? undefined,
         title: normalizedFilter.title ?? undefined,
         project: normalizedFilter.project ?? undefined,
         projectDir: normalizedFilter.projectDir ?? undefined,
         titleExact: normalizedFilter.titleExact ?? undefined,
         projectDirExact: normalizedFilter.projectDirExact ?? undefined,
-        range: denormalizeAgentUsageRange(normalizedFilter.range),
+        range,
         limit: normalizedFilter.limit,
         offset: normalizedFilter.offset,
-      }),
+      });
+    },
     enabled: options?.enabled ?? true,
     staleTime: options?.staleTime,
     refetchInterval: options?.refetchInterval,
@@ -541,18 +629,29 @@ export function useAgentTaskUsage(
 
 /** Query the complete native title/project candidate list for a scope. */
 export function useAgentTaskUsageFilterOptions(
-  request: AgentTaskUsageFilterOptionsRequest = {},
+  request: AgentTaskUsageFilterOptionsQueryRequest = {},
   options?: AgentUsageQueryOptions,
 ) {
-  const normalizedRange = normalizeAgentUsageRange(request.range);
+  const rangeSelection = normalizeUsageRangeSelection(request.rangeSelection);
+  const normalizedRange = normalizeAgentUsageRange(
+    rangeSelection ? undefined : request.range,
+  );
   const appType = request.appType ?? null;
   return useQuery<AgentTaskUsageFilterOptions>({
-    queryKey: usageKeys.agentTaskFilterOptions(appType, normalizedRange),
-    queryFn: () =>
-      usageApi.getAgentTaskUsageFilterOptions({
+    queryKey: usageKeys.agentTaskFilterOptions(
+      appType,
+      normalizedRange,
+      rangeSelection,
+    ),
+    queryFn: () => {
+      // Keep filter-options requests on the same per-fetch range semantics as
+      // task rows; otherwise a newly active task can be absent from choices.
+      const range = resolveAgentUsageQueryRange(rangeSelection, normalizedRange);
+      return usageApi.getAgentTaskUsageFilterOptions({
         appType: request.appType,
-        range: denormalizeAgentUsageRange(normalizedRange),
-      }),
+        range,
+      });
+    },
     enabled: options?.enabled ?? true,
     staleTime: options?.staleTime,
     refetchInterval: options?.refetchInterval,

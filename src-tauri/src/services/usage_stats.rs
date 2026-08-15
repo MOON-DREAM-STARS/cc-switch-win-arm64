@@ -11,7 +11,7 @@ use crate::services::sql_helpers::{
 use chrono::{Local, NaiveDate, TimeZone, Timelike};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::LazyLock;
 
@@ -398,19 +398,88 @@ pub(crate) struct DedupKey<'a> {
     pub created_at: i64,
 }
 
-/// session 日志写入前的统一去重判定。
+/// Identity of the proxy row which won a cross-source deduplication match.
 ///
-/// 命中以下任一条件即跳过插入：① `request_id` 已存在；② 时间窗口内存在
-/// 与 `key` 匹配的 proxy 日志（指纹去重）。
+/// The app type is retained alongside the request id because Claude session
+/// events may match the Desktop gateway's `claude-desktop` rows.  Coverage
+/// markers use the stored app type as part of their key, so dropping this
+/// dimension would leave the proxy row visible to retention/global filters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MatchingProxyUsageLog {
+    pub request_id: String,
+    pub app_type: String,
+}
+
+/// Outcome of the pre-insert arbitration used by session-log adapters.
+///
+/// `MatchedProxy` is deliberately richer than the historical bool helper:
+/// callers can retain the proxy request identity and let the native event own
+/// canonical session attribution without inserting a duplicate compatibility
+/// raw row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionInsertOutcome {
+    Insert,
+    ExistingRequest,
+    MatchedProxy(MatchingProxyUsageLog),
+}
+
+/// Return the full pre-insert arbitration outcome for a session event.
+///
+/// The request-id check is kept ahead of the fingerprint lookup so an exact
+/// same-source replay remains a cheap/idempotent no-op.  A fingerprint match
+/// returns the proxy row identity instead of collapsing to a bool; Claude can
+/// then transfer canonical ownership to the transcript while retaining the
+/// proxy row as the global request record.
+pub(crate) fn session_insert_outcome(
+    conn: &Connection,
+    request_id: &str,
+    key: &DedupKey,
+) -> Result<SessionInsertOutcome, AppError> {
+    session_insert_outcome_excluding_claimed(conn, request_id, key, &HashSet::new())
+}
+
+/// Return the pre-insert arbitration outcome while excluding proxy rows that
+/// have already been claimed by an earlier native event in the current batch.
+///
+/// The durable coverage marker is written only when the batch transaction
+/// flushes.  Without this in-memory exclusion, two same-fingerprint native
+/// events would both observe the same unmarked proxy row and the second event
+/// could not reach a distinct matching row that is still available.
+pub(crate) fn session_insert_outcome_excluding_claimed(
+    conn: &Connection,
+    request_id: &str,
+    key: &DedupKey,
+    claimed_proxy_request_ids: &HashSet<String>,
+) -> Result<SessionInsertOutcome, AppError> {
+    if has_proxy_request_id(conn, request_id)? {
+        return Ok(SessionInsertOutcome::ExistingRequest);
+    }
+    let matched = find_matching_proxy_usage_log_details_excluding_claimed(
+        conn,
+        key,
+        claimed_proxy_request_ids,
+    )?;
+    if let Some(proxy) = matched {
+        return Ok(SessionInsertOutcome::MatchedProxy(proxy));
+    }
+    // No unclaimed proxy remains, so the native event owns its own raw and
+    // canonical record.  This preserves distinct transcript messages even
+    // when their fingerprints collide with a proxy row already claimed in
+    // this batch.
+    Ok(SessionInsertOutcome::Insert)
+}
+
+/// Compatibility bool wrapper retained for non-Claude adapters whose caller
+/// only needs to know whether a raw insert should be skipped.
 pub(crate) fn should_skip_session_insert(
     conn: &Connection,
     request_id: &str,
     key: &DedupKey,
 ) -> Result<bool, AppError> {
-    if has_proxy_request_id(conn, request_id)? {
-        return Ok(true);
-    }
-    has_matching_proxy_usage_log(conn, key)
+    Ok(!matches!(
+        session_insert_outcome(conn, request_id, key)?,
+        SessionInsertOutcome::Insert
+    ))
 }
 
 pub(crate) fn has_proxy_request_id(conn: &Connection, request_id: &str) -> Result<bool, AppError> {
@@ -436,7 +505,7 @@ fn matching_proxy_usage_log_sql(include_coverage: bool) -> String {
         ""
     };
     format!(
-        "SELECT l.request_id
+        "SELECT l.request_id, l.app_type
          FROM proxy_request_logs l
          WHERE {l_data_source} = 'proxy'
            AND {app_type_match}
@@ -471,6 +540,29 @@ pub(crate) fn find_matching_proxy_usage_log(
     conn: &Connection,
     key: &DedupKey,
 ) -> Result<Option<String>, AppError> {
+    Ok(find_matching_proxy_usage_log_details(conn, key)?.map(|matched| matched.request_id))
+}
+
+/// Find one unclaimed successful proxy row and retain the stored app type.
+///
+/// This is the detail-bearing sibling of [`find_matching_proxy_usage_log`].
+/// Keep the public(crate) string helper above for existing provider adapters;
+/// Claude's takeover path uses this richer form to write a correctly keyed
+/// proxy coverage marker, including `claude-desktop` matches.
+pub(crate) fn find_matching_proxy_usage_log_details(
+    conn: &Connection,
+    key: &DedupKey,
+) -> Result<Option<MatchingProxyUsageLog>, AppError> {
+    find_matching_proxy_usage_log_details_excluding_claimed(conn, key, &HashSet::new())
+}
+
+/// Find one matching proxy row while skipping rows already claimed by native
+/// transcript events in the current source batch.
+pub(crate) fn find_matching_proxy_usage_log_details_excluding_claimed(
+    conn: &Connection,
+    key: &DedupKey,
+    claimed_proxy_request_ids: &HashSet<String>,
+) -> Result<Option<MatchingProxyUsageLog>, AppError> {
     let allow_missing_cache_creation =
         matches!(key.app_type, "codex" | "gemini" | "opencode") && key.cache_creation_tokens == 0;
 
@@ -490,7 +582,99 @@ pub(crate) fn find_matching_proxy_usage_log(
         &*MATCHING_PROXY_USAGE_LOG_SQL_LEGACY
     };
 
-    conn.prepare_cached(sql)
+    // The cached matcher intentionally limits to one row.  For a batch with
+    // prior claims we need the full ordered candidate set so a later native
+    // event can claim the next available proxy row instead of being skipped
+    // after observing the already-claimed first row.
+    let sql = if claimed_proxy_request_ids.is_empty() {
+        sql.to_string()
+    } else {
+        sql.replace("LIMIT 1", "")
+    };
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(|e| AppError::Database(format!("准备重复代理用量日志查询失败: {e}")))?;
+    let rows = statement
+        .query_map(
+            params![
+                key.app_type,
+                key.model,
+                key.input_tokens as i64,
+                key.output_tokens as i64,
+                key.cache_read_tokens as i64,
+                key.cache_creation_tokens as i64,
+                key.created_at,
+                SESSION_PROXY_DEDUP_WINDOW_SECONDS,
+                allow_missing_cache_creation as i64,
+            ],
+            |row| {
+                Ok(MatchingProxyUsageLog {
+                    request_id: row.get(0)?,
+                    app_type: row.get(1)?,
+                })
+            },
+        )
+        .map_err(|e| AppError::Database(format!("查询重复代理用量日志失败: {e}")))?;
+    for row in rows {
+        let matched = row
+            .map_err(|e| AppError::Database(format!("读取重复代理用量日志失败: {e}")))?;
+        if !claimed_proxy_request_ids.contains(&matched.request_id) {
+            return Ok(Some(matched));
+        }
+    }
+    Ok(None)
+}
+
+/// Check whether the *current* session event is already represented by a
+/// proxy coverage marker for the same canonical session.
+///
+/// This is intentionally separate from [`find_matching_proxy_usage_log`]:
+/// takeover matching excludes covered proxy rows so a new source event cannot
+/// claim them again, whereas replay repair must recognize the exact covered
+/// proxy row that belongs to this message.  Matching the full fingerprint and
+/// event-time window prevents an unrelated takeover in the same session from
+/// suppressing a missing native raw row.
+pub(crate) fn has_matching_proxy_usage_coverage_for_session(
+    conn: &Connection,
+    key: &DedupKey,
+    canonical_session_id: &str,
+) -> Result<bool, AppError> {
+    if canonical_session_id.trim().is_empty() {
+        return Ok(false);
+    }
+    let allow_missing_cache_creation =
+        matches!(key.app_type, "codex" | "gemini" | "opencode") && key.cache_creation_tokens == 0;
+    let l_data_source = data_source_expr("l");
+    let app_type_match = dedup_app_type_match_sql("l.app_type", "?1");
+    let sql = format!(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM proxy_request_logs l
+            WHERE {l_data_source} = 'proxy'
+              AND {app_type_match}
+              AND l.status_code >= 200
+              AND l.status_code < 300
+              AND l.input_tokens = ?3
+              AND l.output_tokens = ?4
+              AND l.cache_read_tokens = ?5
+              AND (l.cache_creation_tokens = ?6 OR ?9 = 1)
+              AND l.created_at BETWEEN ?7 - ?8 AND ?7 + ?8
+              AND (
+                  LOWER(l.model) = LOWER(?2)
+                  OR LOWER(l.model) = 'unknown'
+                  OR LOWER(?2) = 'unknown'
+              )
+              AND EXISTS(
+                  SELECT 1
+                  FROM agent_session_canonical_coverage coverage
+                  WHERE coverage.app_type = l.app_type
+                    AND coverage.data_source = 'proxy'
+                    AND coverage.request_id = l.request_id
+                    AND coverage.canonical_session_id = ?10
+              )
+         )"
+    );
+    conn.prepare_cached(&sql)
         .and_then(|mut stmt| {
             stmt.query_row(
                 params![
@@ -503,12 +687,12 @@ pub(crate) fn find_matching_proxy_usage_log(
                     key.created_at,
                     SESSION_PROXY_DEDUP_WINDOW_SECONDS,
                     allow_missing_cache_creation as i64,
+                    canonical_session_id,
                 ],
-                |row| row.get::<_, String>(0),
+                |row| row.get::<_, bool>(0),
             )
-            .optional()
         })
-        .map_err(|e| AppError::Database(format!("查询重复代理用量日志失败: {e}")))
+        .map_err(|e| AppError::Database(format!("查询代理覆盖指纹失败: {e}")))
 }
 
 /// Replay variant of [`find_matching_proxy_usage_log`].  The replay generation

@@ -26,7 +26,9 @@ use crate::services::agent_session_usage::{
 use crate::services::session_usage::{
     get_sync_state, metadata_modified_nanos, update_sync_state, SessionSyncResult,
 };
-use crate::services::usage_stats::{find_model_pricing, should_skip_session_insert, DedupKey};
+use crate::services::usage_stats::{
+    find_matching_proxy_usage_log, find_model_pricing, DedupKey, SESSION_PROXY_DEDUP_WINDOW_SECONDS,
+};
 use chrono::{Local, TimeZone};
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
@@ -36,6 +38,7 @@ use std::str::FromStr;
 use std::time::SystemTime;
 
 /// 从 opencode message.data JSON 中提取的 token 和费用数据
+#[derive(Debug, Clone)]
 struct OpenCodeMessageData {
     input_tokens: u32,
     output_tokens: u32,
@@ -104,6 +107,14 @@ struct UsageBucketAccumulator {
 struct OpenCodeUsageRollup {
     rollup: NormalizedUsageRollup,
     request_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenCodeInsertOutcome {
+    Inserted,
+    ExistingSource,
+    ProxyDuplicate { proxy_request_id: String },
+    Rejected,
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +350,12 @@ fn persist_opencode_session(
         .first()
         .ok_or_else(|| AppError::InvalidInput("OpenCode 会话节点规范化为空".into()))?;
 
+    // Only messages that are owned by this source may contribute to the
+    // canonical rollup. A proxy match is represented by a coverage marker for
+    // the proxy request itself, not by a second direct-source fact.
+    let mut canonical_messages = Vec::new();
+    let mut proxy_duplicate_request_ids = Vec::new();
+    let mut claimed_proxy_request_ids = HashSet::new();
     for (message_id, msg_data) in &query_result.messages {
         let request_id = format!("opencode_session:{}:{message_id}", session.session_id);
         if !msg_data.token_fields_complete
@@ -355,9 +372,30 @@ fn persist_opencode_session(
             result.skipped = result.skipped.saturating_add(1);
             continue;
         }
-        match insert_opencode_message(db, &request_id, msg_data, &session.session_id) {
-            Ok(true) => result.imported = result.imported.saturating_add(1),
-            Ok(false) => result.skipped = result.skipped.saturating_add(1),
+        match insert_opencode_message_with_claims(
+            db,
+            &request_id,
+            msg_data,
+            &session.session_id,
+            &claimed_proxy_request_ids,
+        ) {
+            Ok(OpenCodeInsertOutcome::Inserted) => {
+                result.imported = result.imported.saturating_add(1);
+                canonical_messages.push((message_id.clone(), msg_data.clone()));
+            }
+            Ok(OpenCodeInsertOutcome::ExistingSource) => {
+                result.skipped = result.skipped.saturating_add(1);
+                canonical_messages.push((message_id.clone(), msg_data.clone()));
+            }
+            Ok(OpenCodeInsertOutcome::ProxyDuplicate { proxy_request_id }) => {
+                result.skipped = result.skipped.saturating_add(1);
+                if claimed_proxy_request_ids.insert(proxy_request_id.clone()) {
+                    proxy_duplicate_request_ids.push(proxy_request_id);
+                }
+            }
+            Ok(OpenCodeInsertOutcome::Rejected) => {
+                result.skipped = result.skipped.saturating_add(1);
+            }
             Err(error) => {
                 let message = format!("OpenCode 消息插入失败 {request_id}: {error}");
                 log::warn!("[OPENCODE-SYNC] {message}");
@@ -372,7 +410,7 @@ fn persist_opencode_session(
     // assistant message before writing, so two messages on the same day/key
     // become one sum rather than the last message winning.
     let rollups =
-        build_usage_rollups_with_request_ids(db, &session.session_id, &query_result.messages);
+        build_usage_rollups_with_request_ids(db, &session.session_id, &canonical_messages);
     let conn = lock_conn!(db.conn);
     let tx = conn.unchecked_transaction().map_err(|error| {
         AppError::Database(format!("开启 OpenCode canonical 写入事务失败: {error}"))
@@ -394,6 +432,16 @@ fn persist_opencode_session(
             };
             Database::upsert_agent_session_canonical_coverage_on_conn(&tx, &marker)?;
         }
+    }
+    for request_id in proxy_duplicate_request_ids {
+        let marker = AgentSessionCanonicalCoverageMarker {
+            app_type: "opencode".to_string(),
+            data_source: "proxy".to_string(),
+            request_id,
+            canonical_session_id: Some(session.session_id.clone()),
+            marked_at,
+        };
+        Database::upsert_agent_session_canonical_coverage_on_conn(&tx, &marker)?;
     }
     tx.commit().map_err(|error| {
         AppError::Database(format!("提交 OpenCode canonical 写入事务失败: {error}"))
@@ -975,18 +1023,46 @@ fn insert_opencode_message(
     request_id: &str,
     msg: &OpenCodeMessageData,
     session_id: &str,
-) -> Result<bool, AppError> {
+) -> Result<OpenCodeInsertOutcome, AppError> {
+    insert_opencode_message_with_claims(db, request_id, msg, session_id, &HashSet::new())
+}
+
+fn insert_opencode_message_with_claims(
+    db: &Database,
+    request_id: &str,
+    msg: &OpenCodeMessageData,
+    session_id: &str,
+    claimed_proxy_request_ids: &HashSet<String>,
+) -> Result<OpenCodeInsertOutcome, AppError> {
+    if !msg.token_fields_complete
+        || !msg.model_is_explicit
+        || !msg.timestamp_is_explicit
+        || local_date_from_timestamp_ms(msg.timestamp_ms).is_none()
+    {
+        return Ok(OpenCodeInsertOutcome::Rejected);
+    }
+
     let cost = resolve_message_cost(db, msg);
     let conn = lock_conn!(db.conn);
 
-    let created_at = if msg.timestamp_ms > 0 {
-        msg.timestamp_ms / 1000
-    } else {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-    };
+    let created_at = msg.timestamp_ms / 1000;
+
+    // A same-source row is eligible for canonical reconstruction even though
+    // the raw insert is idempotently skipped.  This distinguishes it from a
+    // proxy row that happens to match the same token fingerprint.
+    let same_source_exists: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM proxy_request_logs
+             WHERE request_id = ?1
+               AND app_type = 'opencode'
+               AND data_source = 'opencode_session'
+         )",
+        rusqlite::params![request_id],
+        |row| row.get(0),
+    )?;
+    if same_source_exists {
+        return Ok(OpenCodeInsertOutcome::ExistingSource);
+    }
 
     // OpenCode 使用 Anthropic 风格：input 是新鲜输入，cache 单独计
     // output 包含 reasoning tokens（按输出计费）
@@ -1001,8 +1077,29 @@ fn insert_opencode_message(
         cache_creation_tokens: msg.cache_write_tokens,
         created_at,
     };
-    if should_skip_session_insert(&conn, request_id, &dedup_key)? {
-        return Ok(false);
+    // Prefer an already-marked proxy row for this session on rescans. The
+    // normal matcher intentionally hides covered rows, but hiding it here
+    // would make a rescan promote the same native message into a second
+    // canonical source row after the first pass established proxy ownership.
+    let proxy_request_id = find_covered_proxy_usage_log_for_session(
+        &conn,
+        &dedup_key,
+        session_id,
+        claimed_proxy_request_ids,
+    )?
+    .or(find_matching_proxy_usage_log_excluding_claimed(
+        &conn,
+        &dedup_key,
+        claimed_proxy_request_ids,
+    )?);
+    if let Some(proxy_request_id) = proxy_request_id {
+        // A single source batch can contain distinct native messages with the
+        // same fingerprint. Once a matching proxy row has been claimed by an
+        // earlier message in this batch, admit this later native row instead
+        // of assigning the one proxy request twice.
+        if !claimed_proxy_request_ids.contains(&proxy_request_id) {
+            return Ok(OpenCodeInsertOutcome::ProxyDuplicate { proxy_request_id });
+        }
     }
 
     let inserted_rows = conn.execute(
@@ -1042,7 +1139,147 @@ fn insert_opencode_message(
     )
     .map_err(|e| AppError::Database(format!("插入 OpenCode 会话日志失败: {e}")))?;
 
-    Ok(inserted_rows > 0)
+    Ok(if inserted_rows > 0 {
+        OpenCodeInsertOutcome::Inserted
+    } else {
+        OpenCodeInsertOutcome::Rejected
+    })
+}
+
+fn find_covered_proxy_usage_log_for_session(
+    conn: &rusqlite::Connection,
+    key: &DedupKey,
+    session_id: &str,
+    claimed_proxy_request_ids: &HashSet<String>,
+) -> Result<Option<String>, AppError> {
+    let coverage_table_exists: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'agent_session_canonical_coverage'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !coverage_table_exists {
+        return Ok(None);
+    }
+    let mut statement = conn.prepare(
+        "SELECT l.request_id
+         FROM proxy_request_logs l
+         INNER JOIN agent_session_canonical_coverage coverage
+           ON coverage.app_type = l.app_type
+          AND coverage.data_source = 'proxy'
+          AND coverage.request_id = l.request_id
+          AND coverage.canonical_session_id = ?1
+         WHERE COALESCE(l.data_source, 'proxy') = 'proxy'
+           AND l.app_type = 'opencode'
+           AND l.status_code >= 200
+           AND l.status_code < 300
+           AND l.input_tokens = ?2
+           AND l.output_tokens = ?3
+           AND l.cache_read_tokens = ?4
+           AND (l.cache_creation_tokens = ?5 OR ?5 = 0)
+           AND l.created_at BETWEEN ?6 - ?7 AND ?6 + ?7
+           AND (
+               LOWER(l.model) = LOWER(?8)
+               OR LOWER(l.model) = 'unknown'
+               OR LOWER(?8) = 'unknown'
+           )
+         ORDER BY ABS(l.created_at - ?6), l.request_id",
+    )?;
+    let rows = statement.query_map(
+        rusqlite::params![
+            session_id,
+            key.input_tokens as i64,
+            key.output_tokens as i64,
+            key.cache_read_tokens as i64,
+            key.cache_creation_tokens as i64,
+            key.created_at,
+            SESSION_PROXY_DEDUP_WINDOW_SECONDS,
+            key.model,
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    for row in rows {
+        let request_id = row?;
+        if !claimed_proxy_request_ids.contains(&request_id) {
+            return Ok(Some(request_id));
+        }
+    }
+    Ok(None)
+}
+
+/// The shared matcher returns the closest proxy row, which is enough for a
+/// single event but cannot express the current batch's already-claimed IDs.
+/// When a batch has claimed one fingerprint, enumerate the same candidate set
+/// and skip those IDs so the next native message can claim the next proxy row.
+fn find_matching_proxy_usage_log_excluding_claimed(
+    conn: &rusqlite::Connection,
+    key: &DedupKey,
+    claimed_proxy_request_ids: &HashSet<String>,
+) -> Result<Option<String>, AppError> {
+    if claimed_proxy_request_ids.is_empty() {
+        return find_matching_proxy_usage_log(conn, key);
+    }
+
+    let coverage_table_exists: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'agent_session_canonical_coverage'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let coverage_filter = if coverage_table_exists {
+        "AND NOT EXISTS (
+               SELECT 1 FROM agent_session_canonical_coverage coverage
+               WHERE coverage.app_type = l.app_type
+                 AND coverage.data_source = 'proxy'
+                 AND coverage.request_id = l.request_id
+           )"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT l.request_id
+         FROM proxy_request_logs l
+         WHERE COALESCE(l.data_source, 'proxy') = 'proxy'
+           AND l.app_type = 'opencode'
+           AND l.status_code >= 200
+           AND l.status_code < 300
+           AND l.input_tokens = ?1
+           AND l.output_tokens = ?2
+           AND l.cache_read_tokens = ?3
+           AND (l.cache_creation_tokens = ?4 OR ?4 = 0)
+           AND l.created_at BETWEEN ?5 - ?6 AND ?5 + ?6
+           AND (
+               LOWER(l.model) = LOWER(?7)
+               OR LOWER(l.model) = 'unknown'
+               OR LOWER(?7) = 'unknown'
+           )
+           {coverage_filter}
+         ORDER BY ABS(l.created_at - ?5), l.request_id"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(
+        rusqlite::params![
+            key.input_tokens as i64,
+            key.output_tokens as i64,
+            key.cache_read_tokens as i64,
+            key.cache_creation_tokens as i64,
+            key.created_at,
+            SESSION_PROXY_DEDUP_WINDOW_SECONDS,
+            key.model,
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    for row in rows {
+        let request_id = row?;
+        if !claimed_proxy_request_ids.contains(&request_id) {
+            return Ok(Some(request_id));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1215,6 +1452,200 @@ mod tests {
             message_id.to_string(),
             parse_message_data(&value).expect("complete fixture message"),
         )
+    }
+
+    fn insert_matching_proxy_row(db: &Database, request_id: &str, message: &OpenCodeMessageData) {
+        let conn = db.conn.lock().expect("lock proxy fixture database");
+        conn.execute(
+            "INSERT INTO proxy_request_logs (
+                request_id, provider_id, app_type, model,
+                input_tokens, output_tokens, cache_read_tokens,
+                cache_creation_tokens, latency_ms, status_code, created_at
+             ) VALUES (?1, 'proxy-provider', 'opencode', ?2, ?3, ?4, ?5, ?6, 0, 200, ?7)",
+            rusqlite::params![
+                request_id,
+                message.model_id,
+                message.input_tokens,
+                output_tokens_with_reasoning(message),
+                message.cache_read_tokens,
+                message.cache_write_tokens,
+                message.timestamp_ms / 1000,
+            ],
+        )
+        .expect("insert matching proxy fixture");
+    }
+
+    #[test]
+    fn matching_proxy_is_excluded_from_canonical_rollup_and_marked() {
+        let db = Database::memory().expect("memory database");
+        let message = completed_message("native", 10, 5, 2, 3, 4, Some(0.1), 1_800_000_000_000);
+        insert_matching_proxy_row(&db, "proxy-opencode-1", &message.1);
+
+        let session = session_fixture("ses_proxy", OpenCodeStorage::Sqlite);
+        let query_result = OpenCodeMessageQueryResult {
+            messages: vec![message],
+            has_incomplete_usage: false,
+        };
+        let mut result = SessionSyncResult::default();
+        persist_opencode_session(&db, &session, &query_result, &mut result)
+            .expect("persist matching proxy");
+        let mut rescan = SessionSyncResult::default();
+        persist_opencode_session(&db, &session, &query_result, &mut rescan)
+            .expect("rescan matching proxy");
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.skipped, 1);
+        assert_eq!(rescan.imported, 0);
+        assert_eq!(rescan.skipped, 1);
+        let conn = db.conn.lock().expect("lock canonical fixture database");
+        let counts: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM proxy_request_logs),
+                    (SELECT COUNT(*) FROM agent_session_usage_rollups
+                     WHERE app_type = 'opencode' AND session_id = 'ses_proxy'),
+                    (SELECT COUNT(*) FROM agent_session_canonical_coverage
+                     WHERE app_type = 'opencode' AND data_source = 'proxy'
+                       AND request_id = 'proxy-opencode-1'),
+                    (SELECT COUNT(*) FROM agent_session_canonical_coverage
+                     WHERE app_type = 'opencode' AND data_source = 'opencode_session')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("proxy canonical counts");
+        assert_eq!(counts, (1, 0, 1, 0));
+        let canonical_session_id: String = conn
+            .query_row(
+                "SELECT canonical_session_id
+                 FROM agent_session_canonical_coverage
+                 WHERE app_type = 'opencode' AND data_source = 'proxy'
+                   AND request_id = 'proxy-opencode-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("proxy canonical marker");
+        assert_eq!(canonical_session_id, "ses_proxy");
+    }
+
+    #[test]
+    fn identical_native_messages_claim_distinct_proxy_rows() {
+        let db = Database::memory().expect("memory database");
+        let first = completed_message("native-1", 10, 5, 2, 3, 4, Some(0.1), 1_800_000_000_000);
+        let second = completed_message("native-2", 10, 5, 2, 3, 4, Some(0.1), 1_800_000_000_000);
+        insert_matching_proxy_row(&db, "proxy-opencode-1", &first.1);
+        insert_matching_proxy_row(&db, "proxy-opencode-2", &second.1);
+
+        let session = session_fixture("ses_two_proxies", OpenCodeStorage::Sqlite);
+        let query_result = OpenCodeMessageQueryResult {
+            messages: vec![first, second],
+            has_incomplete_usage: false,
+        };
+        let mut result = SessionSyncResult::default();
+        persist_opencode_session(&db, &session, &query_result, &mut result)
+            .expect("persist two matching proxies");
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.skipped, 2);
+        let conn = db.conn.lock().expect("lock two-proxy database");
+        let counts: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM proxy_request_logs),
+                    (SELECT COUNT(*) FROM agent_session_usage_rollups
+                     WHERE app_type = 'opencode' AND session_id = 'ses_two_proxies'),
+                    (SELECT COUNT(*) FROM agent_session_canonical_coverage
+                     WHERE app_type = 'opencode' AND data_source = 'proxy'),
+                    (SELECT COUNT(*) FROM agent_session_canonical_coverage
+                     WHERE app_type = 'opencode' AND data_source = 'opencode_session')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("two-proxy counts");
+        assert_eq!(counts, (2, 0, 2, 0));
+    }
+
+    #[test]
+    fn one_proxy_and_two_identical_native_messages_leave_one_native_owned() {
+        let db = Database::memory().expect("memory database");
+        let first = completed_message("native-1", 10, 5, 2, 3, 4, Some(0.1), 1_800_000_000_000);
+        let second = completed_message("native-2", 10, 5, 2, 3, 4, Some(0.1), 1_800_000_000_000);
+        insert_matching_proxy_row(&db, "proxy-opencode-1", &first.1);
+
+        let session = session_fixture("ses_one_proxy", OpenCodeStorage::Sqlite);
+        let query_result = OpenCodeMessageQueryResult {
+            messages: vec![first, second],
+            has_incomplete_usage: false,
+        };
+        let mut result = SessionSyncResult::default();
+        persist_opencode_session(&db, &session, &query_result, &mut result)
+            .expect("persist one matching proxy");
+
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.skipped, 1);
+        let conn = db.conn.lock().expect("lock one-proxy database");
+        let counts: (i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM proxy_request_logs),
+                    (SELECT request_count FROM agent_session_usage_rollups
+                     WHERE app_type = 'opencode' AND session_id = 'ses_one_proxy'),
+                    (SELECT COUNT(*) FROM agent_session_canonical_coverage
+                     WHERE app_type = 'opencode' AND data_source = 'proxy'),
+                    (SELECT COUNT(*) FROM agent_session_canonical_coverage
+                     WHERE app_type = 'opencode' AND data_source = 'opencode_session'),
+                    (SELECT input_tokens FROM agent_session_usage_rollups
+                     WHERE app_type = 'opencode' AND session_id = 'ses_one_proxy')",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("one-proxy counts");
+        assert_eq!(counts, (2, 1, 1, 1, 10));
+    }
+
+    #[test]
+    fn existing_source_rescan_rebuilds_canonical_without_duplicate_rows() {
+        let db = Database::memory().expect("memory database");
+        let message = completed_message("native", 10, 5, 2, 3, 4, Some(0.1), 1_800_000_000_000);
+        let session = session_fixture("ses_existing", OpenCodeStorage::Sqlite);
+        let query_result = OpenCodeMessageQueryResult {
+            messages: vec![message],
+            has_incomplete_usage: false,
+        };
+
+        let mut first = SessionSyncResult::default();
+        persist_opencode_session(&db, &session, &query_result, &mut first)
+            .expect("first OpenCode persist");
+        let mut second = SessionSyncResult::default();
+        persist_opencode_session(&db, &session, &query_result, &mut second)
+            .expect("existing OpenCode persist");
+
+        assert_eq!(first.imported, 1);
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.skipped, 1);
+        let conn = db.conn.lock().expect("lock existing-source database");
+        let counts: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM proxy_request_logs),
+                    (SELECT COUNT(*) FROM agent_session_usage_rollups
+                     WHERE app_type = 'opencode' AND session_id = 'ses_existing'),
+                    (SELECT request_count FROM agent_session_usage_rollups
+                     WHERE app_type = 'opencode' AND session_id = 'ses_existing'),
+                    (SELECT COUNT(*) FROM agent_session_canonical_coverage
+                     WHERE app_type = 'opencode' AND data_source = 'opencode_session')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("existing-source counts");
+        assert_eq!(counts, (1, 1, 1, 1));
     }
 
     #[test]

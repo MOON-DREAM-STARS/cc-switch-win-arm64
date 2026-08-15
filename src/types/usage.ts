@@ -47,6 +47,33 @@ export interface SessionSyncResult {
   errors: string[];
 }
 
+/** Providers supported by the explicit historical session-usage rebuild. */
+export const AGENT_USAGE_REBUILD_APPS = [
+  "claude",
+  "codex",
+  "grokbuild",
+  "opencode",
+  "hermes",
+] as const;
+
+export type AgentUsageRebuildApp = (typeof AGENT_USAGE_REBUILD_APPS)[number];
+
+export interface RebuildAgentSessionUsageRequest {
+  appTypes: AgentUsageRebuildApp[];
+}
+
+export type ProviderUsageRebuildStatus = "published" | "keptPrevious";
+
+export interface ProviderUsageRebuildResult {
+  appType: AgentUsageRebuildApp;
+  status: ProviderUsageRebuildStatus;
+  syncResult: SessionSyncResult;
+}
+
+export interface RebuildAgentSessionUsageResult {
+  providers: ProviderUsageRebuildResult[];
+}
+
 export interface DataSourceSummary {
   dataSource: string;
   requestCount: number;

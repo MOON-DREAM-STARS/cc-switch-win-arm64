@@ -13,6 +13,8 @@ import type {
   ProviderLimitStatus,
   PaginatedLogs,
   SessionSyncResult,
+  RebuildAgentSessionUsageRequest,
+  RebuildAgentSessionUsageResult,
   DataSourceSummary,
   AgentSessionUsageRequest,
   AgentSessionUsageSummary,
@@ -213,6 +215,12 @@ export const usageApi = {
 
   rebuildCodexUsage: async (): Promise<SessionSyncResult> => {
     return invoke("rebuild_codex_usage");
+  },
+
+  rebuildAgentSessionUsage: async (
+    request: RebuildAgentSessionUsageRequest,
+  ): Promise<RebuildAgentSessionUsageResult> => {
+    return invoke("rebuild_agent_session_usage", { request });
   },
 
   getDataSourceBreakdown: async (): Promise<DataSourceSummary[]> => {

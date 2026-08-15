@@ -64,6 +64,7 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::SystemTime;
 
 const GROK_APP_TYPE: &str = "grokbuild";
@@ -172,6 +173,20 @@ struct GrokRollupAccumulator {
     last_event_at: i64,
 }
 
+/// Durable request evidence retained in `proxy_request_logs`.  This is the
+/// source of truth for canonical request identity when an updates.jsonl
+/// rewrite no longer contains a previously imported prompt.
+#[derive(Debug, Clone)]
+struct GrokDurableRawRow {
+    request_id: String,
+    model: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    total_cost_usd: Option<Decimal>,
+    created_at: i64,
+}
+
 impl GrokRollupAccumulator {
     fn add(&mut self, turn: &GrokCounters, cost_is_partial: bool, created_at: i64) {
         self.request_count = self.request_count.saturating_add(1);
@@ -187,25 +202,49 @@ impl GrokRollupAccumulator {
         self.first_event_at = self.first_event_at.min(created_at);
         self.last_event_at = self.last_event_at.max(created_at);
 
+        let incoming_cost = (!cost_is_partial && turn.cost_reported)
+            .then(|| Decimal::from(turn.cost_ticks) / Decimal::from(10_000_000_000u64));
         if cost_is_partial {
             self.cost_has_partial = true;
         }
 
-        if self.cost_is_complete {
-            match (!cost_is_partial && turn.cost_reported)
-                .then(|| Decimal::from(turn.cost_ticks) / Decimal::from(10_000_000_000u64))
-            {
-                Some(cost) => {
-                    self.total_cost_usd = Some(self.total_cost_usd.unwrap_or(Decimal::ZERO) + cost);
-                }
-                None => {
-                    // The T03 bucket has no independent partial-cost flag.  A
-                    // single missing/partial turn therefore makes the whole
-                    // bucket's cost unknown instead of claiming an exact sum.
-                    self.total_cost_usd = None;
-                    self.cost_is_complete = false;
-                }
+        if let Some(cost) = incoming_cost {
+            // A raw fallback may already have made this bucket partial while
+            // retaining an explicitly stored legacy total.  Preserve that
+            // sum when possible; once any cost is unknown, keep it unknown.
+            if let Some(total) = self.total_cost_usd.as_mut() {
+                *total += cost;
             }
+        } else {
+            // The canonical bucket has no independent per-request cost
+            // quality field.  A single missing/partial source value therefore
+            // makes the exact total unavailable instead of claiming a sum.
+            self.total_cost_usd = None;
+            self.cost_is_complete = false;
+        }
+    }
+
+    /// Add a durable compatibility raw row when the current source rewrite no
+    /// longer contains its prompt.  The raw row proves request identity and
+    /// token/time values, and may carry a legacy total cost, but it does not
+    /// prove the original Grok cost-report or reasoning-token metadata.  Keep
+    /// the preserved total marked partial and never claim missing detail.
+    fn add_durable_raw(&mut self, row: &GrokDurableRawRow) {
+        self.request_count = self.request_count.saturating_add(1);
+        self.input_tokens = self.input_tokens.saturating_add(row.input_tokens.max(0));
+        self.output_tokens = self.output_tokens.saturating_add(row.output_tokens.max(0));
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(row.cache_read_tokens.max(0));
+        // Raw compatibility rows do not carry reasoning-token metadata.
+        self.reasoning_tokens = None;
+        self.first_event_at = self.first_event_at.min(row.created_at);
+        self.last_event_at = self.last_event_at.max(row.created_at);
+        self.cost_has_partial = true;
+        self.cost_is_complete = false;
+        match (&mut self.total_cost_usd, row.total_cost_usd.as_ref()) {
+            (Some(total), Some(cost)) => *total += cost,
+            _ => self.total_cost_usd = None,
         }
     }
 
@@ -323,11 +362,121 @@ fn add_grok_rollup(
     entry.add(turn, cost_is_partial, created_at);
 }
 
+fn load_grok_durable_raw_rows(
+    db: &Database,
+    session_id: &str,
+) -> Result<Vec<GrokDurableRawRow>, AppError> {
+    let conn = lock_conn!(db.conn);
+    let mut statement = conn
+        .prepare(
+            "SELECT request_id, model, input_tokens, output_tokens,
+                    cache_read_tokens, total_cost_usd, created_at
+             FROM proxy_request_logs
+             WHERE app_type = ?1 AND data_source = ?2 AND provider_id = ?3
+               AND session_id = ?4
+             ORDER BY request_id",
+        )
+        .map_err(|error| AppError::Database(format!("读取 Grok durable raw rows 失败: {error}")))?;
+    let rows = statement
+        .query_map(
+            rusqlite::params![
+                GROK_APP_TYPE,
+                GROK_SESSION_DATA_SOURCE,
+                GROK_SESSION_PROVIDER_ID,
+                session_id
+            ],
+            |row| {
+                let total_cost = row
+                    .get::<_, Option<String>>(5)?
+                    .and_then(|value| Decimal::from_str(&value).ok());
+                Ok(GrokDurableRawRow {
+                    request_id: row.get(0)?,
+                    model: row.get(1)?,
+                    input_tokens: row.get(2)?,
+                    output_tokens: row.get(3)?,
+                    cache_read_tokens: row.get(4)?,
+                    total_cost_usd: total_cost,
+                    created_at: row.get(6)?,
+                })
+            },
+        )
+        .map_err(|error| AppError::Database(format!("读取 Grok durable raw rows 失败: {error}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| AppError::Database(format!("解析 Grok durable raw rows 失败: {error}")))?;
+    Ok(rows)
+}
+
+fn add_grok_durable_raw_rollup(
+    buckets: &mut HashMap<GrokRollupKey, GrokRollupAccumulator>,
+    session_id: &str,
+    row: &GrokDurableRawRow,
+) {
+    let key = grok_rollup_key(session_id, &row.model, row.created_at);
+    let entry = buckets
+        .entry(key.clone())
+        .or_insert_with(|| GrokRollupAccumulator {
+            key,
+            request_ids: Vec::new(),
+            request_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            reasoning_tokens: Some(0),
+            total_cost_usd: Some(Decimal::ZERO),
+            cost_is_complete: true,
+            cost_has_partial: false,
+            first_event_at: row.created_at,
+            last_event_at: row.created_at,
+        });
+    if !entry.request_ids.iter().any(|id| id == &row.request_id) {
+        entry.request_ids.push(row.request_id.clone());
+    }
+    entry.add_durable_raw(row);
+}
+
 fn write_grok_rollups(
     db: &Database,
-    buckets: HashMap<GrokRollupKey, GrokRollupAccumulator>,
+    session_id: &str,
+    admitted_turns: HashMap<String, (GrokCounters, bool)>,
     marked_at: i64,
 ) -> Result<(), AppError> {
+    // The current updates.jsonl scan is not a durable history boundary: a
+    // source rewind can remove an already imported prompt while appending a
+    // new one.  Rebuild every canonical bucket from all retained provider raw
+    // rows, using current events only for richer per-request metadata.
+    let durable_rows = load_grok_durable_raw_rows(db, session_id)?;
+    if durable_rows.is_empty() {
+        // Do not erase an older canonical generation when the compatibility
+        // raw rows have already been pruned; there is no evidence to rebuild
+        // it from in this sync pass.
+        return Ok(());
+    }
+
+    let mut buckets: HashMap<GrokRollupKey, GrokRollupAccumulator> = HashMap::new();
+    for row in &durable_rows {
+        if let Some((turn, cost_is_partial)) = admitted_turns.get(&row.request_id) {
+            add_grok_rollup(
+                &mut buckets,
+                session_id,
+                &row.model,
+                &row.request_id,
+                turn,
+                *cost_is_partial,
+                row.created_at,
+            );
+        } else {
+            // Historical rows still prove request/token/time identity, but do
+            // not prove source reasoning or cost-report quality.  The raw
+            // fallback preserves any stored legacy total while marking the
+            // resulting bucket partial.
+            add_grok_durable_raw_rollup(&mut buckets, session_id, row);
+            log::warn!(
+                "[GROK-SYNC] canonical rebuild uses durable raw fallback for request_id={}",
+                row.request_id
+            );
+        }
+    }
+
     // Sorting is not required for correctness, but makes writes deterministic
     // and keeps fixture diagnostics stable across HashMap iteration orders.
     let mut values: Vec<_> = buckets.into_values().collect();
@@ -342,58 +491,20 @@ fn write_grok_rollups(
         AppError::Database(format!("开启 Grok canonical 覆盖事务失败: {error}"))
     })?;
 
+    // This is a full source-scoped replacement, not an additive update.  The
+    // durable raw rows above are the complete retained request identity set;
+    // deleting the prior source/session buckets prevents an old model/date
+    // bucket from surviving a prompt or source rewrite.
+    tx.execute(
+        "DELETE FROM agent_session_usage_rollups
+         WHERE app_type = ?1 AND session_id = ?2 AND data_source = ?3",
+        rusqlite::params![GROK_APP_TYPE, session_id, GROK_SESSION_DATA_SOURCE],
+    )
+    .map_err(|error| AppError::Database(format!("清理 Grok canonical 桶失败: {error}")))?;
+
     for accumulator in values {
         let request_ids = accumulator.request_ids.clone();
         let fact = accumulator.into_fact();
-        // A source rewind can remove old lines from updates.jsonl while the
-        // already-imported raw rows remain durable by design.  Never shrink a
-        // canonical bucket merely because this rescan sees a shorter prefix;
-        // equal/newer counts still replace the bucket with the complete
-        // aggregation computed above.
-        let existing_count = {
-            tx.query_row(
-                "SELECT request_count FROM agent_session_usage_rollups
-                 WHERE date = ?1 AND app_type = ?2 AND session_id = ?3
-                   AND provider_id = ?4 AND model = ?5 AND request_model = ?6
-                   AND pricing_model = ?7 AND data_source = ?8 AND precision = ?9
-                   AND time_semantics = ?10 AND request_count_semantics = ?11
-                   AND input_token_semantics = ?12 AND source_identity = ?13
-                   AND profile_id = ?14 AND database_identity = ?15
-                   AND base_url_digest = ?16 AND billing_mode = ?17
-                   AND task = ?18 AND source_version = ?19
-                   AND sync_window_start = ?20 AND sync_window_end = ?21",
-                rusqlite::params![
-                    &fact.date,
-                    &fact.app_type,
-                    &fact.session_id,
-                    &fact.provider_id,
-                    &fact.model,
-                    &fact.request_model,
-                    &fact.pricing_model,
-                    &fact.data_source,
-                    fact.precision.as_str(),
-                    fact.time_semantics.as_str(),
-                    fact.request_count_semantics.as_str(),
-                    fact.input_token_semantics,
-                    &fact.source_identity,
-                    &fact.profile_id,
-                    &fact.database_identity,
-                    &fact.base_url_digest,
-                    &fact.billing_mode,
-                    &fact.task,
-                    &fact.source_version,
-                    fact.sync_window_start,
-                    fact.sync_window_end,
-                ],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .optional()
-            .map_err(|error| AppError::Database(format!("读取 Grok canonical 桶失败: {error}")))?
-            .flatten()
-        };
-        if existing_count.is_some_and(|count| count > fact.request_count.unwrap_or_default()) {
-            continue;
-        }
         write_agent_session_usage_rollup_fact_on_conn(&tx, &fact)?;
 
         // Marker writes intentionally follow the canonical upsert in the same
@@ -711,7 +822,7 @@ fn sync_single_grok_file(db: &Database, file_path: &Path) -> Result<SessionSyncR
     // raw UPSERT has the same last-value semantics for a (rare) duplicate
     // turn_completed prompt; aggregating directly while iterating would count
     // that replacement twice in the canonical bucket.
-    let mut admitted_turns: HashMap<(String, String), (GrokCounters, bool, i64)> = HashMap::new();
+    let mut admitted_turns: HashMap<String, (GrokCounters, bool)> = HashMap::new();
 
     for (idx, event) in events.iter().enumerate() {
         // 沉降窗：事件按 append 顺序时间单调，遇到第一条未沉降的事件即停，
@@ -794,47 +905,21 @@ fn sync_single_grok_file(db: &Database, file_path: &Path) -> Result<SessionSyncR
             // the duplicate-key boundary.  One turn is one AgentCall
             // regardless of `modelCalls`; that field remains source metadata.
             if raw_write_ok {
-                let key = (turn_key, model.clone());
-                if let Some(existing) = admitted_turns.get_mut(&key) {
+                if let Some(existing) = admitted_turns.get_mut(&request_id) {
                     // Raw UPSERT keeps created_at from the first insert even
                     // when a duplicate prompt later replaces token values.
-                    let first_event_at = existing.2;
-                    *existing = (
-                        *turn,
-                        event.cost_is_partial || turn.cost_partial,
-                        first_event_at,
-                    );
+                    *existing = (*turn, event.cost_is_partial || turn.cost_partial);
                 } else {
                     admitted_turns.insert(
-                        key,
-                        (
-                            *turn,
-                            event.cost_is_partial || turn.cost_partial,
-                            event.created_at,
-                        ),
+                        request_id,
+                        (*turn, event.cost_is_partial || turn.cost_partial),
                     );
                 }
             }
         }
     }
 
-    let mut rollup_buckets: HashMap<GrokRollupKey, GrokRollupAccumulator> = HashMap::new();
-    for ((turn_key, model), (turn, cost_is_partial, created_at)) in admitted_turns {
-        let request_id = format!(
-            "{GROK_SESSION_DATA_SOURCE}:{}:{turn_key}:{model}",
-            identity.session_id
-        );
-        add_grok_rollup(
-            &mut rollup_buckets,
-            &identity.session_id,
-            &model,
-            &request_id,
-            &turn,
-            cost_is_partial,
-            created_at,
-        );
-    }
-    write_grok_rollups(db, rollup_buckets, now)?;
+    write_grok_rollups(db, &identity.session_id, admitted_turns, now)?;
 
     if deferred {
         // 不落同步状态：下一轮重读整个文件，把沉降后的事件补入。
@@ -1101,6 +1186,7 @@ fn insert_grok_session_entry(
           AND (input_tokens != excluded.input_tokens
            OR output_tokens != excluded.output_tokens
            OR cache_read_tokens != excluded.cache_read_tokens
+           OR total_cost_usd != excluded.total_cost_usd
            OR latency_ms != excluded.latency_ms
            OR model != excluded.model)",
         rusqlite::params![
@@ -1827,6 +1913,170 @@ mod tests {
             3,
             "rewind skip adds no marker"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_rebuild_retains_durable_rows_across_rewind_and_update() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let temp = tempdir().expect("tempdir");
+        let full = vec![
+            usage_event_line(
+                OLD_EPOCH,
+                "p1",
+                &model_counters("grok-4.5-build", 100, 10, 0, 1),
+            ),
+            usage_event_line(
+                OLD_EPOCH + 60,
+                "p2",
+                &model_counters("grok-4.5-build", 200, 20, 0, 1),
+            ),
+            usage_event_line(
+                OLD_EPOCH + 120,
+                "p3",
+                &model_counters("grok-4.5-build", 300, 30, 0, 1),
+            ),
+        ];
+        let path = write_session_file(temp.path(), "sess-durable-rewind", &full);
+        assert_eq!(sync_single_grok_file(&db, &path)?.imported, 3);
+
+        // The source rewinds away p2 while appending p4.  The current scan has
+        // three prompts again, but durable raw rows prove four unique IDs.
+        let rewritten = vec![
+            full[0].clone(),
+            full[2].clone(),
+            usage_event_line(
+                OLD_EPOCH + 180,
+                "p4",
+                &model_counters("grok-4.5-build", 400, 40, 0, 1),
+            ),
+        ];
+        write_session_file(temp.path(), "sess-durable-rewind", &rewritten);
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute("DELETE FROM session_log_sync", [])?;
+        }
+
+        assert_eq!(sync_single_grok_file(&db, &path)?.imported, 1);
+        let canonical = query_canonical_rows(&db)?;
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].request_count, Some(4));
+        assert_eq!(
+            (
+                canonical[0].input_tokens,
+                canonical[0].output_tokens,
+                canonical[0].cache_read_tokens
+            ),
+            (1000, 100, 0),
+            "p2 remains counted and new p4 is included"
+        );
+        assert_eq!(
+            canonical[0].reasoning_tokens, None,
+            "raw fallback does not claim unsupported reasoning metadata"
+        );
+        assert_eq!(canonical[0].cost_status.as_deref(), Some("partial"));
+        assert_eq!(query_coverage_markers(&db)?.len(), 4);
+
+        // Updating p3 replaces its durable raw contribution; it must not add
+        // a fifth request to the rebuilt canonical bucket.
+        let updated = vec![
+            full[0].clone(),
+            usage_event_line(
+                OLD_EPOCH + 120,
+                "p3",
+                &model_counters("grok-4.5-build", 350, 35, 0, 1),
+            ),
+            rewritten[2].clone(),
+        ];
+        write_session_file(temp.path(), "sess-durable-rewind", &updated);
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute("DELETE FROM session_log_sync", [])?;
+        }
+        assert_eq!(sync_single_grok_file(&db, &path)?.imported, 1);
+
+        let canonical = query_canonical_rows(&db)?;
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].request_count, Some(4));
+        assert_eq!(
+            (canonical[0].input_tokens, canonical[0].output_tokens),
+            (1050, 105),
+            "updating p3 replaces its contribution without increasing count"
+        );
+        assert_eq!(query_coverage_markers(&db)?.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn durable_raw_refreshes_cost_only_updates_before_rewind() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let temp = tempdir().expect("tempdir");
+        let initial = vec![
+            usage_event_line(
+                OLD_EPOCH,
+                "p1",
+                &model_counters_with_ticks("grok-4.5-build", 100, 10, 0, 1, 1_000),
+            ),
+            usage_event_line(
+                OLD_EPOCH + 60,
+                "p2",
+                &model_counters_with_ticks("grok-4.5-build", 200, 20, 0, 1, 2_000),
+            ),
+            usage_event_line(
+                OLD_EPOCH + 120,
+                "p3",
+                &model_counters_with_ticks("grok-4.5-build", 300, 30, 0, 1, 3_000),
+            ),
+        ];
+        let path = write_session_file(temp.path(), "sess-cost-rewind", &initial);
+        assert_eq!(sync_single_grok_file(&db, &path)?.imported, 3);
+
+        // Keep p3's token/latency fields identical but change only its source
+        // reported cost.  The durable compatibility row must refresh too.
+        let cost_updated = vec![
+            initial[0].clone(),
+            initial[1].clone(),
+            usage_event_line(
+                OLD_EPOCH + 120,
+                "p3",
+                &model_counters_with_ticks("grok-4.5-build", 300, 30, 0, 1, 9_000),
+            ),
+        ];
+        write_session_file(temp.path(), "sess-cost-rewind", &cost_updated);
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute("DELETE FROM session_log_sync", [])?;
+        }
+        assert_eq!(sync_single_grok_file(&db, &path)?.imported, 1);
+
+        let p3_request_id = "grok_session:sess-cost-rewind:p3:grok-4.5-build";
+        let refreshed_cost: String = {
+            let conn = lock_conn!(db.conn);
+            conn.query_row(
+                "SELECT total_cost_usd FROM proxy_request_logs WHERE request_id = ?1",
+                [p3_request_id],
+                |row| row.get(0),
+            )?
+        };
+        let expected_cost = Decimal::from(9_000u64) / Decimal::from(10_000_000_000u64);
+        assert_eq!(
+            Decimal::from_str(&refreshed_cost).expect("decimal"),
+            expected_cost
+        );
+
+        // Rewind away p3.  Its fallback must use the refreshed durable cost,
+        // while the request still contributes exactly one historical count.
+        write_session_file(temp.path(), "sess-cost-rewind", &cost_updated[..2]);
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute("DELETE FROM session_log_sync", [])?;
+        }
+        assert_eq!(sync_single_grok_file(&db, &path)?.imported, 0);
+        let canonical = query_canonical_rows(&db)?;
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].request_count, Some(3));
+        assert_eq!(canonical[0].reasoning_tokens, None);
+        assert_eq!(canonical[0].cost_status.as_deref(), Some("partial"));
         Ok(())
     }
 

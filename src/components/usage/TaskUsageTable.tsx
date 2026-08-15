@@ -13,9 +13,9 @@ import {
   useAgentTaskUsage,
   useAgentTaskUsageFilterOptions,
   useAgentUsageCapabilities,
+  type AgentTaskUsageQueryFilter,
 } from "@/lib/query/usage";
 import {
-  type AgentTaskUsageFilter,
   type AgentTaskUsageRow,
   type AgentUsageCapability,
   type AgentUsageMeasure,
@@ -792,8 +792,13 @@ export function TaskUsageTable({
     setAgentAppType(initialAppType ?? "all");
   }, [initialAppType]);
 
-  const queryRange = useMemo(
-    () => toAgentUsageRange(range),
+  const rangeSelection = useMemo<UsageRangeSelection>(
+    () => ({
+      preset: range.preset,
+      customStartDate: range.customStartDate,
+      customEndDate: range.customEndDate,
+      liveEndTime: range.liveEndTime,
+    }),
     [
       range.customEndDate,
       range.customStartDate,
@@ -802,16 +807,16 @@ export function TaskUsageTable({
     ],
   );
 
-  const filter = useMemo<AgentTaskUsageFilter>(
+  const filter = useMemo<AgentTaskUsageQueryFilter>(
     () => ({
       appType: agentAppType === "all" ? undefined : agentAppType,
       titleExact: title.trim() || undefined,
       projectDirExact: projectDir.trim() || undefined,
-      range: queryRange,
+      rangeSelection,
       limit: TASK_PAGE_SIZE,
       offset: page * TASK_PAGE_SIZE,
     }),
-    [agentAppType, page, projectDir, queryRange, title],
+    [agentAppType, page, projectDir, rangeSelection, title],
   );
 
   const { data, isLoading, isError, error, isFetching } = useAgentTaskUsage(
@@ -826,7 +831,7 @@ export function TaskUsageTable({
   const filterOptionsQuery = useAgentTaskUsageFilterOptions(
     {
       appType: agentAppType === "all" ? undefined : agentAppType,
-      range: queryRange,
+      rangeSelection,
     },
     {
       refetchInterval: refreshIntervalMs > 0 ? refreshIntervalMs : false,
@@ -867,7 +872,7 @@ export function TaskUsageTable({
   useEffect(() => {
     setTitle("");
     setProjectDir("");
-  }, [agentAppType, queryRange.startAt, queryRange.endAt]);
+  }, [agentAppType, rangeSelection]);
 
   const toggleExpanded = (key: string) => {
     setExpandedRows((current) =>
