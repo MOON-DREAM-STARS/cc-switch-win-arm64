@@ -359,13 +359,25 @@ pub(crate) fn effective_session_usage_log_filter(log_alias: &str) -> String {
     format!(
         "({base_filter})
          AND NOT (
-            {data_source} IN ('session_log', 'codex_session', 'gemini_session', 'grok_session', 'opencode_session')
-            AND EXISTS (
-                SELECT 1
-                FROM agent_session_canonical_coverage canonical_coverage
-                WHERE canonical_coverage.app_type = {log_alias}.app_type
-                  AND canonical_coverage.data_source = {data_source}
-                  AND canonical_coverage.request_id = {log_alias}.request_id
+            (
+                {data_source} IN ('session_log', 'codex_session', 'gemini_session', 'grok_session', 'opencode_session')
+                AND EXISTS (
+                    SELECT 1
+                    FROM agent_session_canonical_coverage canonical_coverage
+                    WHERE canonical_coverage.app_type = {log_alias}.app_type
+                      AND canonical_coverage.data_source = {data_source}
+                      AND canonical_coverage.request_id = {log_alias}.request_id
+                )
+            )
+            OR (
+                {data_source} = 'proxy'
+                AND EXISTS (
+                    SELECT 1
+                    FROM agent_session_canonical_coverage canonical_coverage
+                    WHERE canonical_coverage.app_type = {log_alias}.app_type
+                      AND canonical_coverage.data_source = 'proxy'
+                      AND canonical_coverage.request_id = {log_alias}.request_id
+                )
             )
         )"
     )
@@ -395,13 +407,13 @@ pub(crate) fn should_skip_session_insert(
     request_id: &str,
     key: &DedupKey,
 ) -> Result<bool, AppError> {
-    if proxy_request_id_exists(conn, request_id)? {
+    if has_proxy_request_id(conn, request_id)? {
         return Ok(true);
     }
     has_matching_proxy_usage_log(conn, key)
 }
 
-fn proxy_request_id_exists(conn: &Connection, request_id: &str) -> Result<bool, AppError> {
+pub(crate) fn has_proxy_request_id(conn: &Connection, request_id: &str) -> Result<bool, AppError> {
     conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM proxy_request_logs WHERE request_id = ?1)")
         .and_then(|mut stmt| stmt.query_row(params![request_id], |row| row.get::<_, bool>(0)))
         .map_err(|e| AppError::Database(format!("查询 request_id 失败: {e}")))
@@ -409,39 +421,76 @@ fn proxy_request_id_exists(conn: &Connection, request_id: &str) -> Result<bool, 
 
 // 会话重导每个 token 事件都要跑一次这条查询；SQL 文本静态化让
 // prepare_cached 稳定命中，也省掉每行的 format! 分配。
-static MATCHING_PROXY_USAGE_LOG_SQL: LazyLock<String> = LazyLock::new(|| {
+fn matching_proxy_usage_log_sql(include_coverage: bool) -> String {
     let l_data_source = data_source_expr("l");
     let app_type_match = dedup_app_type_match_sql("l.app_type", "?1");
+    let coverage_filter = if include_coverage {
+        "AND NOT EXISTS (
+               SELECT 1
+               FROM agent_session_canonical_coverage coverage
+               WHERE coverage.app_type = l.app_type
+                 AND coverage.data_source = 'proxy'
+                 AND coverage.request_id = l.request_id
+           )"
+    } else {
+        ""
+    };
     format!(
-        "SELECT EXISTS (
-            SELECT 1
-            FROM proxy_request_logs l
-            WHERE {l_data_source} = 'proxy'
-              AND {app_type_match}
-              AND l.status_code >= 200
-              AND l.status_code < 300
-              AND l.input_tokens = ?3
-              AND l.output_tokens = ?4
-              AND l.cache_read_tokens = ?5
-              AND (l.cache_creation_tokens = ?6 OR ?9 = 1)
-              AND l.created_at BETWEEN ?7 - ?8 AND ?7 + ?8
-              AND (
-                  LOWER(l.model) = LOWER(?2)
-                  OR LOWER(l.model) = 'unknown'
-                  OR LOWER(?2) = 'unknown'
-              )
-        )"
+        "SELECT l.request_id
+         FROM proxy_request_logs l
+         WHERE {l_data_source} = 'proxy'
+           AND {app_type_match}
+           AND l.status_code >= 200
+           AND l.status_code < 300
+           AND l.input_tokens = ?3
+           AND l.output_tokens = ?4
+           AND l.cache_read_tokens = ?5
+           AND (l.cache_creation_tokens = ?6 OR ?9 = 1)
+           AND l.created_at BETWEEN ?7 - ?8 AND ?7 + ?8
+           AND (
+               LOWER(l.model) = LOWER(?2)
+               OR LOWER(l.model) = 'unknown'
+               OR LOWER(?2) = 'unknown'
+           )
+           {coverage_filter}
+         ORDER BY ABS(l.created_at - ?7), l.request_id
+         LIMIT 1"
     )
-});
+}
 
-pub(crate) fn has_matching_proxy_usage_log(
+static MATCHING_PROXY_USAGE_LOG_SQL: LazyLock<String> =
+    LazyLock::new(|| matching_proxy_usage_log_sql(true));
+static MATCHING_PROXY_USAGE_LOG_SQL_LEGACY: LazyLock<String> =
+    LazyLock::new(|| matching_proxy_usage_log_sql(false));
+
+/// Find one unclaimed successful proxy row whose token fingerprint and event
+/// time exactly match a session event.  The request id/order make the choice
+/// deterministic when duplicate fingerprints occur in the ten-minute window;
+/// the proxy coverage marker makes the match one-to-one across replay passes.
+pub(crate) fn find_matching_proxy_usage_log(
     conn: &Connection,
     key: &DedupKey,
-) -> Result<bool, AppError> {
+) -> Result<Option<String>, AppError> {
     let allow_missing_cache_creation =
         matches!(key.app_type, "codex" | "gemini" | "opencode") && key.cache_creation_tokens == 0;
 
-    conn.prepare_cached(&MATCHING_PROXY_USAGE_LOG_SQL)
+    let coverage_table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'agent_session_canonical_coverage'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| AppError::Database(format!("查询规范覆盖表失败: {e}")))?;
+    let sql = if coverage_table_exists {
+        &*MATCHING_PROXY_USAGE_LOG_SQL
+    } else {
+        &*MATCHING_PROXY_USAGE_LOG_SQL_LEGACY
+    };
+
+    conn.prepare_cached(sql)
         .and_then(|mut stmt| {
             stmt.query_row(
                 params![
@@ -455,10 +504,18 @@ pub(crate) fn has_matching_proxy_usage_log(
                     SESSION_PROXY_DEDUP_WINDOW_SECONDS,
                     allow_missing_cache_creation as i64,
                 ],
-                |row| row.get::<_, bool>(0),
+                |row| row.get::<_, String>(0),
             )
+            .optional()
         })
         .map_err(|e| AppError::Database(format!("查询重复代理用量日志失败: {e}")))
+}
+
+pub(crate) fn has_matching_proxy_usage_log(
+    conn: &Connection,
+    key: &DedupKey,
+) -> Result<bool, AppError> {
+    Ok(find_matching_proxy_usage_log(conn, key)?.is_some())
 }
 
 /// grokbuild 会话导入的接管活动守卫：给定时刻 ±窗口内存在任何 grokbuild

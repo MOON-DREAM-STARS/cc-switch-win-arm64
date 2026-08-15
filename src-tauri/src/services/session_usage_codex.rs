@@ -29,9 +29,10 @@ use crate::services::session_usage::{
     metadata_modified_nanos, update_sync_state, update_sync_state_on_conn, SessionSyncResult,
 };
 use crate::services::usage_stats::{
-    find_model_pricing, has_suspected_codex_session_duplicate, should_skip_session_insert, DedupKey,
+    find_matching_proxy_usage_log, find_model_pricing, has_proxy_request_id,
+    has_suspected_codex_session_duplicate, should_skip_session_insert, DedupKey,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -51,7 +52,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 const CODEX_THREAD_REQUEST_ID_PREFIX: &str = "codex_session:thread-v1";
-const CODEX_REPLAY_STATE_KEY: &str = "codex_usage_canonical_replay_v1";
+const CODEX_REPLAY_STATE_KEY: &str = "codex_usage_canonical_replay_v2";
 const CODEX_REPLAY_PENDING: &str = "pending";
 const CODEX_REPLAYING: &str = "replaying";
 const CODEX_REPLAY_COMPLETE: &str = "complete";
@@ -402,6 +403,11 @@ pub(crate) fn reset_codex_usage_on_conn(
             conn,
             "codex",
             "codex_session",
+        )?;
+        Database::delete_agent_session_canonical_coverage_for_source_on_conn(
+            conn,
+            "codex",
+            "proxy",
         )?;
     }
     if sqlite_table_exists(conn, "session_log_sync")?
@@ -1590,9 +1596,7 @@ fn codex_fact_from_event(
         return None;
     }
     let key = CodexFactKey {
-        date: DateTime::<Utc>::from_timestamp(timestamp, 0)?
-            .date_naive()
-            .to_string(),
+        date: Local.timestamp_opt(timestamp, 0).single()?.date_naive().to_string(),
         session_id: session_id.to_string(),
         model: event.model.clone(),
         precision: event.precision.as_str().to_string(),
@@ -2085,6 +2089,7 @@ fn sync_single_codex_file(
         let mut batch_suspected = 0u32;
         let mut canonical_observations: HashMap<CodexFactKey, CodexFactAccumulator> =
             HashMap::new();
+        let mut proxy_coverage: Vec<(String, String, i64)> = Vec::new();
         for (event, event_index) in batch {
             let request_id =
                 format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{root_thread_id}:{event_index}");
@@ -2099,30 +2104,78 @@ fn sync_single_codex_file(
                 batch_skipped = batch_skipped.saturating_add(1);
                 continue;
             };
-            match insert_codex_session_entry_on_conn(
+            if Database::has_agent_session_canonical_coverage_on_conn(
                 &tx,
+                "codex",
+                "codex_session",
                 &request_id,
-                &event.delta,
-                &event.model,
-                Some(root_thread_id),
-                event.timestamp.as_deref(),
-                &mut batch_suspected,
-                &mut pass.pricing,
-            ) {
-                Ok(true) => {
-                    remember_request_precision(&request_id, event.precision);
-                    let aggregate = canonical_observations.entry(fact_key).or_default();
-                    merge_codex_fact_accumulator(aggregate, fact_observation);
-                    batch_imported += 1;
+            )? || has_proxy_request_id(&tx, &request_id)?
+            {
+                batch_skipped = batch_skipped.saturating_add(1);
+                continue;
+            }
+
+            let created_at = event_timestamp_epoch(event.timestamp.as_deref()).unwrap_or(0);
+            let dedup_key = DedupKey {
+                app_type: "codex",
+                model: &event.model,
+                input_tokens: event.delta.input,
+                output_tokens: event.delta.output,
+                cache_read_tokens: event.delta.cached_input,
+                cache_creation_tokens: 0,
+                created_at,
+            };
+            let matched_proxy = find_matching_proxy_usage_log(&tx, &dedup_key)?;
+            let inserted_compatibility_row = if matched_proxy.is_some() {
+                false
+            } else {
+                match insert_codex_session_entry_on_conn(
+                    &tx,
+                    &request_id,
+                    &event.delta,
+                    &event.model,
+                    Some(root_thread_id),
+                    event.timestamp.as_deref(),
+                    &mut batch_suspected,
+                    &mut pass.pricing,
+                ) {
+                    Ok(inserted) => inserted,
+                    Err(e) => {
+                        log::warn!("[CODEX-SYNC] 插入失败 ({request_id}): {e}");
+                        false
+                    }
                 }
-                Ok(false) => batch_skipped += 1,
-                Err(e) => {
-                    log::warn!("[CODEX-SYNC] 插入失败 ({request_id}): {e}");
-                    batch_skipped += 1;
+            };
+
+            if inserted_compatibility_row || matched_proxy.is_some() {
+                remember_request_precision(&request_id, event.precision);
+                let aggregate = canonical_observations.entry(fact_key).or_default();
+                merge_codex_fact_accumulator(aggregate, fact_observation);
+                if let Some(proxy_request_id) = matched_proxy {
+                    proxy_coverage.push((
+                        proxy_request_id,
+                        root_thread_id.to_string(),
+                        created_at,
+                    ));
                 }
+                batch_imported = batch_imported.saturating_add(1);
+            } else {
+                batch_skipped = batch_skipped.saturating_add(1);
             }
         }
         persist_codex_facts_on_conn(&tx, canonical_observations)?;
+        for (request_id, session_id, marked_at) in proxy_coverage {
+            Database::upsert_agent_session_canonical_coverage_on_conn(
+                &tx,
+                &AgentSessionCanonicalCoverageMarker {
+                    app_type: "codex".to_string(),
+                    data_source: "proxy".to_string(),
+                    request_id,
+                    canonical_session_id: Some(session_id),
+                    marked_at,
+                },
+            )?;
+        }
         if is_last_batch {
             // 游标推进与最后一批数据同事务提交：中途崩溃时两者一起回滚，
             // 不会出现"游标已推进但数据缺失"的丢数据窗口。
@@ -3842,6 +3895,78 @@ mod tests {
         })?;
         assert_eq!(count, 1);
 
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_matching_proxy_row_still_persists_canonical_fact_and_coverage() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let file = rollout_path(temp.path(), PARENT_ID);
+        let event_time = "2026-07-10T03:00:02Z";
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, request_model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    total_cost_usd, latency_ms, status_code, created_at, data_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    "proxy-match-1",
+                    "openai",
+                    "codex",
+                    "gpt-5.6-sol",
+                    "gpt-5.6-sol",
+                    10,
+                    2,
+                    1,
+                    0,
+                    "0.01",
+                    100,
+                    200,
+                    DateTime::parse_from_rfc3339(event_time).unwrap().timestamp(),
+                    "proxy"
+                ],
+            )?;
+        }
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count_at(10, 1, 2, event_time),
+            ],
+        );
+
+        let result = sync_test_file(&db, &file, &[&file])?;
+        assert_eq!(result.imported, 1);
+        let conn = lock_conn!(db.conn);
+        let compatibility_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        let fact_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_usage_rollups
+             WHERE app_type = 'codex' AND data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        let (source_coverage, proxy_coverage): (i64, i64) = conn.query_row(
+            "SELECT
+                SUM(CASE WHEN data_source = 'codex_session' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN data_source = 'proxy' THEN 1 ELSE 0 END)
+             FROM agent_session_canonical_coverage
+             WHERE app_type = 'codex'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(compatibility_rows, 0);
+        assert_eq!(fact_rows, 1);
+        assert_eq!((source_coverage, proxy_coverage), (1, 1));
         Ok(())
     }
 

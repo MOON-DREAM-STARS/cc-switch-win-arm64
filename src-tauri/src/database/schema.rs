@@ -710,6 +710,11 @@ impl Database {
                         Self::migrate_v20_to_v21(conn)?;
                         Self::set_user_version(conn, 21)?;
                     }
+                    21 => {
+                        log::info!("迁移数据库从 v21 到 v22（修复 Codex 代理去重与本地日桶）");
+                        Self::migrate_v21_to_v22(conn)?;
+                        Self::set_user_version(conn, 22)?;
+                    }
                     _ => {
                         return Err(AppError::Database(format!(
                             "未知的数据库版本 {version}，无法迁移到 {SCHEMA_VERSION}"
@@ -2084,6 +2089,66 @@ impl Database {
             [state],
         )
         .map_err(|e| AppError::Database(format!("写入 Codex 重放状态失败: {e}")))?;
+        Ok(())
+    }
+
+    /// v21 -> v22：Codex 规范化重放需要重新认领与代理请求精确匹配的
+    /// 事件，并把 rollup 日桶改为本地日历日期。只设置状态，实际备份、
+    /// 清理和导入仍由后台同步状态机执行。
+    fn migrate_v21_to_v22(conn: &Connection) -> Result<(), AppError> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("补齐 settings 表失败: {e}")))?;
+        let has_codex_rows: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM proxy_request_logs
+                    WHERE COALESCE(data_source, 'proxy') IN ('codex_session', 'proxy')
+                      AND app_type = 'codex'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        let has_codex_rollups: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM agent_session_usage_rollups
+                    WHERE app_type = 'codex'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        let has_codex_cursor: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM session_log_sync
+                    WHERE file_path LIKE '%/sessions/%/rollout-%'
+                       OR file_path LIKE '%\\sessions\\%\\rollout-%'
+                       OR file_path LIKE '%/archived_sessions/rollout-%'
+                       OR file_path LIKE '%\\archived_sessions\\rollout-%'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        let state = if has_codex_rows || has_codex_rollups || has_codex_cursor {
+            "pending"
+        } else {
+            "complete"
+        };
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value)
+             VALUES ('codex_usage_canonical_replay_v2', ?1)",
+            [state],
+        )
+        .map_err(|e| AppError::Database(format!("写入 Codex v2 重放状态失败: {e}")))?;
         Ok(())
     }
 
@@ -4370,6 +4435,45 @@ mod tests {
         assert_eq!(
             cursor_only.query_row(
                 "SELECT value FROM settings WHERE key = 'codex_usage_canonical_replay_v1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "pending"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v21_to_v22_marks_replay_for_codex_history_only() -> Result<(), AppError> {
+        let fresh = Connection::open_in_memory()?;
+        Database::create_tables_on_conn(&fresh)?;
+        Database::set_user_version(&fresh, 21)?;
+        Database::apply_schema_migrations_on_conn(&fresh)?;
+        assert_eq!(
+            fresh.query_row(
+                "SELECT value FROM settings WHERE key = 'codex_usage_canonical_replay_v2'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "complete"
+        );
+        assert_eq!(Database::get_user_version(&fresh)?, SCHEMA_VERSION);
+
+        let legacy = Connection::open_in_memory()?;
+        Database::create_tables_on_conn(&legacy)?;
+        legacy.execute(
+            "INSERT INTO proxy_request_logs
+                (request_id, provider_id, app_type, model, latency_ms,
+                 status_code, created_at, data_source)
+             VALUES ('codex-proxy-history', 'openai', 'codex', 'gpt-5.6-sol',
+                     0, 200, 1, 'proxy')",
+            [],
+        )?;
+        Database::set_user_version(&legacy, 21)?;
+        Database::apply_schema_migrations_on_conn(&legacy)?;
+        assert_eq!(
+            legacy.query_row(
+                "SELECT value FROM settings WHERE key = 'codex_usage_canonical_replay_v2'",
                 [],
                 |row| row.get::<_, String>(0),
             )?,
