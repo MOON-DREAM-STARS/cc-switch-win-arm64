@@ -990,6 +990,8 @@
     "collapseContent": "收起",
     "usageDataDetails": "数据说明",
     "usageDataDetailsClose": "收起数据说明",
+    "usageExpand": "展开用量",
+    "usageCollapse": "收起用量",
     "usageSessionTimeHint": "数据按会话时间汇总。",
     "usageTimeUnavailableHint": "来源时间不可用。"
   },

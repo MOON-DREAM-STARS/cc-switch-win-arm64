@@ -8,6 +8,8 @@ import {
   MessageSquare,
 } from "lucide-react";
 import { useEffect, useState } from "react";
+import type { RefObject } from "react";
+import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 
 import { useAgentSessionUsage } from "@/lib/query/usage";
@@ -23,7 +25,45 @@ import { formatKnownTokenTotal } from "@/components/usage/format";
 type SessionUsageSummaryProps = {
   appType: AgentUsageAppType;
   sessionId: string;
+  detailContainerRef?: RefObject<HTMLElement | null>;
 };
+
+const COMPACT_DETAIL_WIDTH = 920;
+const COMPACT_DETAIL_HEIGHT = 760;
+
+function useCompactDetailLayout(
+  detailContainerRef?: RefObject<HTMLElement | null>,
+) {
+  const [isCompact, setIsCompact] = useState(false);
+
+  useEffect(() => {
+    const container = detailContainerRef?.current;
+    if (!container) {
+      setIsCompact(false);
+      return;
+    }
+
+    const update = () => {
+      setIsCompact(
+        container.clientWidth < COMPACT_DETAIL_WIDTH ||
+          container.clientHeight < COMPACT_DETAIL_HEIGHT,
+      );
+    };
+
+    update();
+
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", update);
+      return () => window.removeEventListener("resize", update);
+    }
+
+    const observer = new ResizeObserver(update);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [detailContainerRef]);
+
+  return isCompact;
+}
 
 const requestCountLabel = (
   semantics: AgentUsageRequestCountSemantics,
@@ -174,18 +214,31 @@ function UsageUnavailable({
 export function SessionUsageSummary({
   appType,
   sessionId,
+  detailContainerRef,
 }: SessionUsageSummaryProps) {
   const { t, i18n } = useTranslation();
   const { data, isLoading, isError } = useAgentSessionUsage(appType, sessionId);
+  const isCompact = useCompactDetailLayout(detailContainerRef);
+  const [usageOpen, setUsageOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const previousCompactRef = useRef(false);
   const language = i18n.resolvedLanguage || i18n.language || "en-US";
   const unavailableLabel = t("sessionManager.usageUnavailableShort", {
     defaultValue: "Unavailable",
   });
 
   useEffect(() => {
+    setUsageOpen(false);
     setDetailsOpen(false);
   }, [appType, sessionId]);
+
+  useEffect(() => {
+    if (isCompact && !previousCompactRef.current) {
+      setUsageOpen(false);
+      setDetailsOpen(false);
+    }
+    previousCompactRef.current = isCompact;
+  }, [isCompact]);
 
   if (isLoading) {
     return (
@@ -238,6 +291,81 @@ export function SessionUsageSummary({
   const descendantsLabel = t("sessionManager.usageDescendants", {
     defaultValue: "All descendants",
   });
+  const tokenValue = formatKnownTokenTotal(
+    data.totalUsage,
+    language,
+    unavailableLabel,
+  );
+  const tokenLabel = t("sessionManager.usageTokens", {
+    defaultValue: "Tokens",
+  });
+  const costValue = formatCost(data.totalUsage, unavailableLabel);
+  const usageToggleLabel = t(
+    usageOpen ? "sessionManager.usageCollapse" : "sessionManager.usageExpand",
+    {
+      defaultValue: usageOpen ? "Collapse usage" : "Expand usage",
+    },
+  );
+  const usageToggleAriaLabel = `${usageToggleLabel}: ${totalLabel} ${tokenValue} ${tokenLabel}, ${costValue}`;
+  const showUsageDetails = !isCompact || usageOpen;
+
+  const expandedHeader = (
+    <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+      <div className="min-w-0">
+        <div className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-muted-foreground">
+          <Layers3 className="size-3.5 shrink-0" aria-hidden="true" />
+          <span className="truncate">{totalLabel}</span>
+        </div>
+        <div className="mt-1 flex min-w-0 items-baseline gap-2">
+          <span
+            className={cn(
+              "min-w-0 truncate text-lg font-semibold tabular-nums",
+              !data.totalUsage && "text-muted-foreground",
+            )}
+            data-testid="session-usage-total-tokens"
+          >
+            {tokenValue}
+          </span>
+          <span className="shrink-0 text-[11px] text-muted-foreground">
+            {tokenLabel}
+          </span>
+        </div>
+      </div>
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] text-muted-foreground">
+        <span
+          className="inline-flex min-w-0 items-center gap-1 truncate"
+          title={costValue}
+        >
+          <Coins className="size-3 shrink-0" aria-hidden="true" />
+          <span className="truncate">{costValue}</span>
+        </span>
+      </div>
+    </div>
+  );
+
+  const compactHeader = (
+    <span className="flex min-w-0 flex-1 items-center gap-1.5">
+      <Layers3
+        className="size-3.5 shrink-0 text-muted-foreground"
+        aria-hidden="true"
+      />
+      <span className="shrink-0 text-xs font-medium text-muted-foreground">
+        {totalLabel}
+      </span>
+      <span
+        className={cn(
+          "min-w-0 truncate text-sm font-semibold tabular-nums",
+          !data.totalUsage && "text-muted-foreground",
+        )}
+        data-testid="session-usage-total-tokens"
+      >
+        {tokenValue}
+      </span>
+      <span className="shrink-0 text-[10px] text-muted-foreground">
+        {tokenLabel}
+      </span>
+    </span>
+  );
 
   return (
     <section
@@ -245,150 +373,152 @@ export function SessionUsageSummary({
       aria-label={totalLabel}
       data-testid="session-usage-summary"
     >
-      <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-        <div className="min-w-0">
-          <div className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-muted-foreground">
-            <Layers3 className="size-3.5 shrink-0" aria-hidden="true" />
-            <span className="truncate">{totalLabel}</span>
-          </div>
-          <div className="mt-1 flex min-w-0 items-baseline gap-2">
-            <span
-              className={cn(
-                "min-w-0 truncate text-lg font-semibold tabular-nums",
-                !data.totalUsage && "text-muted-foreground",
-              )}
-              data-testid="session-usage-total-tokens"
-            >
-              {formatKnownTokenTotal(
-                data.totalUsage,
-                language,
-                unavailableLabel,
-              )}
-            </span>
-            <span className="shrink-0 text-[11px] text-muted-foreground">
-              {t("sessionManager.usageTokens", { defaultValue: "Tokens" })}
-            </span>
-          </div>
-        </div>
-        <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] text-muted-foreground">
+      {isCompact ? (
+        <button
+          type="button"
+          className="flex w-full min-w-0 items-center gap-2 rounded-md text-left transition-colors hover:text-foreground focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2"
+          aria-label={usageToggleAriaLabel}
+          aria-expanded={usageOpen}
+          aria-controls="session-usage-details"
+          title={usageToggleLabel}
+          data-testid="session-usage-toggle"
+          onClick={() => setUsageOpen((open) => !open)}
+        >
+          {compactHeader}
           <span
-            className="inline-flex min-w-0 items-center gap-1 truncate"
-            title={formatCost(data.totalUsage, unavailableLabel)}
+            className="inline-flex min-w-0 shrink-0 items-center gap-1 text-[10px] text-muted-foreground"
+            title={costValue}
           >
             <Coins className="size-3 shrink-0" aria-hidden="true" />
-            <span className="truncate">
-              {formatCost(data.totalUsage, unavailableLabel)}
-            </span>
+            <span className="truncate">{costValue}</span>
           </span>
-        </div>
-      </div>
+          {usageOpen ? (
+            <ChevronUp
+              className="size-3.5 shrink-0 text-muted-foreground"
+              aria-hidden="true"
+            />
+          ) : (
+            <ChevronDown
+              className="size-3.5 shrink-0 text-muted-foreground"
+              aria-hidden="true"
+            />
+          )}
+        </button>
+      ) : (
+        expandedHeader
+      )}
 
-      <div
-        className={cn(
-          "mt-2 grid min-w-0 gap-2",
-          descendantVisible ? "sm:grid-cols-2" : "grid-cols-1",
-        )}
-      >
-        <MeasureCard
-          label={selfLabel}
-          measure={data.selfUsage}
-          language={language}
-          t={t}
-          countUnavailableLabel={unavailableLabel}
-          unavailableLabel={unavailableLabel}
-        />
-        {descendantVisible && (
-          <MeasureCard
-            label={
-              data.descendantSessionCount > 0
-                ? `${descendantsLabel} (${formatNumber(data.descendantSessionCount, language)})`
-                : descendantsLabel
-            }
-            measure={data.descendantUsage}
-            language={language}
-            t={t}
-            countUnavailableLabel={unavailableLabel}
-            unavailableLabel={unavailableLabel}
-          />
-        )}
-      </div>
-
-      {hasDataDetails && (
-        <div className="mt-2 min-w-0">
-          <button
-            type="button"
-            className="inline-flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground transition-colors hover:text-foreground"
-            aria-expanded={detailsOpen}
-            aria-controls="session-usage-data-details"
-            onClick={() => setDetailsOpen((open) => !open)}
-          >
-            {detailsOpen ? (
-              <ChevronUp className="size-3 shrink-0" aria-hidden="true" />
-            ) : (
-              <ChevronDown className="size-3 shrink-0" aria-hidden="true" />
+      {showUsageDetails && (
+        <div id={isCompact ? "session-usage-details" : undefined}>
+          <div
+            className={cn(
+              "mt-2 grid min-w-0 gap-2",
+              descendantVisible ? "sm:grid-cols-2" : "grid-cols-1",
             )}
-            <span>
-              {t(
-                detailsOpen
-                  ? "sessionManager.usageDataDetailsClose"
-                  : "sessionManager.usageDataDetails",
-                {
-                  defaultValue: detailsOpen
-                    ? "Hide data details"
-                    : "Data details",
-                },
-              )}
-            </span>
-          </button>
-          {detailsOpen && (
-            <div
-              id="session-usage-data-details"
-              data-testid="session-usage-data-details"
-              className="mt-1.5 flex min-w-0 items-start gap-1.5 rounded-md border border-border/50 bg-background/30 px-2 py-1.5 text-[10px] text-muted-foreground"
-            >
-              <AlertCircle
-                className="mt-0.5 size-3 shrink-0"
-                aria-hidden="true"
+          >
+            <MeasureCard
+              label={selfLabel}
+              measure={data.selfUsage}
+              language={language}
+              t={t}
+              countUnavailableLabel={unavailableLabel}
+              unavailableLabel={unavailableLabel}
+            />
+            {descendantVisible && (
+              <MeasureCard
+                label={
+                  data.descendantSessionCount > 0
+                    ? `${descendantsLabel} (${formatNumber(data.descendantSessionCount, language)})`
+                    : descendantsLabel
+                }
+                measure={data.descendantUsage}
+                language={language}
+                t={t}
+                countUnavailableLabel={unavailableLabel}
+                unavailableLabel={unavailableLabel}
               />
-              <div className="min-w-0 space-y-1">
-                {(totalIsPartial ||
-                  measureHasPartial ||
-                  data.warnings.length > 0) && (
-                  <div>
-                    {t("sessionManager.usagePartialHint", {
-                      defaultValue:
-                        "Some usage fields are partial or unavailable.",
-                    })}
-                  </div>
+            )}
+          </div>
+
+          {hasDataDetails && (
+            <div className="mt-2 min-w-0">
+              <button
+                type="button"
+                className="inline-flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground transition-colors hover:text-foreground"
+                aria-expanded={detailsOpen}
+                aria-controls="session-usage-data-details"
+                onClick={() => setDetailsOpen((open) => !open)}
+              >
+                {detailsOpen ? (
+                  <ChevronUp className="size-3 shrink-0" aria-hidden="true" />
+                ) : (
+                  <ChevronDown className="size-3 shrink-0" aria-hidden="true" />
                 )}
-                {syncWindow && (
-                  <div className="flex items-start gap-1">
-                    <MessageSquare
-                      className="mt-0.5 size-3 shrink-0"
-                      aria-hidden="true"
-                    />
-                    <span>
-                      {t("sessionManager.usageSyncWindowHint", {
-                        defaultValue: "Sync-window increment; not per-request.",
-                      })}
-                    </span>
+                <span>
+                  {t(
+                    detailsOpen
+                      ? "sessionManager.usageDataDetailsClose"
+                      : "sessionManager.usageDataDetails",
+                    {
+                      defaultValue: detailsOpen
+                        ? "Hide data details"
+                        : "Data details",
+                    },
+                  )}
+                </span>
+              </button>
+              {detailsOpen && (
+                <div
+                  id="session-usage-data-details"
+                  data-testid="session-usage-data-details"
+                  className="mt-1.5 flex min-w-0 items-start gap-1.5 rounded-md border border-border/50 bg-background/30 px-2 py-1.5 text-[10px] text-muted-foreground"
+                >
+                  <AlertCircle
+                    className="mt-0.5 size-3 shrink-0"
+                    aria-hidden="true"
+                  />
+                  <div className="min-w-0 space-y-1">
+                    {(totalIsPartial ||
+                      measureHasPartial ||
+                      data.warnings.length > 0) && (
+                      <div>
+                        {t("sessionManager.usagePartialHint", {
+                          defaultValue:
+                            "Some usage fields are partial or unavailable.",
+                        })}
+                      </div>
+                    )}
+                    {syncWindow && (
+                      <div className="flex items-start gap-1">
+                        <MessageSquare
+                          className="mt-0.5 size-3 shrink-0"
+                          aria-hidden="true"
+                        />
+                        <span>
+                          {t("sessionManager.usageSyncWindowHint", {
+                            defaultValue:
+                              "Sync-window increment; not per-request.",
+                          })}
+                        </span>
+                      </div>
+                    )}
+                    {detailTimeSemantics === "session_time" && (
+                      <div>
+                        {t("sessionManager.usageSessionTimeHint", {
+                          defaultValue: "Usage is aggregated by session time.",
+                        })}
+                      </div>
+                    )}
+                    {detailTimeSemantics === "unavailable" && (
+                      <div>
+                        {t("sessionManager.usageTimeUnavailableHint", {
+                          defaultValue: "Source time is unavailable.",
+                        })}
+                      </div>
+                    )}
                   </div>
-                )}
-                {detailTimeSemantics === "session_time" && (
-                  <div>
-                    {t("sessionManager.usageSessionTimeHint", {
-                      defaultValue: "Usage is aggregated by session time.",
-                    })}
-                  </div>
-                )}
-                {detailTimeSemantics === "unavailable" && (
-                  <div>
-                    {t("sessionManager.usageTimeUnavailableHint", {
-                      defaultValue: "Source time is unavailable.",
-                    })}
-                  </div>
-                )}
-              </div>
+                </div>
+              )}
             </div>
           )}
         </div>

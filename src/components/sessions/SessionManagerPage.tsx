@@ -29,6 +29,7 @@ import {
 } from "@/lib/query";
 import { sessionsApi } from "@/lib/api";
 import type { SessionMeta } from "@/types";
+import type { AgentUsageAppType } from "@/types/usage";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -58,6 +59,7 @@ import { isMac } from "@/lib/platform";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { SessionItem } from "./SessionItem";
 import { SessionMessageItem } from "./SessionMessageItem";
+import { SessionUsageSummary } from "./SessionUsageSummary";
 import { SessionTocDialog, SessionTocSidebar } from "./SessionToc";
 import {
   extractCodexPromptPreview,
@@ -1579,6 +1581,12 @@ export function SessionManagerPage({ appId }: { appId: string }) {
                         </Tooltip>
                       </div>
                     </div>
+
+                    <SessionUsageSummary
+                      appType={selectedSession.providerId as AgentUsageAppType}
+                      sessionId={selectedSession.sessionId}
+                      detailContainerRef={detailRef}
+                    />
 
                     {/* 恢复命令预览 */}
                     {selectedSession.resumeCommand && (

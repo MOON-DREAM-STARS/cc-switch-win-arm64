@@ -1,5 +1,11 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SessionUsageSummary } from "@/components/sessions/SessionUsageSummary";
 import type {
@@ -8,6 +14,27 @@ import type {
 } from "@/types/usage";
 
 const useAgentSessionUsageMock = vi.hoisted(() => vi.fn());
+
+const resizeObserverInstances: TestResizeObserver[] = [];
+
+class TestResizeObserver {
+  private readonly callback: ResizeObserverCallback;
+
+  constructor(callback: ResizeObserverCallback) {
+    this.callback = callback;
+    resizeObserverInstances.push(this);
+  }
+
+  observe() {}
+
+  unobserve() {}
+
+  disconnect() {}
+
+  trigger() {
+    this.callback([], this as unknown as ResizeObserver);
+  }
+}
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
@@ -74,17 +101,49 @@ const summary = (
   };
 };
 
-const renderSummary = (sessionId = "root-session") =>
-  render(<SessionUsageSummary appType="codex" sessionId={sessionId} />);
+const renderSummary = (
+  sessionId = "root-session",
+  detailContainerRef?: { current: HTMLElement | null },
+) =>
+  render(
+    <SessionUsageSummary
+      appType="codex"
+      sessionId={sessionId}
+      detailContainerRef={detailContainerRef}
+    />,
+  );
+
+const createDetailContainerRef = (width: number, height: number) => {
+  const size = { width, height };
+  const container = document.createElement("div");
+  Object.defineProperties(container, {
+    clientWidth: { configurable: true, get: () => size.width },
+    clientHeight: { configurable: true, get: () => size.height },
+  });
+
+  return {
+    ref: { current: container },
+    setSize: (nextWidth: number, nextHeight: number) => {
+      size.width = nextWidth;
+      size.height = nextHeight;
+    },
+  };
+};
 
 describe("SessionUsageSummary", () => {
   beforeEach(() => {
+    resizeObserverInstances.length = 0;
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
     useAgentSessionUsageMock.mockReset();
     useAgentSessionUsageMock.mockReturnValue({
       data: summary(),
       isLoading: false,
       isError: false,
     });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("shows self, descendant aggregate, API-derived total, and count without child rows", () => {
@@ -137,6 +196,91 @@ describe("SessionUsageSummary", () => {
 
     expect(screen.getByText("This task")).toBeInTheDocument();
     expect(screen.queryByText("All descendants")).not.toBeInTheDocument();
+  });
+
+  it("collapses usage details in a compact detail card and expands them on demand", async () => {
+    const detailContainer = createDetailContainerRef(800, 700);
+    const selfUsage = measure({ inputTokens: 10, outputTokens: 5 });
+    const descendantUsage = measure({ inputTokens: 20, outputTokens: 5 });
+    useAgentSessionUsageMock.mockReturnValue({
+      data: summary({
+        supportsDescendants: true,
+        selfUsage,
+        descendantUsage,
+        totalUsage: measure({ inputTokens: 30, outputTokens: 10 }),
+        descendantSessionCount: 1,
+      }),
+      isLoading: false,
+      isError: false,
+    });
+
+    renderSummary("compact-session", detailContainer.ref);
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: /Expand usage/ }),
+      ).toHaveAttribute("aria-expanded", "false");
+    });
+    expect(screen.getByTestId("session-usage-total-tokens")).toHaveTextContent(
+      "40",
+    );
+    expect(screen.queryByText("This task")).not.toBeInTheDocument();
+    expect(screen.queryByText("All descendants (1)")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Expand usage/ }));
+
+    expect(
+      screen.getByRole("button", { name: /Collapse usage/ }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("This task")).toBeInTheDocument();
+    expect(screen.getByText("All descendants (1)")).toBeInTheDocument();
+  });
+
+  it("resets compact usage after resizing back from a wide detail card", async () => {
+    const detailContainer = createDetailContainerRef(1200, 900);
+    useAgentSessionUsageMock.mockReturnValue({
+      data: summary({
+        supportsDescendants: true,
+        descendantUsage: measure(),
+        descendantSessionCount: 1,
+      }),
+      isLoading: false,
+      isError: false,
+    });
+
+    renderSummary("resize-session", detailContainer.ref);
+    expect(
+      screen.queryByTestId("session-usage-toggle"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("This task")).toBeInTheDocument();
+
+    detailContainer.setSize(800, 700);
+    act(() => resizeObserverInstances[0].trigger());
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: /Expand usage/ }),
+      ).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Expand usage/ }));
+    expect(screen.getByText("This task")).toBeInTheDocument();
+
+    detailContainer.setSize(1200, 900);
+    act(() => resizeObserverInstances[0].trigger());
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("session-usage-toggle"),
+      ).not.toBeInTheDocument(),
+    );
+
+    detailContainer.setSize(800, 700);
+    act(() => resizeObserverInstances[0].trigger());
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: /Expand usage/ }),
+      ).toHaveAttribute("aria-expanded", "false");
+    });
+    expect(screen.queryByText("This task")).not.toBeInTheDocument();
   });
 
   it("keeps unavailable and partial values distinct from explicit zero and marks sync windows", () => {

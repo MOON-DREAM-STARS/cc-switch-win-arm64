@@ -990,6 +990,8 @@
     "collapseContent": "折りたたむ",
     "usageDataDetails": "データの説明",
     "usageDataDetailsClose": "データの説明を閉じる",
+    "usageExpand": "使用量を展開",
+    "usageCollapse": "使用量を折りたたむ",
     "usageSessionTimeHint": "セッション時間で集計されています。",
     "usageTimeUnavailableHint": "ソース時刻を利用できません。"
   },

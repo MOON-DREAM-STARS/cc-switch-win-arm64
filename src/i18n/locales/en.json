@@ -990,6 +990,8 @@
     "collapseContent": "Collapse",
     "usageDataDetails": "Data details",
     "usageDataDetailsClose": "Hide data details",
+    "usageExpand": "Expand usage",
+    "usageCollapse": "Collapse usage",
     "usageSessionTimeHint": "Usage is aggregated by session time.",
     "usageTimeUnavailableHint": "Source time is unavailable."
   },
