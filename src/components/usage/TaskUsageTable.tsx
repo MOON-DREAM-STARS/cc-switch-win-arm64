@@ -630,7 +630,7 @@ function TaskUsageRowView({
   return (
     <TableRow data-testid={`task-row-${key}`}>
       <TableCell className="min-w-[320px] max-w-[560px] align-top">
-        <div className="flex min-w-0 items-start gap-1.5">
+        <div className="flex min-w-0 items-center gap-1.5">
           <div className="min-w-0 truncate font-medium" title={titleTooltip}>
             {title}
           </div>
@@ -706,7 +706,7 @@ function TaskUsageCardView({
     >
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
-          <div className="flex min-w-0 items-start gap-1.5">
+          <div className="flex min-w-0 items-center gap-1.5">
             <div
               className="line-clamp-2 min-w-0 break-words font-medium"
               title={titleTooltip}
