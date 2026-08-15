@@ -2736,6 +2736,7 @@ fn query_task_roots(
              LEFT JOIN agent_session_nodes n
                ON n.app_type = l.app_type AND n.session_id = l.session_id
              WHERE {raw_where}
+               AND (l.app_type <> 'codex' OR n.session_id IS NOT NULL)
          ), candidates AS (
              {candidates_sql}
          ), filtered AS (
@@ -2904,6 +2905,7 @@ fn query_task_filter_options(
              LEFT JOIN agent_session_nodes n
                ON n.app_type = l.app_type AND n.session_id = l.session_id
              WHERE {raw_where}
+               AND (l.app_type <> 'codex' OR n.session_id IS NOT NULL)
          ), candidates AS (
              {candidates_sql}
          )
@@ -4335,6 +4337,87 @@ mod tests {
             .items
             .iter()
             .any(|item| item.session_id == "source-only-root"));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_source_only_proxy_sessions_are_not_task_roots() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        write_agent_session_node(
+            &db,
+            &query_node("codex", "codex-root", "codex-root", SessionNodeKind::Root),
+        )?;
+        let mut canonical = query_rollup("codex-root", "2026-08-13", 10, 2);
+        canonical.app_type = "codex".into();
+        canonical.data_source = "codex_session".into();
+        canonical.request_count_semantics = RequestCountSemantics::AgentCall;
+        let start_at = Local
+            .with_ymd_and_hms(2026, 8, 13, 0, 0, 0)
+            .single()
+            .expect("valid fixture range start")
+            .timestamp();
+        let end_at = Local
+            .with_ymd_and_hms(2026, 8, 13, 23, 59, 59)
+            .single()
+            .expect("valid fixture range end")
+            .timestamp();
+        canonical.first_event_at = Some(start_at);
+        canonical.last_event_at = Some(end_at);
+        write_agent_session_usage_rollup(&db, &canonical)?;
+
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs
+                    (request_id, provider_id, app_type, model, input_tokens,
+                     output_tokens, cache_read_tokens, cache_creation_tokens,
+                     total_cost_usd, latency_ms, status_code, created_at,
+                     session_id, data_source)
+                 VALUES ('generated-codex-request', 'codex-provider', 'codex',
+                         'codex-model', 100, 5, 20, 0, '0.01', 1, 200, ?1,
+                         'generated-codex-session', 'proxy')",
+                params![start_at],
+            )?;
+        }
+
+        let all_time = list_agent_task_usage(
+            &db,
+            &AgentTaskUsageFilter {
+                app_type: Some("codex".into()),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(all_time.total, 1);
+        assert_eq!(all_time.items[0].session_id, "codex-root");
+        assert_eq!(
+            all_time.items[0].root.as_ref().unwrap().title.as_deref(),
+            Some("Task codex-root")
+        );
+
+        let ranged = list_agent_task_usage(
+            &db,
+            &AgentTaskUsageFilter {
+                app_type: Some("codex".into()),
+                range: Some(AgentUsageRange {
+                    start_at: Some(start_at),
+                    end_at: Some(end_at),
+                }),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(ranged.total, 1);
+        assert_eq!(ranged.items[0].session_id, "codex-root");
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let raw_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE request_id = 'generated-codex-request'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            raw_count, 1,
+            "task filtering must not delete raw request logs"
+        );
         Ok(())
     }
 
