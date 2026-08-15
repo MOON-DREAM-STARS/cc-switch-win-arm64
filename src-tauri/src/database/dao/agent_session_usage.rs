@@ -318,8 +318,22 @@ impl Database {
         conn: &Connection,
         fact: &AgentSessionUsageRollupFact,
     ) -> Result<(), AppError> {
+        Self::upsert_agent_session_usage_rollup_fact_on_conn_into(
+            conn,
+            fact,
+            "agent_session_usage_rollups",
+        )
+    }
+
+    /// Same upsert targeted at an internal generation table used by Codex
+    /// shadow replay.  The table name is selected only by trusted callers.
+    pub(crate) fn upsert_agent_session_usage_rollup_fact_on_conn_into(
+        conn: &Connection,
+        fact: &AgentSessionUsageRollupFact,
+        table: &str,
+    ) -> Result<(), AppError> {
         conn.execute(
-            "INSERT INTO agent_session_usage_rollups (
+            &format!("INSERT INTO {table} (
                 date, app_type, session_id, provider_id, model,
                 request_model, pricing_model, data_source, precision,
                 time_semantics, request_count_semantics, input_token_semantics,
@@ -356,7 +370,7 @@ impl Database {
                 cost_delta_kind = excluded.cost_delta_kind,
                 correction_state = excluded.correction_state,
                 first_event_at = excluded.first_event_at,
-                last_event_at = excluded.last_event_at",
+             last_event_at = excluded.last_event_at"),
             params![
                 &fact.date,
                 &fact.app_type,

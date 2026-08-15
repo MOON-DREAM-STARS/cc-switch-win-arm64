@@ -256,6 +256,22 @@ pub enum DescendantUsageStatus {
     NotApplicable,
 }
 
+/// Publication state for the Codex task generation.  A replay is written to
+/// shadow tables and only becomes visible after a complete atomic publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTaskUsageDataStatus {
+    Ready,
+    RebuildingWithSnapshot,
+    Rebuilding,
+}
+
+impl Default for AgentTaskUsageDataStatus {
+    fn default() -> Self {
+        Self::Ready
+    }
+}
+
 impl DescendantUsageStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -846,7 +862,7 @@ impl NormalizedSessionNode {
         Ok(())
     }
 
-    fn to_dao(&self) -> Result<AgentSessionNode, AppError> {
+    pub(crate) fn to_dao(&self) -> Result<AgentSessionNode, AppError> {
         self.validate_for_persistence()?;
         let app_type = canonical_app_type(&self.app_type)?;
         let session_id = normalized_id(&self.session_id, "session_id")?;
@@ -1173,7 +1189,7 @@ impl NormalizedUsageRollupFact {
         Ok(())
     }
 
-    fn to_dao(&self) -> Result<AgentSessionUsageRollupFact, AppError> {
+    pub(crate) fn to_dao(&self) -> Result<AgentSessionUsageRollupFact, AppError> {
         self.validate_for_persistence()?;
         Ok(AgentSessionUsageRollupFact {
             date: trimmed_text(&self.date),
@@ -1871,6 +1887,8 @@ pub struct AgentTaskUsagePage {
     /// session event. This is a summary, not an additional task row.
     #[serde(default)]
     pub unattributed_usage: Option<UsageMeasure>,
+    #[serde(default)]
+    pub data_status: AgentTaskUsageDataStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -2511,22 +2529,7 @@ fn query_usage_groups(
     let mut groups = rows
         .collect::<Result<Vec<_>, _>>()
         .map_err(AppError::from)?;
-    let codex_replay_in_progress = app_type == "codex"
-        && crate::services::session_usage_codex::codex_replay_in_progress_on_conn(conn);
-    if codex_replay_in_progress {
-        for group in &mut groups {
-            group.measure.partial = true;
-            group
-                .measure
-                .warnings
-                .push("Codex 历史用量正在重放，当前结果尚未完成".into());
-            group.measure.total_cost_usd = None;
-            group.source_dimension.cost_status = Some("unavailable".into());
-            group.source_dimension.cost_source = Some("codex_replay".into());
-        }
-    } else {
-        enrich_codex_session_costs(conn, app_type, &mut groups);
-    }
+    enrich_codex_session_costs(conn, app_type, &mut groups);
     Ok(groups)
 }
 
@@ -2622,6 +2625,33 @@ fn append_root_metadata_filter(
     }
 }
 
+fn codex_published_snapshot_on_conn(conn: &Connection) -> Result<bool, AppError> {
+    let nodes: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM agent_session_nodes WHERE app_type = 'codex'",
+        [],
+        |row| row.get(0),
+    )?;
+    let rollups: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM agent_session_usage_rollups WHERE app_type = 'codex'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(nodes > 0 && rollups > 0)
+}
+
+fn codex_task_data_status_on_conn(
+    conn: &Connection,
+) -> Result<AgentTaskUsageDataStatus, AppError> {
+    if !crate::services::session_usage_codex::codex_replay_in_progress_on_conn(conn) {
+        return Ok(AgentTaskUsageDataStatus::Ready);
+    }
+    if codex_published_snapshot_on_conn(conn)? {
+        Ok(AgentTaskUsageDataStatus::RebuildingWithSnapshot)
+    } else {
+        Ok(AgentTaskUsageDataStatus::Rebuilding)
+    }
+}
+
 fn query_task_roots(
     conn: &Connection,
     filter: &AgentTaskUsageFilter,
@@ -2635,6 +2665,12 @@ fn query_task_roots(
         .as_deref()
         .map(canonical_query_app_type)
         .transpose()?;
+    let codex_replay_in_progress =
+        crate::services::session_usage_codex::codex_replay_in_progress_on_conn(conn);
+    let codex_has_snapshot = codex_replay_in_progress && codex_published_snapshot_on_conn(conn)?;
+    if codex_replay_in_progress && !codex_has_snapshot && app_filter.as_deref() == Some("codex") {
+        return Ok((Vec::new(), 0));
+    }
     let raw_filter = crate::services::usage_stats::effective_session_usage_log_filter("l");
     let mut params_vec: Vec<Box<dyn ToSql>> = Vec::new();
     let mut node_conditions = vec!["1 = 1".to_string()];
@@ -2644,6 +2680,10 @@ fn query_task_roots(
         "TRIM(l.session_id) <> ''".to_string(),
         raw_filter,
     ];
+    if codex_replay_in_progress && !codex_has_snapshot && app_filter.is_none() {
+        source_rollup_conditions.push("r.app_type <> 'codex'".into());
+        source_raw_conditions.push("l.app_type <> 'codex'".into());
+    }
     // SQL placeholder order is source-rollup, source-raw, then root metadata;
     // keep their parameter vectors separate so adding a filter cannot silently
     // bind the wrong value to a date predicate.
@@ -2715,15 +2755,20 @@ fn query_task_roots(
              UNION
              SELECT app_type, root_session_id FROM source_roots"
     };
+    let node_codex_exclusion = if codex_replay_in_progress && !codex_has_snapshot && app_filter.is_none() {
+        "AND n.app_type <> 'codex'"
+    } else {
+        ""
+    };
     let sql = format!(
         "WITH node_roots AS (
              SELECT n.app_type, n.session_id AS root_session_id
              FROM agent_session_nodes n
-             WHERE n.node_kind <> 'child'
+             WHERE n.node_kind <> 'child' {node_codex_exclusion}
              UNION
              SELECT n.app_type, n.root_session_id
              FROM agent_session_nodes n
-             WHERE n.node_kind = 'child'
+             WHERE n.node_kind = 'child' {node_codex_exclusion}
          ), source_roots AS (
              SELECT r.app_type,
                     CASE WHEN n.node_kind = 'child' AND n.root_session_id <> r.session_id
@@ -2774,6 +2819,7 @@ fn query_task_roots(
          LIMIT ? OFFSET ?",
         rollup_where = source_rollup_conditions.join(" AND "),
         raw_where = source_raw_conditions.join(" AND "),
+        node_codex_exclusion = node_codex_exclusion,
         candidates_sql = candidates_sql,
         node_filter = if has_text_filter {
             format!("({})", node_conditions.join(" AND "))
@@ -2830,6 +2876,9 @@ fn query_unattributed_codex_usage(
         .as_deref()
         .map(canonical_query_app_type)
         .transpose()?;
+    if crate::services::session_usage_codex::codex_replay_in_progress_on_conn(conn) {
+        return Ok(None);
+    }
     if app_filter.as_deref().is_some_and(|app| app != "codex") {
         return Ok(None);
     }
@@ -2944,6 +2993,15 @@ fn query_task_filter_options(
         .as_deref()
         .map(canonical_query_app_type)
         .transpose()?;
+    let codex_replay_in_progress =
+        crate::services::session_usage_codex::codex_replay_in_progress_on_conn(conn);
+    let codex_has_snapshot = codex_replay_in_progress && codex_published_snapshot_on_conn(conn)?;
+    if codex_replay_in_progress && !codex_has_snapshot && app_filter.as_deref() == Some("codex") {
+        return Ok(AgentTaskUsageFilterOptions {
+            titles: Vec::new(),
+            projects: Vec::new(),
+        });
+    }
     let raw_filter = crate::services::usage_stats::effective_session_usage_log_filter("l");
     let mut params_vec: Vec<Box<dyn ToSql>> = Vec::new();
     let mut source_rollup_conditions = vec!["1 = 1".to_string()];
@@ -2952,6 +3010,10 @@ fn query_task_filter_options(
         "TRIM(l.session_id) <> ''".to_string(),
         raw_filter,
     ];
+    if codex_replay_in_progress && !codex_has_snapshot && app_filter.is_none() {
+        source_rollup_conditions.push("r.app_type <> 'codex'".into());
+        source_raw_conditions.push("l.app_type <> 'codex'".into());
+    }
     let mut rollup_params: Vec<Box<dyn ToSql>> = Vec::new();
     let mut raw_params: Vec<Box<dyn ToSql>> = Vec::new();
 
@@ -2991,15 +3053,20 @@ fn query_task_filter_options(
              UNION
              SELECT app_type, root_session_id FROM source_roots"
     };
+    let node_codex_exclusion = if codex_replay_in_progress && !codex_has_snapshot && app_filter.is_none() {
+        "AND n.app_type <> 'codex'"
+    } else {
+        ""
+    };
     let sql = format!(
         "WITH node_roots AS (
              SELECT n.app_type, n.session_id AS root_session_id
              FROM agent_session_nodes n
-             WHERE n.node_kind <> 'child'
+             WHERE n.node_kind <> 'child' {node_codex_exclusion}
              UNION
              SELECT n.app_type, n.root_session_id
              FROM agent_session_nodes n
-             WHERE n.node_kind = 'child'
+             WHERE n.node_kind = 'child' {node_codex_exclusion}
          ), source_roots AS (
              SELECT r.app_type,
                     CASE WHEN n.node_kind = 'child' AND n.root_session_id <> r.session_id
@@ -3030,6 +3097,7 @@ fn query_task_filter_options(
         rollup_where = source_rollup_conditions.join(" AND "),
         raw_where = source_raw_conditions.join(" AND "),
         candidates_sql = candidates_sql,
+        node_codex_exclusion = node_codex_exclusion,
     );
     let refs: Vec<&dyn ToSql> = params_vec.iter().map(|value| value.as_ref()).collect();
     let mut statement = conn.prepare(&sql)?;
@@ -3134,6 +3202,7 @@ pub fn list_agent_task_usage(
     }
     let (limit, offset) = filter.normalized_page();
     let conn = crate::database::lock_conn!(db.conn);
+    let data_status = codex_task_data_status_on_conn(&conn)?;
     let (roots, total) = query_task_roots(&conn, filter)?;
     let unattributed_usage = query_unattributed_codex_usage(&conn, filter)?;
     let root_ids: Vec<String> = roots
@@ -3213,6 +3282,7 @@ pub fn list_agent_task_usage(
         offset,
         has_more: (offset as u64).saturating_add(limit as u64) < total,
         unattributed_usage,
+        data_status,
     })
 }
 
@@ -5253,6 +5323,39 @@ mod tests {
             },
         )?;
         assert!(filtered_page.unattributed_usage.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn task_page_hides_unattributed_codex_usage_while_replay_is_incomplete() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, input_tokens,
+                    output_tokens, cache_read_tokens, latency_ms, status_code,
+                    created_at, data_source
+                 ) VALUES ('rebuilding-proxy', 'openai', 'codex', 'gpt-5.6-sol',
+                           100, 20, 30, 0, 200, 150, 'proxy')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value)
+                 VALUES ('codex_usage_canonical_replay_v3', 'replaying')",
+                [],
+            )?;
+        }
+        let page = list_agent_task_usage(
+            &db,
+            &AgentTaskUsageFilter {
+                app_type: Some("codex".into()),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(page.data_status, AgentTaskUsageDataStatus::Rebuilding);
+        assert!(page.items.is_empty());
+        assert!(page.unattributed_usage.is_none());
         Ok(())
     }
 

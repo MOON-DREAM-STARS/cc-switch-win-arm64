@@ -4,7 +4,7 @@
 
 use super::{lock_conn, Database, SCHEMA_VERSION};
 use crate::error::AppError;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -497,6 +497,11 @@ impl Database {
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // Codex replay staging tables.  A replay writes here first and publishes
+        // the complete generation atomically, so readers never observe a
+        // partially rebuilt set of nodes, rollups, or coverage markers.
+        Self::create_codex_replay_tables_on_conn(conn)?;
+
         // 修复跑过未发布开发版的库：current 标记曾是全局 key，现按应用分组
         // （随 v12 定稿为 current_profile_id_<scope>，不单独 bump 版本）
         if conn
@@ -714,6 +719,11 @@ impl Database {
                         log::info!("迁移数据库从 v21 到 v22（修复 Codex 代理去重与本地日桶）");
                         Self::migrate_v21_to_v22(conn)?;
                         Self::set_user_version(conn, 22)?;
+                    }
+                    22 => {
+                        log::info!("迁移数据库从 v22 到 v23（隔离 Codex 规范化重放）");
+                        Self::migrate_v22_to_v23(conn)?;
+                        Self::set_user_version(conn, 23)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -2164,6 +2174,242 @@ impl Database {
             [state],
         )
         .map_err(|e| AppError::Database(format!("写入 Codex v2 重放状态失败: {e}")))?;
+        Ok(())
+    }
+
+    fn create_codex_replay_tables_on_conn(conn: &Connection) -> Result<(), AppError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS codex_replay_nodes (
+                app_type TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                parent_session_id TEXT,
+                root_session_id TEXT NOT NULL,
+                node_kind TEXT NOT NULL,
+                relation_confidence TEXT NOT NULL,
+                title TEXT,
+                project_dir TEXT,
+                source_path TEXT,
+                created_at INTEGER,
+                last_active_at INTEGER,
+                last_synced_at INTEGER NOT NULL,
+                PRIMARY KEY (app_type, session_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_codex_replay_nodes_root
+                ON codex_replay_nodes(app_type, root_session_id);
+            CREATE INDEX IF NOT EXISTS idx_codex_replay_nodes_parent
+                ON codex_replay_nodes(app_type, parent_session_id);
+            CREATE TABLE IF NOT EXISTS codex_replay_rollups (
+                date TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                request_model TEXT NOT NULL DEFAULT '',
+                pricing_model TEXT NOT NULL DEFAULT '',
+                data_source TEXT NOT NULL DEFAULT '',
+                precision TEXT NOT NULL DEFAULT 'request_exact',
+                time_semantics TEXT NOT NULL DEFAULT 'event_time',
+                request_count_semantics TEXT NOT NULL DEFAULT 'http_request',
+                input_token_semantics INTEGER NOT NULL DEFAULT 0,
+                source_identity TEXT NOT NULL DEFAULT '',
+                profile_id TEXT NOT NULL DEFAULT '',
+                database_identity TEXT NOT NULL DEFAULT '',
+                base_url_digest TEXT NOT NULL DEFAULT '',
+                billing_mode TEXT NOT NULL DEFAULT '',
+                task TEXT NOT NULL DEFAULT '',
+                source_version TEXT NOT NULL DEFAULT '',
+                sync_window_start INTEGER NOT NULL DEFAULT 0,
+                sync_window_end INTEGER NOT NULL DEFAULT 0,
+                request_count INTEGER,
+                api_call_count INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_creation_tokens INTEGER,
+                cache_write_tokens INTEGER,
+                reasoning_tokens INTEGER,
+                total_cost_usd TEXT,
+                cost_status TEXT,
+                cost_source TEXT,
+                cost_delta_kind TEXT,
+                correction_state TEXT,
+                first_event_at INTEGER,
+                last_event_at INTEGER,
+                PRIMARY KEY (
+                    date, app_type, session_id, provider_id, model,
+                    request_model, pricing_model, data_source, precision,
+                    time_semantics, request_count_semantics,
+                    input_token_semantics, source_identity, profile_id,
+                    database_identity, base_url_digest, billing_mode, task,
+                    source_version, sync_window_start, sync_window_end
+                )
+            );
+            CREATE INDEX IF NOT EXISTS idx_codex_replay_rollups_session
+                ON codex_replay_rollups(app_type, session_id, date);
+            CREATE INDEX IF NOT EXISTS idx_codex_replay_rollups_root_lookup
+                ON codex_replay_rollups(app_type, date, session_id);
+            CREATE TABLE IF NOT EXISTS codex_replay_coverage (
+                app_type TEXT NOT NULL,
+                data_source TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                canonical_session_id TEXT,
+                marked_at INTEGER NOT NULL,
+                PRIMARY KEY (app_type, data_source, request_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_codex_replay_coverage_session
+                ON codex_replay_coverage(app_type, data_source, canonical_session_id);
+            CREATE TABLE IF NOT EXISTS codex_replay_session_logs (
+                request_id TEXT PRIMARY KEY,
+                provider_id TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                model TEXT NOT NULL,
+                request_model TEXT,
+                pricing_model TEXT,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                input_cost_usd TEXT NOT NULL DEFAULT '0',
+                output_cost_usd TEXT NOT NULL DEFAULT '0',
+                cache_read_cost_usd TEXT NOT NULL DEFAULT '0',
+                cache_creation_cost_usd TEXT NOT NULL DEFAULT '0',
+                total_cost_usd TEXT NOT NULL DEFAULT '0',
+                latency_ms INTEGER NOT NULL,
+                first_token_ms INTEGER,
+                duration_ms INTEGER,
+                status_code INTEGER NOT NULL,
+                error_message TEXT,
+                session_id TEXT,
+                provider_type TEXT,
+                is_streaming INTEGER NOT NULL DEFAULT 0,
+                cost_multiplier TEXT NOT NULL DEFAULT '1.0',
+                created_at INTEGER NOT NULL,
+                data_source TEXT NOT NULL DEFAULT 'codex_session',
+                input_token_semantics INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS codex_replay_sync (
+                file_path TEXT PRIMARY KEY,
+                last_modified INTEGER NOT NULL,
+                last_line_offset INTEGER NOT NULL DEFAULT 0,
+                last_synced_at INTEGER NOT NULL
+            );",
+        )
+        .map_err(|e| AppError::Database(format!("创建 Codex 重放影子表失败: {e}")))
+    }
+
+    /// v22 -> v23: move an interrupted in-place replay into the staging
+    /// generation.  A pending replay keeps the published generation intact;
+    /// the background sync initializes the empty staging generation later.
+    fn migrate_v22_to_v23(conn: &Connection) -> Result<(), AppError> {
+        Self::create_codex_replay_tables_on_conn(conn)?;
+        let v2_state: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'codex_usage_canonical_replay_v2'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| AppError::Database(format!("读取 Codex v22 重放状态失败: {e}")))?;
+        let state = v2_state.as_deref().unwrap_or("complete");
+        if state == "replaying" {
+            conn.execute_batch(
+                "DELETE FROM codex_replay_nodes;
+                 DELETE FROM codex_replay_rollups;
+                 DELETE FROM codex_replay_coverage;
+                 DELETE FROM codex_replay_session_logs;
+                 DELETE FROM codex_replay_sync;",
+            )?;
+            conn.execute(
+                "INSERT INTO codex_replay_nodes (
+                    app_type, session_id, parent_session_id, root_session_id,
+                    node_kind, relation_confidence, title, project_dir, source_path,
+                    created_at, last_active_at, last_synced_at
+                 ) SELECT 'codex_replay', session_id, parent_session_id, root_session_id,
+                    node_kind, relation_confidence, title, project_dir, source_path,
+                    created_at, last_active_at, last_synced_at
+                 FROM agent_session_nodes WHERE app_type = 'codex'",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO codex_replay_rollups (
+                    date, app_type, session_id, provider_id, model, request_model,
+                    pricing_model, data_source, precision, time_semantics,
+                    request_count_semantics, input_token_semantics, source_identity,
+                    profile_id, database_identity, base_url_digest, billing_mode, task,
+                    source_version, sync_window_start, sync_window_end, request_count,
+                    api_call_count, input_tokens, output_tokens, cache_read_tokens,
+                    cache_creation_tokens, cache_write_tokens, reasoning_tokens,
+                    total_cost_usd, cost_status, cost_source, cost_delta_kind,
+                    correction_state, first_event_at, last_event_at
+                 ) SELECT date, 'codex_replay', session_id, provider_id, model,
+                    request_model, pricing_model, data_source, precision, time_semantics,
+                    request_count_semantics, input_token_semantics, source_identity,
+                    profile_id, database_identity, base_url_digest, billing_mode, task,
+                    source_version, sync_window_start, sync_window_end, request_count,
+                    api_call_count, input_tokens, output_tokens, cache_read_tokens,
+                    cache_creation_tokens, cache_write_tokens, reasoning_tokens,
+                    total_cost_usd, cost_status, cost_source, cost_delta_kind,
+                    correction_state, first_event_at, last_event_at
+                 FROM agent_session_usage_rollups WHERE app_type = 'codex'",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO codex_replay_coverage (
+                    app_type, data_source, request_id, canonical_session_id, marked_at
+                 ) SELECT 'codex_replay', data_source || '_replay', request_id,
+                    canonical_session_id, marked_at
+                 FROM agent_session_canonical_coverage
+                 WHERE app_type = 'codex' AND data_source IN ('codex_session', 'proxy')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO codex_replay_session_logs (
+                    request_id, provider_id, app_type, model, request_model,
+                    pricing_model, input_tokens, output_tokens, cache_read_tokens,
+                    cache_creation_tokens, input_cost_usd, output_cost_usd,
+                    cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
+                    latency_ms, first_token_ms, duration_ms, status_code, error_message,
+                    session_id, provider_type, is_streaming, cost_multiplier, created_at,
+                    data_source, input_token_semantics
+                 ) SELECT request_id, provider_id, app_type, model, request_model,
+                    pricing_model, input_tokens, output_tokens, cache_read_tokens,
+                    cache_creation_tokens, input_cost_usd, output_cost_usd,
+                    cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
+                    latency_ms, first_token_ms, duration_ms, status_code, error_message,
+                    session_id, provider_type, is_streaming, cost_multiplier, created_at,
+                    data_source, input_token_semantics
+                 FROM proxy_request_logs
+                 WHERE app_type = 'codex' AND data_source = 'codex_session'",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO codex_replay_sync
+                    (file_path, last_modified, last_line_offset, last_synced_at)
+                 SELECT file_path, last_modified, last_line_offset, last_synced_at
+                 FROM session_log_sync
+                 WHERE file_path LIKE '%/sessions/%/rollout-%'
+                    OR file_path LIKE '%\\sessions\\%\\rollout-%'
+                    OR file_path LIKE '%/archived_sessions/rollout-%'
+                    OR file_path LIKE '%\\archived_sessions\\rollout-%'",
+                [],
+            )?;
+            conn.execute("DELETE FROM proxy_request_logs WHERE app_type = 'codex' AND data_source = 'codex_session'", [])?;
+            conn.execute("DELETE FROM agent_session_usage_rollups WHERE app_type = 'codex'", [])?;
+            conn.execute("DELETE FROM agent_session_nodes WHERE app_type = 'codex'", [])?;
+            conn.execute("DELETE FROM agent_session_canonical_coverage WHERE app_type = 'codex' AND data_source IN ('codex_session', 'proxy')", [])?;
+            conn.execute(
+                "DELETE FROM session_log_sync WHERE file_path LIKE '%/sessions/%/rollout-%'
+                    OR file_path LIKE '%\\sessions\\%\\rollout-%'
+                    OR file_path LIKE '%/archived_sessions/rollout-%'
+                    OR file_path LIKE '%\\archived_sessions\\rollout-%'",
+                [],
+            )?;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value)
+             VALUES ('codex_usage_canonical_replay_v3', ?1)",
+            [state],
+        )?;
         Ok(())
     }
 
@@ -4493,6 +4739,123 @@ mod tests {
                 |row| row.get::<_, String>(0),
             )?,
             "pending"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v22_to_v23_moves_interrupted_codex_replay_into_shadow_tables() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        Database::create_tables_on_conn(&conn)?;
+        conn.execute(
+            "INSERT INTO settings (key, value)
+             VALUES ('codex_usage_canonical_replay_v2', 'replaying')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO agent_session_nodes (
+                app_type, session_id, root_session_id, node_kind,
+                relation_confidence, last_synced_at
+             ) VALUES ('codex', 'root', 'root', 'root', 'explicit', 1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO agent_session_usage_rollups (
+                date, app_type, session_id, provider_id, model, data_source,
+                request_count
+             ) VALUES ('2026-08-15', 'codex', 'root', '_codex_session',
+                       'gpt-5.6-sol', 'codex_session', 1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO proxy_request_logs (
+                request_id, provider_id, app_type, model, latency_ms,
+                status_code, created_at, data_source
+             ) VALUES ('codex-session-row', '_codex_session', 'codex',
+                       'gpt-5.6-sol', 0, 200, 1, 'codex_session')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO session_log_sync (
+                file_path, last_modified, last_line_offset, last_synced_at
+             ) VALUES ('C:/sessions/2026/08/rollout-one.jsonl', 1, 2, 3)",
+            [],
+        )?;
+        Database::set_user_version(&conn, 22)?;
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, 23);
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = 'codex_usage_canonical_replay_v3'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "replaying"
+        );
+        let staged: (i64, i64, i64, i64) = conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM codex_replay_nodes),
+                (SELECT COUNT(*) FROM codex_replay_rollups),
+                (SELECT COUNT(*) FROM codex_replay_session_logs),
+                (SELECT COUNT(*) FROM codex_replay_sync)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(staged, (1, 1, 1, 1));
+        let published: (i64, i64, i64) = conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM agent_session_nodes WHERE app_type = 'codex'),
+                (SELECT COUNT(*) FROM agent_session_usage_rollups WHERE app_type = 'codex'),
+                (SELECT COUNT(*) FROM proxy_request_logs
+                 WHERE app_type = 'codex' AND data_source = 'codex_session')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(published, (0, 0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v22_to_v23_pending_keeps_published_codex_snapshot() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        Database::create_tables_on_conn(&conn)?;
+        conn.execute(
+            "INSERT INTO settings (key, value)
+             VALUES ('codex_usage_canonical_replay_v2', 'pending')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO agent_session_nodes (
+                app_type, session_id, root_session_id, node_kind,
+                relation_confidence, last_synced_at
+             ) VALUES ('codex', 'root', 'root', 'root', 'explicit', 1)",
+            [],
+        )?;
+        Database::set_user_version(&conn, 22)?;
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = 'codex_usage_canonical_replay_v3'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "pending"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM agent_session_nodes WHERE app_type = 'codex'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM codex_replay_nodes", [], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            0
         );
         Ok(())
     }

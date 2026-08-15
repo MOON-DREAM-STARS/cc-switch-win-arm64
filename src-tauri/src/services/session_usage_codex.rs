@@ -15,13 +15,13 @@
 
 use crate::codex_config::{get_codex_config_dir, read_codex_config_text};
 use crate::codex_state_db::codex_state_db_paths;
-use crate::database::{lock_conn, AgentSessionCanonicalCoverageMarker, Database};
+use crate::database::{lock_conn, AgentSessionCanonicalCoverageMarker, Database, AgentSessionUsageRollupFact};
 use crate::error::AppError;
 use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
 use crate::proxy::usage::parser::TokenUsage;
 use crate::services::agent_session_usage::{
-    normalize_session_relations, write_agent_session_node_on_conn,
-    write_agent_session_usage_rollup_fact_on_conn, NormalizedUsageRollupFact, RelationClaim,
+    normalize_session_relations, write_agent_session_usage_rollup_fact_on_conn,
+    NormalizedUsageRollupFact, RelationClaim,
     RelationConfidence, RequestCountSemantics, SessionNodeMetadata, SessionRelationClaim,
     TimeSemantics, UsagePrecision,
 };
@@ -29,8 +29,9 @@ use crate::services::session_usage::{
     metadata_modified_nanos, update_sync_state, update_sync_state_on_conn, SessionSyncResult,
 };
 use crate::services::usage_stats::{
-    find_matching_proxy_usage_log, find_model_pricing, has_proxy_request_id,
-    has_suspected_codex_session_duplicate, should_skip_session_insert, DedupKey,
+    find_matching_proxy_usage_log, find_matching_proxy_usage_log_for_coverage_source,
+    find_model_pricing, has_proxy_request_id, has_suspected_codex_session_duplicate,
+    should_skip_session_insert, DedupKey, SESSION_PROXY_DEDUP_WINDOW_SECONDS,
 };
 use chrono::{DateTime, Local, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -52,10 +53,109 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 const CODEX_THREAD_REQUEST_ID_PREFIX: &str = "codex_session:thread-v1";
-const CODEX_REPLAY_STATE_KEY: &str = "codex_usage_canonical_replay_v2";
+const CODEX_REPLAY_STATE_KEY: &str = "codex_usage_canonical_replay_v3";
+const CODEX_REPLAY_STATE_KEY_V2: &str = "codex_usage_canonical_replay_v2";
 const CODEX_REPLAY_PENDING: &str = "pending";
 const CODEX_REPLAYING: &str = "replaying";
 const CODEX_REPLAY_COMPLETE: &str = "complete";
+const CODEX_REPLAY_APP_TYPE: &str = "codex_replay";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexStorage {
+    Published,
+    Replay,
+}
+
+impl CodexStorage {
+    fn app_type(self) -> &'static str {
+        match self {
+            Self::Published => "codex",
+            Self::Replay => CODEX_REPLAY_APP_TYPE,
+        }
+    }
+
+    fn node_table(self) -> &'static str {
+        match self {
+            Self::Published => "agent_session_nodes",
+            Self::Replay => "codex_replay_nodes",
+        }
+    }
+
+    fn rollup_table(self) -> &'static str {
+        match self {
+            Self::Published => "agent_session_usage_rollups",
+            Self::Replay => "codex_replay_rollups",
+        }
+    }
+
+    fn coverage_table(self) -> &'static str {
+        match self {
+            Self::Published => "agent_session_canonical_coverage",
+            Self::Replay => "codex_replay_coverage",
+        }
+    }
+
+    fn coverage_source(self, source: &str) -> String {
+        match self {
+            Self::Published => source.to_string(),
+            Self::Replay => match source {
+                "codex_session" => "codex_session_replay".to_string(),
+                "proxy" => "proxy_replay".to_string(),
+                _ => source.to_string(),
+            },
+        }
+    }
+
+    fn session_log_table(self) -> &'static str {
+        match self {
+            Self::Published => "proxy_request_logs",
+            Self::Replay => "codex_replay_session_logs",
+        }
+    }
+
+    fn cursor_table(self) -> &'static str {
+        match self {
+            Self::Published => "session_log_sync",
+            Self::Replay => "codex_replay_sync",
+        }
+    }
+}
+
+fn has_codex_storage_coverage_on_conn(
+    conn: &Connection,
+    storage: CodexStorage,
+    source: &str,
+    request_id: &str,
+) -> Result<bool, AppError> {
+    let sql = format!(
+        "SELECT EXISTS(
+             SELECT 1 FROM {} WHERE app_type = ?1 AND data_source = ?2 AND request_id = ?3
+         )",
+        storage.coverage_table()
+    );
+    conn.query_row(
+        &sql,
+        rusqlite::params![storage.app_type(), storage.coverage_source(source), request_id],
+        |row| row.get(0),
+    )
+    .map_err(|error| AppError::Database(format!("读取 Codex 重放覆盖标记失败: {error}")))
+}
+
+fn has_codex_storage_session_log_on_conn(
+    conn: &Connection,
+    storage: CodexStorage,
+    request_id: &str,
+) -> Result<bool, AppError> {
+    if storage == CodexStorage::Published {
+        return has_proxy_request_id(conn, request_id);
+    }
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM {} WHERE request_id = ?1)",
+        storage.session_log_table()
+    );
+    conn.query_row(&sql, [request_id], |row| row.get(0))
+        .map_err(|error| AppError::Database(format!("读取 Codex 重放会话明细失败: {error}")))
+}
 
 /// 累计 token 用量（跟踪 total_token_usage 字段）
 #[derive(Debug, Clone, Default)]
@@ -443,14 +543,25 @@ pub(crate) fn reset_codex_usage_on_conn(
 }
 
 fn codex_replay_state_on_conn(conn: &Connection) -> Result<String, AppError> {
-    conn.query_row(
+    let current = conn
+        .query_row(
         "SELECT value FROM settings WHERE key = ?1",
         [CODEX_REPLAY_STATE_KEY],
         |row| row.get::<_, String>(0),
     )
     .optional()
+    .map_err(|error| AppError::Database(format!("读取 Codex 重放状态失败: {error}")))?;
+    if let Some(value) = current {
+        return Ok(value);
+    }
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        [CODEX_REPLAY_STATE_KEY_V2],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
     .map(|value| value.unwrap_or_else(|| CODEX_REPLAY_COMPLETE.to_string()))
-    .map_err(|error| AppError::Database(format!("读取 Codex 重放状态失败: {error}")))
+    .map_err(|error| AppError::Database(format!("读取 Codex v2 重放状态失败: {error}")))
 }
 
 fn set_codex_replay_state_on_conn(conn: &Connection, state: &str) -> Result<(), AppError> {
@@ -464,7 +575,7 @@ fn set_codex_replay_state_on_conn(conn: &Connection, state: &str) -> Result<(), 
 
 pub(crate) fn codex_replay_in_progress_on_conn(conn: &Connection) -> bool {
     codex_replay_state_on_conn(conn)
-        .map(|state| state == CODEX_REPLAYING)
+        .map(|state| matches!(state.as_str(), CODEX_REPLAY_PENDING | CODEX_REPLAYING))
         .unwrap_or(false)
 }
 
@@ -486,13 +597,23 @@ fn readable_codex_files(codex_dir: &Path) -> Result<Vec<PathBuf>, AppError> {
     Ok(files)
 }
 
+fn clear_codex_replay_stage_on_conn(conn: &Connection) -> Result<(), AppError> {
+    conn.execute_batch(
+        "DELETE FROM codex_replay_nodes;
+         DELETE FROM codex_replay_rollups;
+         DELETE FROM codex_replay_coverage;
+         DELETE FROM codex_replay_session_logs;
+         DELETE FROM codex_replay_sync;",
+    )
+    .map_err(|error| AppError::Database(format!("清理 Codex 重放影子数据失败: {error}")))
+}
+
 fn reset_codex_usage_and_mark_replaying(db: &Database) -> Result<(), AppError> {
-    let codex_dir = get_codex_config_dir();
     let conn = lock_conn!(db.conn);
     conn.execute("SAVEPOINT reset_codex_usage_replay", [])
         .map_err(|error| AppError::Database(format!("开启 Codex 重放事务失败: {error}")))?;
     let result = (|| {
-        reset_codex_usage_on_conn(&conn, &codex_dir)?;
+        clear_codex_replay_stage_on_conn(&conn)?;
         set_codex_replay_state_on_conn(&conn, CODEX_REPLAYING)
     })();
     match result {
@@ -512,9 +633,80 @@ fn reset_codex_usage_and_mark_replaying(db: &Database) -> Result<(), AppError> {
     }
 }
 
-fn mark_codex_replay_complete(db: &Database) -> Result<(), AppError> {
-    let conn = lock_conn!(db.conn);
-    set_codex_replay_state_on_conn(&conn, CODEX_REPLAY_COMPLETE)
+fn publish_codex_replay_on_conn(conn: &Connection) -> Result<(), AppError> {
+    conn.execute_batch(
+        "DELETE FROM proxy_request_logs
+         WHERE app_type = 'codex' AND data_source = 'codex_session';
+         DELETE FROM agent_session_usage_rollups WHERE app_type = 'codex';
+         DELETE FROM agent_session_nodes WHERE app_type = 'codex';
+         DELETE FROM agent_session_canonical_coverage
+         WHERE app_type = 'codex' AND data_source IN ('codex_session', 'proxy');
+         DELETE FROM session_log_sync
+         WHERE file_path LIKE '%/sessions/%/rollout-%'
+            OR file_path LIKE '%\\sessions\\%\\rollout-%'
+            OR file_path LIKE '%/archived_sessions/rollout-%'
+            OR file_path LIKE '%\\archived_sessions\\rollout-%';
+         INSERT OR REPLACE INTO proxy_request_logs (
+             request_id, provider_id, app_type, model, request_model,
+             pricing_model, input_tokens, output_tokens, cache_read_tokens,
+             cache_creation_tokens, input_cost_usd, output_cost_usd,
+             cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
+             latency_ms, first_token_ms, duration_ms, status_code, error_message,
+             session_id, provider_type, is_streaming, cost_multiplier, created_at,
+             data_source, input_token_semantics
+         ) SELECT request_id, provider_id, 'codex', model, request_model,
+             pricing_model, input_tokens, output_tokens, cache_read_tokens,
+             cache_creation_tokens, input_cost_usd, output_cost_usd,
+             cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
+             latency_ms, first_token_ms, duration_ms, status_code, error_message,
+             session_id, provider_type, is_streaming, cost_multiplier, created_at,
+             data_source, input_token_semantics
+         FROM codex_replay_session_logs;
+         INSERT OR REPLACE INTO agent_session_nodes (
+             app_type, session_id, parent_session_id, root_session_id,
+             node_kind, relation_confidence, title, project_dir, source_path,
+             created_at, last_active_at, last_synced_at
+         ) SELECT 'codex', session_id, parent_session_id, root_session_id,
+             node_kind, relation_confidence, title, project_dir, source_path,
+             created_at, last_active_at, last_synced_at
+         FROM codex_replay_nodes;
+         INSERT OR REPLACE INTO agent_session_usage_rollups (
+             date, app_type, session_id, provider_id, model, request_model,
+             pricing_model, data_source, precision, time_semantics,
+             request_count_semantics, input_token_semantics, source_identity,
+             profile_id, database_identity, base_url_digest, billing_mode, task,
+             source_version, sync_window_start, sync_window_end, request_count,
+             api_call_count, input_tokens, output_tokens, cache_read_tokens,
+             cache_creation_tokens, cache_write_tokens, reasoning_tokens,
+             total_cost_usd, cost_status, cost_source, cost_delta_kind,
+             correction_state, first_event_at, last_event_at
+         ) SELECT date, 'codex', session_id, provider_id, model, request_model,
+             pricing_model, data_source, precision, time_semantics,
+             request_count_semantics, input_token_semantics, source_identity,
+             profile_id, database_identity, base_url_digest, billing_mode, task,
+             source_version, sync_window_start, sync_window_end, request_count,
+             api_call_count, input_tokens, output_tokens, cache_read_tokens,
+             cache_creation_tokens, cache_write_tokens, reasoning_tokens,
+             total_cost_usd, cost_status, cost_source, cost_delta_kind,
+             correction_state, first_event_at, last_event_at
+         FROM codex_replay_rollups;
+         INSERT OR REPLACE INTO agent_session_canonical_coverage (
+             app_type, data_source, request_id, canonical_session_id, marked_at
+         ) SELECT 'codex',
+             CASE data_source
+                 WHEN 'codex_session_replay' THEN 'codex_session'
+                 WHEN 'proxy_replay' THEN 'proxy'
+                 ELSE data_source
+             END,
+             request_id, canonical_session_id, marked_at
+         FROM codex_replay_coverage;
+         INSERT OR REPLACE INTO session_log_sync
+             (file_path, last_modified, last_line_offset, last_synced_at)
+         SELECT file_path, last_modified, last_line_offset, last_synced_at
+         FROM codex_replay_sync;",
+    )
+    .map_err(|error| AppError::Database(format!("发布 Codex 重放数据失败: {error}")))?;
+    clear_codex_replay_stage_on_conn(conn)
 }
 
 fn codex_replay_state(db: &Database) -> Result<String, AppError> {
@@ -523,15 +715,46 @@ fn codex_replay_state(db: &Database) -> Result<String, AppError> {
 }
 
 fn finish_codex_replay_if_ready(db: &Database, result: &SessionSyncResult) -> Result<(), AppError> {
-    if result.files_scanned > 0 && result.errors.is_empty() && result.deferred_files == 0 {
-        mark_codex_replay_complete(db)?;
+    if result.files_scanned == 0 || !result.errors.is_empty() || result.deferred_files != 0 {
+        return Ok(());
+    }
+    let conn = lock_conn!(db.conn);
+    let staged_nodes: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM codex_replay_nodes",
+        [],
+        |row| row.get(0),
+    )?;
+    let staged_rollups: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM codex_replay_rollups",
+        [],
+        |row| row.get(0),
+    )?;
+    if staged_nodes == 0 || staged_rollups == 0 {
+        return Ok(());
+    }
+    conn.execute("SAVEPOINT publish_codex_replay", [])
+        .map_err(|error| AppError::Database(format!("开启 Codex 重放发布事务失败: {error}")))?;
+    let publish_result = (|| {
+        publish_codex_replay_on_conn(&conn)?;
+        set_codex_replay_state_on_conn(&conn, CODEX_REPLAY_COMPLETE)
+    })();
+    match publish_result {
+        Ok(()) => conn
+            .execute("RELEASE publish_codex_replay", [])
+            .map_err(|error| AppError::Database(format!("提交 Codex 重放发布事务失败: {error}")))
+            .map(|_| ())?,
+        Err(error) => {
+            conn.execute("ROLLBACK TO publish_codex_replay", []).ok();
+            conn.execute("RELEASE publish_codex_replay", []).ok();
+            return Err(error);
+        }
     }
     Ok(())
 }
 
 /// Sync Codex usage and perform a guarded one-time canonical replay when the
 /// schema migration requested it.
-pub fn sync_codex_usage_with_replay(db: &Database) -> Result<SessionSyncResult, AppError> {
+    pub fn sync_codex_usage_with_replay(db: &Database) -> Result<SessionSyncResult, AppError> {
     let state = codex_replay_state(db)?;
     if state == CODEX_REPLAY_PENDING {
         let codex_dir = get_codex_config_dir();
@@ -540,7 +763,11 @@ pub fn sync_codex_usage_with_replay(db: &Database) -> Result<SessionSyncResult, 
         reset_codex_usage_and_mark_replaying(db)?;
     }
 
-    let result = sync_codex_usage(db)?;
+    let result = if state == CODEX_REPLAY_COMPLETE {
+        sync_codex_usage(db)?
+    } else {
+        sync_codex_usage_to_storage(db, CodexStorage::Replay)?
+    };
     if state == CODEX_REPLAY_PENDING || state == CODEX_REPLAYING {
         finish_codex_replay_if_ready(db, &result)?;
     }
@@ -553,7 +780,7 @@ pub fn rebuild_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError>
     readable_codex_files(&codex_dir)?;
     db.backup_database_file()?;
     reset_codex_usage_and_mark_replaying(db)?;
-    let result = sync_codex_usage(db)?;
+    let result = sync_codex_usage_to_storage(db, CodexStorage::Replay)?;
     finish_codex_replay_if_ready(db, &result)?;
     Ok(result)
 }
@@ -676,10 +903,14 @@ struct CodexSyncPass {
 }
 
 impl CodexSyncPass {
-    fn load(db: &Database) -> Result<Self, AppError> {
+    fn load(db: &Database, storage: CodexStorage) -> Result<Self, AppError> {
         let conn = lock_conn!(db.conn);
+        let sql = format!(
+            "SELECT file_path, last_modified, last_line_offset FROM {}",
+            storage.cursor_table()
+        );
         let mut stmt = conn
-            .prepare("SELECT file_path, last_modified, last_line_offset FROM session_log_sync")
+            .prepare(&sql)
             .map_err(|e| AppError::Database(format!("预载同步游标失败: {e}")))?;
         let cursors = stmt
             .query_map([], |row| {
@@ -701,6 +932,7 @@ fn get_codex_sync_state(
     db: &Database,
     file_path: &Path,
     cursors: &HashMap<String, (i64, i64)>,
+    storage: CodexStorage,
 ) -> Result<(i64, i64), AppError> {
     let file_path_str = file_path.to_string_lossy().to_string();
     let state = cursors.get(&file_path_str).copied().unwrap_or((0, 0));
@@ -732,11 +964,60 @@ fn get_codex_sync_state(
 
     match inherited {
         Some((offset, modified)) => {
-            update_sync_state(db, &file_path_str, modified, offset)?;
+            update_codex_sync_state(db, &file_path_str, modified, offset, storage)?;
             Ok((modified, offset))
         }
         None => Ok(state),
     }
+}
+
+fn update_codex_sync_state(
+    db: &Database,
+    file_path: &str,
+    modified: i64,
+    offset: i64,
+    storage: CodexStorage,
+) -> Result<(), AppError> {
+    if storage == CodexStorage::Published {
+        return update_sync_state(db, file_path, modified, offset);
+    }
+    let conn = lock_conn!(db.conn);
+    let sql = format!(
+        "INSERT INTO {} (file_path, last_modified, last_line_offset, last_synced_at)
+         VALUES (?1, ?2, ?3, unixepoch())
+         ON CONFLICT(file_path) DO UPDATE SET
+             last_modified = excluded.last_modified,
+             last_line_offset = excluded.last_line_offset,
+             last_synced_at = excluded.last_synced_at",
+        storage.cursor_table()
+    );
+    conn.execute(&sql, rusqlite::params![file_path, modified, offset])
+        .map_err(|error| AppError::Database(format!("更新 Codex 重放 cursor 失败: {error}")))?;
+    Ok(())
+}
+
+fn update_codex_sync_state_on_conn(
+    conn: &Connection,
+    file_path: &str,
+    modified: i64,
+    offset: i64,
+    storage: CodexStorage,
+) -> Result<(), AppError> {
+    if storage == CodexStorage::Published {
+        return update_sync_state_on_conn(conn, file_path, modified, offset);
+    }
+    let sql = format!(
+        "INSERT INTO {} (file_path, last_modified, last_line_offset, last_synced_at)
+         VALUES (?1, ?2, ?3, unixepoch())
+         ON CONFLICT(file_path) DO UPDATE SET
+             last_modified = excluded.last_modified,
+             last_line_offset = excluded.last_line_offset,
+             last_synced_at = excluded.last_synced_at",
+        storage.cursor_table()
+    );
+    conn.execute(&sql, rusqlite::params![file_path, modified, offset])
+        .map_err(|error| AppError::Database(format!("写入 Codex 重放 cursor 失败: {error}")))?;
+    Ok(())
 }
 
 /// 归一化 Codex 模型名
@@ -941,11 +1222,18 @@ struct CodexFileSyncResult {
 
 /// 同步 Codex 使用数据（从 JSONL 会话日志）
 pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
+    sync_codex_usage_to_storage(db, CodexStorage::Published)
+}
+
+fn sync_codex_usage_to_storage(
+    db: &Database,
+    storage: CodexStorage,
+) -> Result<SessionSyncResult, AppError> {
     let codex_dir = get_codex_config_dir();
     let files = collect_codex_session_files(&codex_dir);
     let thread_titles = load_native_thread_titles();
     let rollout_index = build_rollout_index(&files);
-    let mut pass = CodexSyncPass::load(db)?;
+    let mut pass = CodexSyncPass::load(db, storage)?;
 
     let mut result = SessionSyncResult {
         imported: 0,
@@ -959,14 +1247,19 @@ pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
     // Normalize every discovered rollout relation in one graph pass before
     // importing usage.  This is what lets root → child → grandchild resolve
     // without ever folding a child's own ID into its parent's node.
-    if let Err(error) = persist_codex_nodes_for_files_with_titles(db, &files, &thread_titles) {
+    if let Err(error) = persist_codex_nodes_for_files_with_titles_to_storage(
+        db,
+        &files,
+        &thread_titles,
+        storage,
+    ) {
         result
             .errors
             .push(format!("Codex 会话节点写入失败: {error}"));
     }
 
     for file_path in &files {
-        match sync_single_codex_file(db, file_path, &rollout_index, &mut pass) {
+        match sync_single_codex_file(db, file_path, &rollout_index, &mut pass, storage) {
             Ok(file_result) => {
                 result.imported = result.imported.saturating_add(file_result.imported);
                 result.skipped = result.skipped.saturating_add(file_result.skipped);
@@ -989,14 +1282,19 @@ pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
     // parent claim is not in that call's scope.  Re-run the complete graph
     // after ingestion so the public sync leaves every discovered depth with
     // its normalized root/parent ownership.
-    if let Err(error) = persist_codex_nodes_for_files_with_titles(db, &files, &thread_titles) {
+    if let Err(error) = persist_codex_nodes_for_files_with_titles_to_storage(
+        db,
+        &files,
+        &thread_titles,
+        storage,
+    ) {
         result
             .errors
             .push(format!("Codex 会话节点归一化失败: {error}"));
     }
 
     if !files.is_empty() {
-        if let Err(error) = rebuild_codex_normalized_rollups(db) {
+        if let Err(error) = rebuild_codex_normalized_rollups(db, storage) {
             result
                 .errors
                 .push(format!("Codex 会话用量桶重建失败: {error}"));
@@ -1448,6 +1746,14 @@ fn persist_codex_relation_claims(
     db: &Database,
     claims: &[SessionRelationClaim],
 ) -> Result<(), AppError> {
+    persist_codex_relation_claims_to_storage(db, claims, CodexStorage::Published)
+}
+
+fn persist_codex_relation_claims_to_storage(
+    db: &Database,
+    claims: &[SessionRelationClaim],
+    storage: CodexStorage,
+) -> Result<(), AppError> {
     if claims.is_empty() {
         return Ok(());
     }
@@ -1457,10 +1763,60 @@ fn persist_codex_relation_claims(
         .unchecked_transaction()
         .map_err(|error| AppError::Database(format!("开启 Codex 会话节点事务失败: {error}")))?;
     for node in &normalized {
-        write_agent_session_node_on_conn(&tx, node)?;
+        write_codex_node_for_storage_on_conn(&tx, node, storage)?;
     }
     tx.commit()
         .map_err(|error| AppError::Database(format!("提交 Codex 会话节点事务失败: {error}")))
+}
+
+fn write_codex_node_for_storage_on_conn(
+    conn: &Connection,
+    node: &crate::services::agent_session_usage::NormalizedSessionNode,
+    storage: CodexStorage,
+) -> Result<(), AppError> {
+    let sql = format!(
+        "INSERT INTO {} (
+             app_type, session_id, parent_session_id, root_session_id,
+             node_kind, relation_confidence, title, project_dir, source_path,
+             created_at, last_active_at, last_synced_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(app_type, session_id) DO UPDATE SET
+             parent_session_id = excluded.parent_session_id,
+             root_session_id = excluded.root_session_id,
+             node_kind = excluded.node_kind,
+             relation_confidence = excluded.relation_confidence,
+             title = COALESCE(excluded.title, {}.title),
+             project_dir = COALESCE(excluded.project_dir, {}.project_dir),
+             source_path = COALESCE(excluded.source_path, {}.source_path),
+             created_at = COALESCE(excluded.created_at, {}.created_at),
+             last_active_at = COALESCE(excluded.last_active_at, {}.last_active_at),
+             last_synced_at = excluded.last_synced_at",
+        storage.node_table(),
+        storage.node_table(),
+        storage.node_table(),
+        storage.node_table(),
+        storage.node_table(),
+        storage.node_table(),
+    );
+    conn.execute(
+        &sql,
+        rusqlite::params![
+            storage.app_type(),
+            &node.session_id,
+            &node.parent_session_id,
+            &node.root_session_id,
+            node.node_kind.as_str(),
+            node.relation_confidence.as_str(),
+            &node.title,
+            &node.project_dir,
+            &node.source_path,
+            node.created_at,
+            node.last_active_at,
+            node.last_synced_at,
+        ],
+    )
+    .map_err(|error| AppError::Database(format!("写入 Codex 会话节点失败: {error}")))?;
+    Ok(())
 }
 
 fn persist_codex_node_for_parsed(
@@ -1468,6 +1824,7 @@ fn persist_codex_node_for_parsed(
     file_path: &Path,
     parsed: &ParsedCodexFile,
     file_modified: i64,
+    storage: CodexStorage,
 ) -> Result<(), AppError> {
     if let Some(claim) = relation_claim_from_parsed(
         file_path,
@@ -1475,20 +1832,39 @@ fn persist_codex_node_for_parsed(
         file_modified,
         &HashMap::new(),
     ) {
-        persist_codex_relation_claims(db, &[claim])?;
+        persist_codex_relation_claims_to_storage(db, &[claim], storage)?;
     }
     Ok(())
 }
 
 fn persist_codex_nodes_for_files(db: &Database, files: &[PathBuf]) -> Result<(), AppError> {
     let thread_titles = load_native_thread_titles();
-    persist_codex_nodes_for_files_with_titles(db, files, &thread_titles)
+    persist_codex_nodes_for_files_with_titles_to_storage(
+        db,
+        files,
+        &thread_titles,
+        CodexStorage::Published,
+    )
 }
 
 fn persist_codex_nodes_for_files_with_titles(
     db: &Database,
     files: &[PathBuf],
     thread_titles: &HashMap<String, String>,
+) -> Result<(), AppError> {
+    persist_codex_nodes_for_files_with_titles_to_storage(
+        db,
+        files,
+        thread_titles,
+        CodexStorage::Published,
+    )
+}
+
+fn persist_codex_nodes_for_files_with_titles_to_storage(
+    db: &Database,
+    files: &[PathBuf],
+    thread_titles: &HashMap<String, String>,
+    storage: CodexStorage,
 ) -> Result<(), AppError> {
     let mut claims = Vec::new();
     for file_path in files {
@@ -1511,7 +1887,7 @@ fn persist_codex_nodes_for_files_with_titles(
             claims.push(claim);
         }
     }
-    persist_codex_relation_claims(db, &claims)
+    persist_codex_relation_claims_to_storage(db, &claims, storage)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1618,12 +1994,13 @@ fn codex_fact_from_event(
 fn read_existing_codex_fact_on_conn(
     conn: &rusqlite::Connection,
     key: &CodexFactKey,
+    storage: CodexStorage,
 ) -> Result<Option<CodexFactAccumulator>, AppError> {
-    let result = conn.query_row(
+    let sql = format!(
         "SELECT request_count, input_tokens, output_tokens, cache_read_tokens,
-                reasoning_tokens, first_event_at, last_event_at
-         FROM agent_session_usage_rollups
-         WHERE date = ?1 AND app_type = 'codex' AND session_id = ?2
+                 reasoning_tokens, first_event_at, last_event_at
+         FROM {}
+         WHERE date = ?1 AND app_type = ?5 AND session_id = ?2
            AND provider_id = '_codex_session' AND model = ?3 AND request_model = ?3
            AND pricing_model = '' AND data_source = 'codex_session'
            AND precision = ?4 AND time_semantics = 'event_time'
@@ -1631,8 +2008,18 @@ fn read_existing_codex_fact_on_conn(
            AND source_identity = '' AND profile_id = '' AND database_identity = ''
            AND base_url_digest = '' AND billing_mode = '' AND task = ''
            AND source_version = ''
-           AND sync_window_start = 0 AND sync_window_end = 0",
-        rusqlite::params![&key.date, &key.session_id, &key.model, &key.precision],
+            AND sync_window_start = 0 AND sync_window_end = 0",
+        storage.rollup_table()
+    );
+    let result = conn.query_row(
+        &sql,
+        rusqlite::params![
+            &key.date,
+            &key.session_id,
+            &key.model,
+            &key.precision,
+            storage.app_type()
+        ],
         |row| {
             Ok(CodexFactAccumulator {
                 initialized: true,
@@ -1663,9 +2050,11 @@ fn read_existing_codex_fact_on_conn(
 fn persist_codex_facts_on_conn(
     conn: &rusqlite::Connection,
     observations: impl IntoIterator<Item = (CodexFactKey, CodexFactAccumulator)>,
+    storage: CodexStorage,
 ) -> Result<(), AppError> {
     for (key, incoming) in observations {
-        let mut aggregate = read_existing_codex_fact_on_conn(conn, &key)?.unwrap_or_default();
+        let mut aggregate =
+            read_existing_codex_fact_on_conn(conn, &key, storage)?.unwrap_or_default();
         let request_ids = incoming.request_ids.clone();
         merge_codex_fact_accumulator(&mut aggregate, incoming);
         let fact = NormalizedUsageRollupFact {
@@ -1707,28 +2096,60 @@ fn persist_codex_facts_on_conn(
             first_event_at: aggregate.first_event_at,
             last_event_at: aggregate.last_event_at,
         };
-        write_agent_session_usage_rollup_fact_on_conn(conn, &fact)?;
+        write_codex_rollup_fact_on_conn(conn, &fact, storage)?;
         for request_id in request_ids {
             let marked_at = aggregate.last_event_at.unwrap_or(0);
-            Database::upsert_agent_session_canonical_coverage_on_conn(
-                conn,
-                &AgentSessionCanonicalCoverageMarker {
-                    app_type: "codex".to_string(),
-                    data_source: "codex_session".to_string(),
+            let marker = AgentSessionCanonicalCoverageMarker {
+                    app_type: storage.app_type().to_string(),
+                    data_source: storage.coverage_source("codex_session").to_string(),
                     request_id,
                     canonical_session_id: Some(key.session_id.clone()),
                     marked_at,
-                },
+                };
+            let sql = format!(
+                "INSERT INTO {} (app_type, data_source, request_id, canonical_session_id, marked_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(app_type, data_source, request_id) DO UPDATE SET
+                     canonical_session_id = excluded.canonical_session_id,
+                     marked_at = excluded.marked_at",
+                storage.coverage_table()
+            );
+            conn.execute(
+                &sql,
+                rusqlite::params![
+                    marker.app_type,
+                    marker.data_source,
+                    marker.request_id,
+                    marker.canonical_session_id,
+                    marker.marked_at
+                ],
             )?;
         }
     }
     Ok(())
 }
 
+fn write_codex_rollup_fact_on_conn(
+    conn: &Connection,
+    fact: &NormalizedUsageRollupFact,
+    storage: CodexStorage,
+) -> Result<(), AppError> {
+    if storage == CodexStorage::Published {
+        return write_agent_session_usage_rollup_fact_on_conn(conn, fact);
+    }
+    let mut dao_fact: AgentSessionUsageRollupFact = fact.to_dao()?;
+    dao_fact.app_type = storage.app_type().to_string();
+    Database::upsert_agent_session_usage_rollup_fact_on_conn_into(
+        conn,
+        &dao_fact,
+        storage.rollup_table(),
+    )
+}
+
 /// Canonical facts are written atomically while parsing each raw batch.  A
 /// later rebuild must not infer source fields from `proxy_request_logs`, whose
 /// legacy integer columns cannot represent missing cache-read or cache-create.
-fn rebuild_codex_normalized_rollups(_db: &Database) -> Result<(), AppError> {
+fn rebuild_codex_normalized_rollups(_db: &Database, _storage: CodexStorage) -> Result<(), AppError> {
     Ok(())
 }
 
@@ -1901,6 +2322,7 @@ fn sync_single_codex_file(
     file_path: &Path,
     rollout_index: &RolloutIndex,
     pass: &mut CodexSyncPass,
+    storage: CodexStorage,
 ) -> Result<CodexFileSyncResult, AppError> {
     let file_path_str = file_path.to_string_lossy().to_string();
 
@@ -1911,7 +2333,8 @@ fn sync_single_codex_file(
     let file_size = metadata.len();
 
     // 检查同步状态
-    let (last_modified, last_offset) = get_codex_sync_state(db, file_path, &pass.cursors)?;
+    let (last_modified, last_offset) =
+        get_codex_sync_state(db, file_path, &pass.cursors, storage)?;
 
     // 文件未变化则跳过
     if file_modified <= last_modified {
@@ -1949,9 +2372,15 @@ fn sync_single_codex_file(
     // Direct callers (including focused fixtures) still get a durable node;
     // the public sync path repeats this write with all claims in one graph so
     // missing parents can be upgraded from unknown to child safely.
-    persist_codex_node_for_parsed(db, file_path, &parsed, file_modified)?;
+    persist_codex_node_for_parsed(db, file_path, &parsed, file_modified, storage)?;
     if !parsed.has_billable_tokens {
-        update_sync_state(db, &file_path_str, file_modified, parsed.line_offset)?;
+        update_codex_sync_state(
+            db,
+            &file_path_str,
+            file_modified,
+            parsed.line_offset,
+            storage,
+        )?;
         return Ok(CodexFileSyncResult::default());
     }
     let Some(root_thread_id) = parsed.root_thread_id.as_deref() else {
@@ -2104,12 +2533,12 @@ fn sync_single_codex_file(
                 batch_skipped = batch_skipped.saturating_add(1);
                 continue;
             };
-            if Database::has_agent_session_canonical_coverage_on_conn(
+            if has_codex_storage_coverage_on_conn(
                 &tx,
-                "codex",
+                storage,
                 "codex_session",
                 &request_id,
-            )? || has_proxy_request_id(&tx, &request_id)?
+            )? || has_codex_storage_session_log_on_conn(&tx, storage, &request_id)?
             {
                 batch_skipped = batch_skipped.saturating_add(1);
                 continue;
@@ -2125,7 +2554,14 @@ fn sync_single_codex_file(
                 cache_creation_tokens: 0,
                 created_at,
             };
-            let matched_proxy = find_matching_proxy_usage_log(&tx, &dedup_key)?;
+            let matched_proxy = if storage == CodexStorage::Published {
+                find_matching_proxy_usage_log(&tx, &dedup_key)?
+            } else {
+                find_matching_proxy_usage_log_for_coverage_source(
+                    &tx,
+                    &dedup_key,
+                )?
+            };
             let inserted_compatibility_row = if matched_proxy.is_some() {
                 false
             } else {
@@ -2138,6 +2574,7 @@ fn sync_single_codex_file(
                     event.timestamp.as_deref(),
                     &mut batch_suspected,
                     &mut pass.pricing,
+                    storage,
                 ) {
                     Ok(inserted) => inserted,
                     Err(e) => {
@@ -2163,23 +2600,38 @@ fn sync_single_codex_file(
                 batch_skipped = batch_skipped.saturating_add(1);
             }
         }
-        persist_codex_facts_on_conn(&tx, canonical_observations)?;
+        persist_codex_facts_on_conn(&tx, canonical_observations, storage)?;
         for (request_id, session_id, marked_at) in proxy_coverage {
-            Database::upsert_agent_session_canonical_coverage_on_conn(
-                &tx,
-                &AgentSessionCanonicalCoverageMarker {
-                    app_type: "codex".to_string(),
-                    data_source: "proxy".to_string(),
+            let sql = format!(
+                "INSERT INTO {} (
+                     app_type, data_source, request_id, canonical_session_id, marked_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(app_type, data_source, request_id) DO UPDATE SET
+                     canonical_session_id = excluded.canonical_session_id,
+                     marked_at = excluded.marked_at",
+                storage.coverage_table()
+            );
+            tx.execute(
+                &sql,
+                rusqlite::params![
+                    storage.app_type(),
+                    storage.coverage_source("proxy"),
                     request_id,
-                    canonical_session_id: Some(session_id),
-                    marked_at,
-                },
+                    session_id,
+                    marked_at
+                ],
             )?;
         }
         if is_last_batch {
             // 游标推进与最后一批数据同事务提交：中途崩溃时两者一起回滚，
             // 不会出现"游标已推进但数据缺失"的丢数据窗口。
-            update_sync_state_on_conn(&tx, &file_path_str, file_modified, parsed.line_offset)?;
+            update_codex_sync_state_on_conn(
+                &tx,
+                &file_path_str,
+                file_modified,
+                parsed.line_offset,
+                storage,
+            )?;
         }
         tx.commit()
             .map_err(|e| AppError::Database(format!("提交 Codex 会话写入事务失败: {e}")))?;
@@ -2190,7 +2642,13 @@ fn sync_single_codex_file(
     }
 
     if to_insert.is_empty() {
-        update_sync_state(db, &file_path_str, file_modified, parsed.line_offset)?;
+        update_codex_sync_state(
+            db,
+            &file_path_str,
+            file_modified,
+            parsed.line_offset,
+            storage,
+        )?;
     }
     Ok(result)
 }
@@ -2217,6 +2675,7 @@ fn insert_codex_session_entry(
         timestamp,
         suspected_duplicates,
         &mut HashMap::new(),
+        CodexStorage::Published,
     )
 }
 
@@ -2235,6 +2694,7 @@ fn insert_codex_session_entry_on_conn(
     timestamp: Option<&str>,
     suspected_duplicates: &mut u32,
     pricing_cache: &mut HashMap<String, Option<ModelPricing>>,
+    storage: CodexStorage,
 ) -> Result<bool, AppError> {
     let created_at = timestamp
         .and_then(|ts| {
@@ -2256,10 +2716,20 @@ fn insert_codex_session_entry_on_conn(
         cache_creation_tokens: 0,
         created_at,
     };
-    if should_skip_session_insert(conn, request_id, &dedup_key)? {
+    let should_skip = if storage == CodexStorage::Published {
+        should_skip_session_insert(conn, request_id, &dedup_key)?
+    } else {
+        has_codex_storage_session_log_on_conn(conn, storage, request_id)?
+    };
+    if should_skip {
         return Ok(false);
     }
-    if has_suspected_codex_session_duplicate(conn, request_id, &dedup_key)? {
+    let has_suspected_duplicate = if storage == CodexStorage::Published {
+        has_suspected_codex_session_duplicate(conn, request_id, &dedup_key)?
+    } else {
+        has_suspected_codex_replay_duplicate(conn, request_id, &dedup_key)?
+    };
+    if has_suspected_duplicate {
         *suspected_duplicates = suspected_duplicates.saturating_add(1);
         log::warn!(
             "[CODEX-SYNC] 疑似重复会话用量: request_id={request_id}, model={model}, input={}, output={}, cache_read={}",
@@ -2304,16 +2774,18 @@ fn insert_codex_session_entry_on_conn(
         ),
     };
 
-    let inserted_rows = conn
-        .prepare_cached(
-            "INSERT OR IGNORE INTO proxy_request_logs (
+    let sql = format!(
+        "INSERT OR IGNORE INTO {} (
             request_id, provider_id, app_type, model, request_model,
             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
             input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd,
             latency_ms, first_token_ms, status_code, error_message, session_id,
             provider_type, is_streaming, cost_multiplier, created_at, data_source
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
-        )
+        storage.session_log_table()
+    );
+    let inserted_rows = conn
+        .prepare_cached(&sql)
         .and_then(|mut stmt| stmt.execute(rusqlite::params![
                 request_id,
                 "_codex_session",    // provider_id
@@ -2348,6 +2820,36 @@ fn insert_codex_session_entry_on_conn(
 /// 查找 Codex 模型定价（带归一化）
 fn find_codex_pricing(conn: &rusqlite::Connection, model_id: &str) -> Option<ModelPricing> {
     find_model_pricing(conn, &normalize_codex_model(model_id))
+}
+
+fn has_suspected_codex_replay_duplicate(
+    conn: &rusqlite::Connection,
+    request_id: &str,
+    key: &DedupKey,
+) -> Result<bool, AppError> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM codex_replay_session_logs
+            WHERE request_id <> ?1
+              AND app_type = 'codex'
+              AND LOWER(model) = LOWER(?2)
+              AND input_tokens = ?3
+              AND output_tokens = ?4
+              AND cache_read_tokens = ?5
+              AND created_at BETWEEN ?6 - ?7 AND ?6 + ?7
+        )",
+        rusqlite::params![
+            request_id,
+            key.model,
+            key.input_tokens as i64,
+            key.output_tokens as i64,
+            key.cache_read_tokens as i64,
+            key.created_at,
+            SESSION_PROXY_DEDUP_WINDOW_SECONDS,
+        ],
+        |row| row.get(0),
+    )
+    .map_err(|error| AppError::Database(format!("查询重放疑似重复 Codex 会话用量失败: {error}")))
 }
 
 #[cfg(test)]
@@ -2614,8 +3116,14 @@ mod tests {
             .iter()
             .map(|path| path.to_path_buf())
             .collect::<Vec<_>>();
-        let mut pass = CodexSyncPass::load(db)?;
-        sync_single_codex_file(db, file, &build_rollout_index(&files), &mut pass)
+        let mut pass = CodexSyncPass::load(db, CodexStorage::Published)?;
+        sync_single_codex_file(
+            db,
+            file,
+            &build_rollout_index(&files),
+            &mut pass,
+            CodexStorage::Published,
+        )
     }
 
     #[test]
@@ -3227,7 +3735,14 @@ mod tests {
                 [],
                 |row| row.get(0),
             )?;
-            assert_eq!(row_count, 0);
+            // Shadow replay never removes the last published generation.
+            assert_eq!(row_count, 1);
+            let staged_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM codex_replay_session_logs",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(staged_count, 0);
             assert_eq!(codex_replay_state_on_conn(&conn)?, CODEX_REPLAYING);
         }
 
@@ -3242,6 +3757,21 @@ mod tests {
         {
             let conn = lock_conn!(db.conn);
             assert_eq!(codex_replay_state_on_conn(&conn)?, CODEX_REPLAYING);
+            conn.execute(
+                "INSERT INTO codex_replay_nodes (
+                    app_type, session_id, root_session_id, node_kind,
+                    relation_confidence, last_synced_at
+                 ) VALUES ('codex_replay', 'root', 'root', 'root', 'explicit', 1)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO codex_replay_rollups (
+                    date, app_type, session_id, provider_id, model, data_source,
+                    request_count
+                 ) VALUES ('2026-08-15', 'codex_replay', 'root', '_codex_session',
+                           'gpt-5.6-sol', 'codex_session', 1)",
+                [],
+            )?;
         }
         finish_codex_replay_if_ready(
             &db,
@@ -4389,7 +4919,7 @@ mod tests {
             ]
         );
         drop(conn);
-        rebuild_codex_normalized_rollups(&db)?;
+        rebuild_codex_normalized_rollups(&db, CodexStorage::Published)?;
         let conn = lock_conn!(db.conn);
         let rebuilt_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM agent_session_usage_rollups

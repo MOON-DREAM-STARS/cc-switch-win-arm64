@@ -511,6 +511,60 @@ pub(crate) fn find_matching_proxy_usage_log(
         .map_err(|e| AppError::Database(format!("查询重复代理用量日志失败: {e}")))
 }
 
+/// Replay variant of [`find_matching_proxy_usage_log`].  The replay generation
+/// lives in shadow tables, so its coverage markers must be checked there rather
+/// than against the published generation.  Proxy rows themselves remain in the
+/// live request log and keep their normal `codex` app type.
+pub(crate) fn find_matching_proxy_usage_log_for_coverage_source(
+    conn: &Connection,
+    key: &DedupKey,
+) -> Result<Option<String>, AppError> {
+    let allow_missing_cache_creation = key.cache_creation_tokens == 0;
+    let sql = "SELECT l.request_id
+        FROM proxy_request_logs l
+        WHERE COALESCE(l.data_source, 'proxy') = 'proxy'
+          AND l.app_type = 'codex'
+          AND l.status_code >= 200
+          AND l.status_code < 300
+          AND l.input_tokens = ?3
+          AND l.output_tokens = ?4
+          AND l.cache_read_tokens = ?5
+          AND (l.cache_creation_tokens = ?6 OR ?9 = 1)
+          AND l.created_at BETWEEN ?7 - ?8 AND ?7 + ?8
+          AND (
+              LOWER(l.model) = LOWER(?2)
+              OR LOWER(l.model) = 'unknown'
+              OR LOWER(?2) = 'unknown'
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM codex_replay_coverage coverage
+              WHERE coverage.app_type = 'codex_replay'
+                AND coverage.data_source = 'proxy_replay'
+                AND coverage.request_id = l.request_id
+          )
+        ORDER BY ABS(l.created_at - ?7), l.request_id
+        LIMIT 1";
+    conn.prepare_cached(sql)
+        .and_then(|mut stmt| {
+            stmt.query_row(
+                params![
+                    key.app_type,
+                    key.model,
+                    key.input_tokens as i64,
+                    key.output_tokens as i64,
+                    key.cache_read_tokens as i64,
+                    key.cache_creation_tokens as i64,
+                    key.created_at,
+                    SESSION_PROXY_DEDUP_WINDOW_SECONDS,
+                    allow_missing_cache_creation as i64,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+        })
+        .map_err(|e| AppError::Database(format!("查询重放代理用量日志失败: {e}")))
+}
+
 pub(crate) fn has_matching_proxy_usage_log(
     conn: &Connection,
     key: &DedupKey,
