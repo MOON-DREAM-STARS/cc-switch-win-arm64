@@ -13,11 +13,18 @@
 //! - `turn_context` → 提取当前 model
 //! - `event_msg` (type=token_count) → 提取累计 token 用量，计算 delta
 
-use crate::codex_config::get_codex_config_dir;
-use crate::database::{lock_conn, Database};
+use crate::codex_config::{get_codex_config_dir, read_codex_config_text};
+use crate::codex_state_db::codex_state_db_paths;
+use crate::database::{lock_conn, AgentSessionCanonicalCoverageMarker, Database};
 use crate::error::AppError;
 use crate::proxy::usage::calculator::{CostCalculator, ModelPricing};
 use crate::proxy::usage::parser::TokenUsage;
+use crate::services::agent_session_usage::{
+    normalize_session_relations, write_agent_session_node_on_conn,
+    write_agent_session_usage_rollup_fact_on_conn, NormalizedUsageRollupFact, RelationClaim,
+    RelationConfidence, RequestCountSemantics, SessionNodeMetadata, SessionRelationClaim,
+    TimeSemantics, UsagePrecision,
+};
 use crate::services::session_usage::{
     metadata_modified_nanos, update_sync_state, update_sync_state_on_conn, SessionSyncResult,
 };
@@ -25,6 +32,7 @@ use crate::services::usage_stats::{
     find_model_pricing, has_suspected_codex_session_duplicate, should_skip_session_insert, DedupKey,
 };
 use chrono::{DateTime, Utc};
+use rusqlite::{Connection, OpenFlags};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::fs;
@@ -34,8 +42,9 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::Duration;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
@@ -57,6 +66,18 @@ struct DeltaTokens {
     input: u32,
     cached_input: u32,
     output: u32,
+}
+
+/// Source-presence-aware components for one token_count event.  The raw
+/// compatibility table has no nullable component distinction, so canonical
+/// facts carry these options directly from the JSON source instead of
+/// treating a missing field as zero.
+#[derive(Debug, Clone, Default)]
+struct ParsedUsageComponents {
+    input: Option<u32>,
+    cache_read: Option<u32>,
+    output: Option<u32>,
+    reasoning: Option<u32>,
 }
 
 impl DeltaTokens {
@@ -197,6 +218,8 @@ struct ParsedTokenEvent {
     event_index: Option<u32>,
     model: String,
     timestamp: Option<String>,
+    precision: UsagePrecision,
+    source_components: ParsedUsageComponents,
 }
 
 #[derive(Debug)]
@@ -211,6 +234,7 @@ struct ParsedCodexFile {
     root_thread_id: Option<String>,
     root_meta_seen: bool,
     root_timestamp: Option<DateTime<Utc>>,
+    project_dir: Option<String>,
     parent: ParentResolution,
     token_events: Vec<ParsedTokenEvent>,
     line_offset: i64,
@@ -236,12 +260,21 @@ struct CodexReplayCaches {
     parent_timelines: HashMap<PathBuf, CachedParentTimeline>,
     replay_prefixes: HashMap<PathBuf, CachedReplayPrefix>,
     pending: HashMap<PathBuf, PendingEntry>,
+    request_precisions: HashMap<String, UsagePrecision>,
 }
 
 static CODEX_REPLAY_CACHES: OnceLock<Mutex<CodexReplayCaches>> = OnceLock::new();
 
 fn replay_caches() -> &'static Mutex<CodexReplayCaches> {
     CODEX_REPLAY_CACHES.get_or_init(|| Mutex::new(CodexReplayCaches::default()))
+}
+
+fn remember_request_precision(request_id: &str, precision: UsagePrecision) {
+    if let Ok(mut caches) = replay_caches().lock() {
+        caches
+            .request_precisions
+            .insert(request_id.to_string(), precision);
+    }
 }
 
 pub(crate) fn clear_codex_replay_caches() {
@@ -323,6 +356,31 @@ pub(crate) fn reset_codex_usage_on_conn(
             [],
         )
         .map_err(|error| AppError::Database(format!("清理 Codex 用量汇总失败: {error}")))?;
+    }
+    if sqlite_table_exists(conn, "agent_session_usage_rollups")?
+        && sqlite_column_exists(conn, "agent_session_usage_rollups", "app_type")?
+    {
+        conn.execute(
+            "DELETE FROM agent_session_usage_rollups WHERE app_type = 'codex'",
+            [],
+        )
+        .map_err(|error| AppError::Database(format!("清理 Codex 会话用量桶失败: {error}")))?;
+    }
+    if sqlite_table_exists(conn, "agent_session_nodes")?
+        && sqlite_column_exists(conn, "agent_session_nodes", "app_type")?
+    {
+        conn.execute(
+            "DELETE FROM agent_session_nodes WHERE app_type = 'codex'",
+            [],
+        )
+        .map_err(|error| AppError::Database(format!("清理 Codex 会话节点失败: {error}")))?;
+    }
+    if sqlite_table_exists(conn, "agent_session_canonical_coverage")? {
+        Database::delete_agent_session_canonical_coverage_for_source_on_conn(
+            conn,
+            "codex",
+            "codex_session",
+        )?;
     }
     if sqlite_table_exists(conn, "session_log_sync")?
         && sqlite_column_exists(conn, "session_log_sync", "file_path")?
@@ -605,6 +663,21 @@ fn update_high_water(high_water: &mut CumulativeTokens, current: &CumulativeToke
     high_water.output = high_water.output.max(current.output);
 }
 
+fn update_presence_high_water(
+    high_water: &mut ParsedUsageComponents,
+    current: &ParsedUsageComponents,
+) {
+    fn update(high_water: &mut Option<u32>, current: Option<u32>) {
+        if let Some(current) = current {
+            *high_water = Some(high_water.unwrap_or(0).max(current));
+        }
+    }
+    update(&mut high_water.input, current.input);
+    update(&mut high_water.cache_read, current.cache_read);
+    update(&mut high_water.output, current.output);
+    update(&mut high_water.reasoning, current.reasoning);
+}
+
 /// 从 JSON Value 中提取累计 token 用量
 fn parse_cumulative_tokens(total_usage: &serde_json::Value) -> Option<CumulativeTokens> {
     let fields = total_usage.as_object()?;
@@ -638,6 +711,80 @@ fn parse_cumulative_tokens(total_usage: &serde_json::Value) -> Option<Cumulative
     })
 }
 
+/// Parse a cumulative token snapshot while retaining which source fields were
+/// actually present.  `parse_cumulative_tokens` remains the compatibility
+/// helper used by the legacy delta tests; canonical writes use this richer
+/// representation so missing cached-input/cache-read is never coerced to 0.
+fn parse_cumulative_components(
+    total_usage: &serde_json::Value,
+) -> Option<(CumulativeTokens, ParsedUsageComponents)> {
+    let fields = total_usage.as_object()?;
+    if ![
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+    ]
+    .iter()
+    .any(|field| fields.contains_key(*field))
+    {
+        return None;
+    }
+    let input = total_usage
+        .get("input_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let cache_read = total_usage
+        .get("cached_input_tokens")
+        .or_else(|| total_usage.get("cache_read_input_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    let output = total_usage
+        .get("output_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let reasoning = total_usage
+        .get("reasoning_output_tokens")
+        .and_then(serde_json::Value::as_u64);
+    Some((
+        CumulativeTokens {
+            input: input.unwrap_or(0),
+            cached_input: cache_read.unwrap_or(0),
+            output: output.unwrap_or(0),
+        },
+        ParsedUsageComponents {
+            input: input.map(|value| value.min(u32::MAX as u64) as u32),
+            cache_read: cache_read.map(|value| value.min(u32::MAX as u64) as u32),
+            output: output.map(|value| value.min(u32::MAX as u64) as u32),
+            reasoning: reasoning.map(|value| value.min(u32::MAX as u64) as u32),
+        },
+    ))
+}
+
+fn cumulative_component_delta(
+    previous: Option<&ParsedUsageComponents>,
+    current: &ParsedUsageComponents,
+) -> ParsedUsageComponents {
+    fn delta(
+        previous: Option<&ParsedUsageComponents>,
+        field: fn(&ParsedUsageComponents) -> Option<u32>,
+        current: Option<u32>,
+    ) -> Option<u32> {
+        match (previous, current) {
+            (None, current) => current,
+            (Some(previous), Some(current)) => {
+                field(previous).map(|previous| current.saturating_sub(previous))
+            }
+            (Some(_), None) => None,
+        }
+    }
+    ParsedUsageComponents {
+        input: delta(previous, |value| value.input, current.input),
+        cache_read: delta(previous, |value| value.cache_read, current.cache_read),
+        output: delta(previous, |value| value.output, current.output),
+        reasoning: delta(previous, |value| value.reasoning, current.reasoning),
+    }
+}
+
 type RolloutIndex = HashMap<String, Vec<PathBuf>>;
 
 #[derive(Debug, Default)]
@@ -652,6 +799,7 @@ struct CodexFileSyncResult {
 pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
     let codex_dir = get_codex_config_dir();
     let files = collect_codex_session_files(&codex_dir);
+    let thread_titles = load_native_thread_titles();
     let rollout_index = build_rollout_index(&files);
     let mut pass = CodexSyncPass::load(db)?;
 
@@ -663,6 +811,15 @@ pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
         deferred_files: 0,
         errors: vec![],
     };
+
+    // Normalize every discovered rollout relation in one graph pass before
+    // importing usage.  This is what lets root → child → grandchild resolve
+    // without ever folding a child's own ID into its parent's node.
+    if let Err(error) = persist_codex_nodes_for_files_with_titles(db, &files, &thread_titles) {
+        result
+            .errors
+            .push(format!("Codex 会话节点写入失败: {error}"));
+    }
 
     for file_path in &files {
         match sync_single_codex_file(db, file_path, &rollout_index, &mut pass) {
@@ -681,6 +838,24 @@ pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
                 log::warn!("[CODEX-SYNC] {msg}");
                 result.errors.push(msg);
             }
+        }
+    }
+
+    // Single-file compatibility writes above intentionally fail closed when a
+    // parent claim is not in that call's scope.  Re-run the complete graph
+    // after ingestion so the public sync leaves every discovered depth with
+    // its normalized root/parent ownership.
+    if let Err(error) = persist_codex_nodes_for_files_with_titles(db, &files, &thread_titles) {
+        result
+            .errors
+            .push(format!("Codex 会话节点归一化失败: {error}"));
+    }
+
+    if !files.is_empty() {
+        if let Err(error) = rebuild_codex_normalized_rollups(db) {
+            result
+                .errors
+                .push(format!("Codex 会话用量桶重建失败: {error}"));
         }
     }
 
@@ -763,6 +938,7 @@ fn parse_codex_file(
     let reader = BufReader::new(file);
     let mut root_meta_seen = false;
     let mut root_timestamp = None;
+    let mut project_dir = None;
     let mut parent = ParentResolution::None;
     let mut current_model = "unknown".to_string();
     // `total_token_usage` is session-cumulative, including across model and
@@ -776,6 +952,7 @@ fn parse_codex_file(
     // those stale signatures can legitimately recur after a counter reset.
     let mut last_signature_by_source: HashMap<Option<String>, TokenUsageSignature> = HashMap::new();
     let mut previous_token_signature = None;
+    let mut total_presence_high_water: Option<ParsedUsageComponents> = None;
     let mut event_index = 0u32;
     let mut token_events = Vec::new();
     let mut line_offset = 0i64;
@@ -814,6 +991,7 @@ fn parse_codex_file(
                 root_meta_seen = true;
                 root_timestamp = parse_timestamp(value.get("timestamp"));
                 let payload = value.get("payload").unwrap_or(&serde_json::Value::Null);
+                project_dir = non_empty_string(payload.get("cwd"));
                 parent = explicit_parent_from_meta(payload);
 
                 let meta_thread_id = non_empty_string(
@@ -882,16 +1060,17 @@ fn parse_codex_file(
                 }
 
                 let snapshot_source = token_snapshot_source(payload);
-                let total = info
+                let total_snapshot = info
                     .get("total_token_usage")
-                    .and_then(parse_cumulative_tokens);
-                let last = info
+                    .and_then(parse_cumulative_components);
+                let last_snapshot = info
                     .get("last_token_usage")
-                    .and_then(parse_cumulative_tokens);
-                if total.is_none() && last.is_none() {
+                    .and_then(parse_cumulative_components);
+                if total_snapshot.is_none() && last_snapshot.is_none() {
                     continue;
                 }
-                let has_total_snapshot = total.is_some();
+                let has_total_snapshot = total_snapshot.is_some();
+                let has_exact_last_usage = last_snapshot.is_some();
                 let duplicate_snapshot = has_total_snapshot
                     && (last_signature_by_source.get(&snapshot_source) == Some(&signature)
                         || previous_token_signature.as_ref() == Some(&signature));
@@ -900,38 +1079,61 @@ fn parse_codex_file(
                 }
                 previous_token_signature = Some(signature.clone());
 
-                let delta = if duplicate_snapshot {
-                    DeltaTokens {
-                        input: 0,
-                        cached_input: 0,
-                        output: 0,
-                    }
-                } else if let Some(last) = last {
+                let (delta, source_components) = if duplicate_snapshot {
+                    (
+                        DeltaTokens {
+                            input: 0,
+                            cached_input: 0,
+                            output: 0,
+                        },
+                        ParsedUsageComponents::default(),
+                    )
+                } else if let Some((last, components)) = last_snapshot {
                     // Codex provides the exact per-request usage. Prefer it to
                     // subtracting cumulative snapshots, which may come from
                     // multiple independently advancing rate-limit lanes.
-                    DeltaTokens {
-                        input: last.input as u32,
-                        cached_input: last.cached_input as u32,
-                        output: last.output as u32,
-                    }
-                } else if let Some(total) = total.as_ref() {
-                    compute_delta(&total_high_water, total)
+                    (
+                        DeltaTokens {
+                            input: last.input as u32,
+                            cached_input: last.cached_input as u32,
+                            output: last.output as u32,
+                        },
+                        components,
+                    )
+                } else if let Some((total, components)) = total_snapshot.as_ref() {
+                    (
+                        compute_delta(&total_high_water, total),
+                        cumulative_component_delta(total_presence_high_water.as_ref(), components),
+                    )
                 } else {
                     continue;
                 };
-                if let Some(total) = total {
+                if let Some((total, components)) = total_snapshot {
                     if let Some(high_water) = total_high_water.as_mut() {
                         update_high_water(high_water, &total);
                     } else {
                         total_high_water = Some(total);
+                    }
+                    if let Some(high_water) = total_presence_high_water.as_mut() {
+                        update_presence_high_water(high_water, &components);
+                    } else {
+                        total_presence_high_water = Some(components);
                     }
                 }
                 let delta = DeltaTokens {
                     cached_input: delta.cached_input.min(delta.input),
                     ..delta
                 };
-                let nonzero_index = if delta.is_zero() {
+                let precision = if has_exact_last_usage {
+                    UsagePrecision::RequestExact
+                } else {
+                    UsagePrecision::SessionExact
+                };
+                let nonzero_index = if delta.is_zero()
+                    && source_components
+                        .reasoning
+                        .is_none_or(|reasoning| reasoning == 0)
+                {
                     None
                 } else {
                     has_billable_tokens = true;
@@ -949,6 +1151,8 @@ fn parse_codex_file(
                         .get("timestamp")
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned),
+                    precision,
+                    source_components,
                 });
             }
             _ => {}
@@ -959,11 +1163,431 @@ fn parse_codex_file(
         root_thread_id,
         root_meta_seen,
         root_timestamp,
+        project_dir,
         parent,
         token_events,
         line_offset,
         has_billable_tokens,
     })
+}
+
+fn event_timestamp_epoch(value: Option<&str>) -> Option<i64> {
+    value
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|timestamp| timestamp.timestamp())
+}
+
+/// Read the titles Codex itself exposes in the desktop sidebar. The state
+/// database is authoritative when available; the legacy session index fills
+/// gaps. The query intentionally selects only `id` and `title`, so no prompt
+/// body or `first_user_message` value is read or persisted.
+fn load_native_thread_titles() -> HashMap<String, String> {
+    let config_dir = get_codex_config_dir();
+    let mut titles = load_native_thread_titles_from_index(
+        &config_dir.join("session_index.jsonl"),
+    );
+    let config_text = read_codex_config_text().unwrap_or_default();
+    for db_path in codex_state_db_paths(&config_dir, &config_text) {
+        titles.extend(load_native_thread_titles_from_db(&db_path));
+    }
+    titles
+}
+
+fn load_native_thread_titles_from_index(path: &Path) -> HashMap<String, String> {
+    let Ok(file) = fs::File::open(path) else {
+        return HashMap::new();
+    };
+    let mut titles = HashMap::new();
+    for line in BufReader::new(file).lines().flatten() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(id) = non_empty_string(value.get("id")) else {
+            continue;
+        };
+        let Some(title) = non_empty_string(value.get("thread_name")) else {
+            continue;
+        };
+        titles.insert(id, title);
+    }
+    titles
+}
+
+fn load_native_thread_titles_from_db(path: &Path) -> HashMap<String, String> {
+    if !path.exists() {
+        return HashMap::new();
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return HashMap::new();
+    };
+    if conn.busy_timeout(Duration::from_secs(2)).is_err() {
+        return HashMap::new();
+    }
+    let Ok(mut statement) = conn.prepare(
+        "SELECT id, title FROM threads WHERE TRIM(COALESCE(title, '')) <> ''",
+    ) else {
+        return HashMap::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let title: String = row.get(1)?;
+        Ok((id, title))
+    }) else {
+        return HashMap::new();
+    };
+    let mut titles = HashMap::new();
+    for (id, title) in rows.flatten() {
+        let id = id.trim();
+        let title = title.trim();
+        if !id.is_empty() && !title.is_empty() {
+            titles.insert(id.to_string(), title.to_string());
+        }
+    }
+    titles
+}
+
+/// Turn one parsed rollout into the only relation evidence accepted by the
+/// normalized service.  The filename UUID is always the node's own identity;
+/// parentage can only come from the two explicit metadata fields parsed above.
+fn relation_claim_from_parsed(
+    file_path: &Path,
+    parsed: &ParsedCodexFile,
+    file_modified: i64,
+    thread_titles: &HashMap<String, String>,
+) -> Option<SessionRelationClaim> {
+    let session_id = parsed.root_thread_id.clone()?;
+    if !parsed.root_meta_seen {
+        return None;
+    }
+
+    let relation = match &parsed.parent {
+        ParentResolution::None => RelationClaim::Root,
+        ParentResolution::Parent(parent_session_id) => RelationClaim::Parent {
+            parent_session_id: parent_session_id.clone(),
+            confidence: RelationConfidence::Explicit,
+        },
+        // RelationClaim has no standalone conflict variant.  A self edge with
+        // Conflict confidence is intentionally fail-closed in T03's graph
+        // normalizer and cannot become an ownership edge.
+        ParentResolution::Deferred(_) => RelationClaim::Parent {
+            parent_session_id: session_id.clone(),
+            confidence: RelationConfidence::Conflict,
+        },
+    };
+
+    let last_active_at = parsed
+        .token_events
+        .iter()
+        .filter_map(|event| event_timestamp_epoch(event.timestamp.as_deref()))
+        .max();
+    let title = thread_titles.get(&session_id).cloned();
+    Some(SessionRelationClaim {
+        app_type: "codex".to_string(),
+        session_id,
+        relation,
+        metadata: SessionNodeMetadata {
+            title,
+            project_dir: parsed.project_dir.clone(),
+            source_path: Some(file_path.to_string_lossy().to_string()),
+            created_at: parsed.root_timestamp.map(|timestamp| timestamp.timestamp()),
+            last_active_at,
+            last_synced_at: file_modified,
+            ..SessionNodeMetadata::default()
+        },
+    })
+}
+
+fn persist_codex_relation_claims(
+    db: &Database,
+    claims: &[SessionRelationClaim],
+) -> Result<(), AppError> {
+    if claims.is_empty() {
+        return Ok(());
+    }
+    let normalized = normalize_session_relations(claims)?;
+    let conn = lock_conn!(db.conn);
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| AppError::Database(format!("开启 Codex 会话节点事务失败: {error}")))?;
+    for node in &normalized {
+        write_agent_session_node_on_conn(&tx, node)?;
+    }
+    tx.commit()
+        .map_err(|error| AppError::Database(format!("提交 Codex 会话节点事务失败: {error}")))
+}
+
+fn persist_codex_node_for_parsed(
+    db: &Database,
+    file_path: &Path,
+    parsed: &ParsedCodexFile,
+    file_modified: i64,
+) -> Result<(), AppError> {
+    if let Some(claim) = relation_claim_from_parsed(
+        file_path,
+        parsed,
+        file_modified,
+        &HashMap::new(),
+    ) {
+        persist_codex_relation_claims(db, &[claim])?;
+    }
+    Ok(())
+}
+
+fn persist_codex_nodes_for_files(db: &Database, files: &[PathBuf]) -> Result<(), AppError> {
+    let thread_titles = load_native_thread_titles();
+    persist_codex_nodes_for_files_with_titles(db, files, &thread_titles)
+}
+
+fn persist_codex_nodes_for_files_with_titles(
+    db: &Database,
+    files: &[PathBuf],
+    thread_titles: &HashMap<String, String>,
+) -> Result<(), AppError> {
+    let mut claims = Vec::new();
+    for file_path in files {
+        let metadata = match fs::metadata(file_path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let parsed = match parse_codex_file(file_path, thread_id_from_filename(file_path)) {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+        if let Some(claim) =
+            relation_claim_from_parsed(
+                file_path,
+                &parsed,
+                metadata_modified_nanos(&metadata),
+                thread_titles,
+            )
+        {
+            claims.push(claim);
+        }
+    }
+    persist_codex_relation_claims(db, &claims)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CodexFactKey {
+    date: String,
+    session_id: String,
+    model: String,
+    precision: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CodexFactAccumulator {
+    initialized: bool,
+    request_count: Option<i64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
+    first_event_at: Option<i64>,
+    last_event_at: Option<i64>,
+    request_ids: Vec<String>,
+}
+
+fn merge_optional_sum(current: &mut Option<i64>, incoming: Option<i64>) {
+    match (current.as_mut(), incoming) {
+        (Some(current), Some(incoming)) => *current = (*current).saturating_add(incoming),
+        // A nullable component on an already-existing durable row is an
+        // unknown value, not an empty accumulator.  Never upgrade that
+        // unknown to a later known value.
+        (None, Some(_)) => {}
+        (_, None) => *current = None,
+    }
+}
+
+fn merge_optional_min(current: &mut Option<i64>, incoming: Option<i64>) {
+    match (current.as_mut(), incoming) {
+        (Some(current), Some(incoming)) => *current = (*current).min(incoming),
+        (None, Some(_)) => {}
+        (_, None) => *current = None,
+    }
+}
+
+fn merge_optional_max(current: &mut Option<i64>, incoming: Option<i64>) {
+    match (current.as_mut(), incoming) {
+        (Some(current), Some(incoming)) => *current = (*current).max(incoming),
+        (None, Some(_)) => {}
+        (_, None) => *current = None,
+    }
+}
+
+fn merge_codex_fact_accumulator(
+    current: &mut CodexFactAccumulator,
+    incoming: CodexFactAccumulator,
+) {
+    if !current.initialized {
+        *current = incoming;
+        current.initialized = true;
+        return;
+    }
+    merge_optional_sum(&mut current.request_count, incoming.request_count);
+    merge_optional_sum(&mut current.input_tokens, incoming.input_tokens);
+    merge_optional_sum(&mut current.output_tokens, incoming.output_tokens);
+    merge_optional_sum(&mut current.cache_read_tokens, incoming.cache_read_tokens);
+    merge_optional_sum(&mut current.reasoning_tokens, incoming.reasoning_tokens);
+    merge_optional_min(&mut current.first_event_at, incoming.first_event_at);
+    merge_optional_max(&mut current.last_event_at, incoming.last_event_at);
+    current.request_ids.extend(incoming.request_ids);
+}
+
+fn codex_fact_from_event(
+    request_id: &str,
+    session_id: &str,
+    event: &ParsedTokenEvent,
+) -> Option<(CodexFactKey, CodexFactAccumulator)> {
+    let timestamp = event_timestamp_epoch(event.timestamp.as_deref())?;
+    let components = &event.source_components;
+    if components.input.is_none()
+        && components.cache_read.is_none()
+        && components.output.is_none()
+        && components.reasoning.is_none()
+    {
+        return None;
+    }
+    let key = CodexFactKey {
+        date: DateTime::<Utc>::from_timestamp(timestamp, 0)?
+            .date_naive()
+            .to_string(),
+        session_id: session_id.to_string(),
+        model: event.model.clone(),
+        precision: event.precision.as_str().to_string(),
+    };
+    let accumulator = CodexFactAccumulator {
+        initialized: true,
+        request_count: Some(1),
+        input_tokens: components.input.map(i64::from),
+        output_tokens: components.output.map(i64::from),
+        cache_read_tokens: components.cache_read.map(i64::from),
+        reasoning_tokens: components.reasoning.map(i64::from),
+        first_event_at: Some(timestamp),
+        last_event_at: Some(timestamp),
+        request_ids: vec![request_id.to_string()],
+    };
+    Some((key, accumulator))
+}
+
+fn read_existing_codex_fact_on_conn(
+    conn: &rusqlite::Connection,
+    key: &CodexFactKey,
+) -> Result<Option<CodexFactAccumulator>, AppError> {
+    let result = conn.query_row(
+        "SELECT request_count, input_tokens, output_tokens, cache_read_tokens,
+                reasoning_tokens, first_event_at, last_event_at
+         FROM agent_session_usage_rollups
+         WHERE date = ?1 AND app_type = 'codex' AND session_id = ?2
+           AND provider_id = '_codex_session' AND model = ?3 AND request_model = ?3
+           AND pricing_model = '' AND data_source = 'codex_session'
+           AND precision = ?4 AND time_semantics = 'event_time'
+           AND request_count_semantics = 'agent_call' AND input_token_semantics = 0
+           AND source_identity = '' AND profile_id = '' AND database_identity = ''
+           AND base_url_digest = '' AND billing_mode = '' AND task = ''
+           AND source_version = ''
+           AND sync_window_start = 0 AND sync_window_end = 0",
+        rusqlite::params![&key.date, &key.session_id, &key.model, &key.precision],
+        |row| {
+            Ok(CodexFactAccumulator {
+                initialized: true,
+                request_count: row.get(0)?,
+                input_tokens: row.get(1)?,
+                output_tokens: row.get(2)?,
+                cache_read_tokens: row.get(3)?,
+                reasoning_tokens: row.get(4)?,
+                first_event_at: row.get(5)?,
+                last_event_at: row.get(6)?,
+                request_ids: Vec::new(),
+            })
+        },
+    );
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(AppError::Database(format!(
+            "读取 Codex 规范用量桶失败: {error}"
+        ))),
+    }
+}
+
+/// Persist source-aware Codex facts and exact request coverage markers in the
+/// same caller-owned transaction as the raw insert.  Legacy raw rows are not
+/// a reconstruction source because they cannot distinguish missing components
+/// from compatibility zeros.
+fn persist_codex_facts_on_conn(
+    conn: &rusqlite::Connection,
+    observations: impl IntoIterator<Item = (CodexFactKey, CodexFactAccumulator)>,
+) -> Result<(), AppError> {
+    for (key, incoming) in observations {
+        let mut aggregate = read_existing_codex_fact_on_conn(conn, &key)?.unwrap_or_default();
+        let request_ids = incoming.request_ids.clone();
+        merge_codex_fact_accumulator(&mut aggregate, incoming);
+        let fact = NormalizedUsageRollupFact {
+            date: key.date,
+            app_type: "codex".to_string(),
+            session_id: key.session_id.clone(),
+            provider_id: "_codex_session".to_string(),
+            model: key.model.clone(),
+            request_model: key.model,
+            pricing_model: String::new(),
+            data_source: "codex_session".to_string(),
+            precision: UsagePrecision::from_str(&key.precision)
+                .unwrap_or(UsagePrecision::SessionExact),
+            time_semantics: TimeSemantics::EventTime,
+            request_count_semantics: RequestCountSemantics::AgentCall,
+            input_token_semantics: 0,
+            source_identity: String::new(),
+            profile_id: String::new(),
+            database_identity: String::new(),
+            base_url_digest: String::new(),
+            billing_mode: String::new(),
+            task: String::new(),
+            source_version: String::new(),
+            sync_window_start: 0,
+            sync_window_end: 0,
+            request_count: aggregate.request_count,
+            api_call_count: None,
+            input_tokens: aggregate.input_tokens,
+            output_tokens: aggregate.output_tokens,
+            cache_read_tokens: aggregate.cache_read_tokens,
+            cache_creation_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: aggregate.reasoning_tokens,
+            total_cost_usd: None,
+            cost_status: None,
+            cost_source: None,
+            cost_delta_kind: None,
+            correction_state: None,
+            first_event_at: aggregate.first_event_at,
+            last_event_at: aggregate.last_event_at,
+        };
+        write_agent_session_usage_rollup_fact_on_conn(conn, &fact)?;
+        for request_id in request_ids {
+            let marked_at = aggregate.last_event_at.unwrap_or(0);
+            Database::upsert_agent_session_canonical_coverage_on_conn(
+                conn,
+                &AgentSessionCanonicalCoverageMarker {
+                    app_type: "codex".to_string(),
+                    data_source: "codex_session".to_string(),
+                    request_id,
+                    canonical_session_id: Some(key.session_id.clone()),
+                    marked_at,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Canonical facts are written atomically while parsing each raw batch.  A
+/// later rebuild must not infer source fields from `proxy_request_logs`, whose
+/// legacy integer columns cannot represent missing cache-read or cache-create.
+fn rebuild_codex_normalized_rollups(_db: &Database) -> Result<(), AppError> {
+    Ok(())
 }
 
 fn parent_signatures_before(
@@ -1180,6 +1804,10 @@ fn sync_single_codex_file(
     }
 
     let parsed = parse_codex_file(file_path, thread_id_from_filename(file_path))?;
+    // Direct callers (including focused fixtures) still get a durable node;
+    // the public sync path repeats this write with all claims in one graph so
+    // missing parents can be upgraded from unknown to child safely.
+    persist_codex_node_for_parsed(db, file_path, &parsed, file_modified)?;
     if !parsed.has_billable_tokens {
         update_sync_state(db, &file_path_str, file_modified, parsed.line_offset)?;
         return Ok(CodexFileSyncResult::default());
@@ -1198,6 +1826,16 @@ fn sync_single_codex_file(
             file_modified,
             file_size,
             PendingReason::Stable("含计费 token 但尚无 session_meta".to_string()),
+        ));
+    }
+    if parsed.token_events.iter().any(|event| {
+        event.event_index.is_some() && event_timestamp_epoch(event.timestamp.as_deref()).is_none()
+    }) {
+        return Ok(mark_deferred(
+            file_path,
+            file_modified,
+            file_size,
+            PendingReason::Stable("含计费 token 但缺少有效 event timestamp".to_string()),
         ));
     }
 
@@ -1307,9 +1945,22 @@ fn sync_single_codex_file(
         let mut batch_imported = 0u32;
         let mut batch_skipped = 0u32;
         let mut batch_suspected = 0u32;
+        let mut canonical_observations: HashMap<CodexFactKey, CodexFactAccumulator> =
+            HashMap::new();
         for (event, event_index) in batch {
             let request_id =
                 format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{root_thread_id}:{event_index}");
+            // A raw compatibility row is admitted only when this exact event
+            // can also produce a canonical fact.  The legacy row shape cannot
+            // carry source-field presence or a safe event time, so inserting
+            // first would leave an unmarked/uncanonical row that later raw
+            // retention could interpret incorrectly.
+            let Some((fact_key, fact_observation)) =
+                codex_fact_from_event(&request_id, root_thread_id, event)
+            else {
+                batch_skipped = batch_skipped.saturating_add(1);
+                continue;
+            };
             match insert_codex_session_entry_on_conn(
                 &tx,
                 &request_id,
@@ -1320,7 +1971,12 @@ fn sync_single_codex_file(
                 &mut batch_suspected,
                 &mut pass.pricing,
             ) {
-                Ok(true) => batch_imported += 1,
+                Ok(true) => {
+                    remember_request_precision(&request_id, event.precision);
+                    let aggregate = canonical_observations.entry(fact_key).or_default();
+                    merge_codex_fact_accumulator(aggregate, fact_observation);
+                    batch_imported += 1;
+                }
                 Ok(false) => batch_skipped += 1,
                 Err(e) => {
                     log::warn!("[CODEX-SYNC] 插入失败 ({request_id}): {e}");
@@ -1328,6 +1984,7 @@ fn sync_single_codex_file(
                 }
             }
         }
+        persist_codex_facts_on_conn(&tx, canonical_observations)?;
         if is_last_batch {
             // 游标推进与最后一批数据同事务提交：中途崩溃时两者一起回滚，
             // 不会出现"游标已推进但数据缺失"的丢数据窗口。
@@ -1394,12 +2051,10 @@ fn insert_codex_session_entry_on_conn(
                 .ok()
                 .map(|dt| dt.timestamp())
         })
-        .unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0)
-        });
+        // Event time is the only safe timestamp for normalized usage.  The
+        // parser defers billable events without one; retain epoch here only
+        // for the legacy proxy row shape and never use it in a rollup.
+        .unwrap_or(0);
 
     let dedup_key = DedupKey {
         app_type: "codex",
@@ -1508,6 +2163,7 @@ fn find_codex_pricing(conn: &rusqlite::Connection, model_id: &str) -> Option<Mod
 mod tests {
     use super::*;
     use crate::services::session_usage::get_sync_state;
+    use rusqlite::Connection;
     use tempfile::tempdir;
 
     const PARENT_ID: &str = "00000000-0000-4000-8000-000000000001";
@@ -1559,6 +2215,22 @@ mod tests {
         session_meta_at(thread_id, None, None, "2026-07-10T03:00:00Z")
     }
 
+    fn session_meta_with_cwd(
+        thread_id: &str,
+        cwd: &str,
+        timestamp: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "cwd": cwd,
+                "source": "cli"
+            }
+        })
+    }
+
     fn turn_context_for_model_at(model: &str, timestamp: &str) -> serde_json::Value {
         serde_json::json!({
             "timestamp": timestamp,
@@ -1573,6 +2245,59 @@ mod tests {
 
     fn turn_context() -> serde_json::Value {
         turn_context_at("2026-07-10T03:00:01Z")
+    }
+
+    #[test]
+    fn native_thread_title_uses_db_then_index_without_reading_first_message() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("state_5.sqlite");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, first_user_message TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, title, first_user_message) VALUES (?1, ?2, ?3)",
+            rusqlite::params![PARENT_ID, "Renamed native title", "prompt body must stay unread"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let index_path = temp.path().join("session_index.jsonl");
+        fs::write(
+            &index_path,
+            format!(
+                "{{\"id\":\"{CHILD_A_ID}\",\"thread_name\":\"Index title\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let db_titles = load_native_thread_titles_from_db(&db_path);
+        assert_eq!(db_titles.get(PARENT_ID).map(String::as_str), Some("Renamed native title"));
+        assert!(!db_titles.values().any(|title| title == "prompt body must stay unread"));
+        let index_titles = load_native_thread_titles_from_index(&index_path);
+        assert_eq!(index_titles.get(CHILD_A_ID).map(String::as_str), Some("Index title"));
+    }
+
+    #[test]
+    fn codex_claim_keeps_native_title_and_session_meta_cwd() {
+        let temp = tempdir().unwrap();
+        let path = rollout_path(temp.path(), PARENT_ID);
+        write_jsonl(
+            &path,
+            &[
+                session_meta_with_cwd(PARENT_ID, "/workspace/codex", "2026-07-10T03:00:00Z"),
+                serde_json::json!({
+                    "type": "user",
+                    "first_user_message": "prompt body must not become title"
+                }),
+            ],
+        );
+        let parsed = parse_codex_file(&path, Some(PARENT_ID.to_string())).unwrap();
+        let titles = HashMap::from([(PARENT_ID.to_string(), "Native task title".to_string())]);
+        let claim = relation_claim_from_parsed(&path, &parsed, 100, &titles).unwrap();
+        assert_eq!(claim.metadata.title.as_deref(), Some("Native task title"));
+        assert_eq!(claim.metadata.project_dir.as_deref(), Some("/workspace/codex"));
     }
 
     fn token_count_at(input: u64, cached: u64, output: u64, timestamp: &str) -> serde_json::Value {
@@ -1603,6 +2328,28 @@ mod tests {
             .expect("token_count must be an object")
             .remove("timestamp");
         value
+    }
+
+    fn token_count_missing_cache_at(input: u64, output: u64, timestamp: &str) -> serde_json::Value {
+        let mut value = token_count_at(input, 0, output, timestamp);
+        value["payload"]["info"]["total_token_usage"]
+            .as_object_mut()
+            .expect("total_token_usage must be an object")
+            .remove("cached_input_tokens");
+        value
+    }
+
+    fn token_count_without_source_components(timestamp: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": { "total_tokens": 99 }
+                }
+            }
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1640,6 +2387,31 @@ mod tests {
                 "rate_limits": { "limit_id": limit_id }
             }
         })
+    }
+
+    fn token_count_with_last_missing_cache_at(
+        total_input: u64,
+        total_output: u64,
+        last_input: u64,
+        last_output: u64,
+        limit_id: &str,
+        timestamp: &str,
+    ) -> serde_json::Value {
+        let mut value = token_count_with_last_at(
+            total_input,
+            0,
+            total_output,
+            last_input,
+            0,
+            last_output,
+            limit_id,
+            timestamp,
+        );
+        value["payload"]["info"]["last_token_usage"]
+            .as_object_mut()
+            .expect("last_token_usage must be an object")
+            .remove("cached_input_tokens");
+        value
     }
 
     fn sync_test_file(
@@ -2550,6 +3322,16 @@ mod tests {
         let deferred = sync_test_file(&db, &child, &[&child])?;
         assert!(deferred.deferred);
         assert_eq!(get_sync_state(&db, &child.to_string_lossy())?, (0, 0));
+        {
+            let conn = lock_conn!(db.conn);
+            let node: (String, String) = conn.query_row(
+                "SELECT root_session_id, node_kind FROM agent_session_nodes
+                 WHERE app_type = 'codex' AND session_id = ?1",
+                [CHILD_A_ID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(node, (CHILD_A_ID.to_string(), "unknown".to_string()));
+        }
 
         write_jsonl(
             &parent,
@@ -2726,6 +3508,14 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         assert_eq!(usage, (100, 50, 10));
+        let canonical: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT request_count, input_tokens, output_tokens, cache_read_tokens
+             FROM agent_session_usage_rollups
+             WHERE app_type = 'codex' AND session_id = ?1",
+            [PARENT_ID],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(canonical, (Some(1), Some(100), Some(10), Some(50)));
         drop(conn);
         assert_eq!(get_sync_state(&db, &archived_file.to_string_lossy())?.1, 4);
 
@@ -2851,7 +3641,24 @@ mod tests {
                  INSERT INTO usage_daily_rollups (date, app_type, provider_id, model)
                  VALUES
                     ('2026-07-10', 'codex', '_codex_session', 'gpt'),
-                    ('2026-07-10', 'gemini', '_gemini_session', 'gemini');",
+                    ('2026-07-10', 'gemini', '_gemini_session', 'gemini');
+                 INSERT INTO agent_session_nodes (
+                    app_type, session_id, root_session_id, node_kind,
+                    relation_confidence, last_synced_at
+                 ) VALUES ('codex', 'codex-node', 'codex-node', 'root', 'explicit', 1);
+                 INSERT INTO agent_session_usage_rollups (
+                    date, app_type, session_id, data_source, precision,
+                    time_semantics, request_count_semantics,
+                    input_tokens, output_tokens, cache_read_tokens,
+                    cache_creation_tokens
+                 ) VALUES ('2026-07-10', 'codex', 'codex-node', 'codex_session',
+                           'request_exact', 'event_time', 'agent_call', 1, 1, 0, 1);",
+            )?;
+            conn.execute(
+                "INSERT INTO agent_session_canonical_coverage
+                    (app_type, data_source, request_id, canonical_session_id, marked_at)
+                 VALUES ('codex', 'codex_session', 'codex-marker', 'codex-node', 1)",
+                [],
             )?;
             for path in [
                 current_codex.to_string_lossy().to_string(),
@@ -2883,11 +3690,29 @@ mod tests {
                 [],
                 |row| row.get(0),
             )?;
+            let codex_nodes: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM agent_session_nodes WHERE app_type = 'codex'",
+                [],
+                |row| row.get(0),
+            )?;
+            let codex_session_rollups: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM agent_session_usage_rollups WHERE app_type = 'codex'",
+                [],
+                |row| row.get(0),
+            )?;
+            let codex_coverage: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM agent_session_canonical_coverage
+                 WHERE app_type = 'codex' AND data_source = 'codex_session'",
+                [],
+                |row| row.get(0),
+            )?;
             let remaining_cursors: i64 =
                 conn.query_row("SELECT COUNT(*) FROM session_log_sync", [], |row| {
                     row.get(0)
                 })?;
             assert_eq!((codex_rows, gemini_rows, codex_rollups), (0, 1, 0));
+            assert_eq!((codex_nodes, codex_session_rollups), (0, 0));
+            assert_eq!(codex_coverage, 0);
             assert_eq!(remaining_cursors, 2);
         }
         Ok(())
@@ -2969,6 +3794,674 @@ mod tests {
         // 实际钳制在调用侧：delta.cached_input.min(delta.input)
         let clamped = delta.cached_input.min(delta.input);
         assert_eq!(clamped, 10);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_normalized_rollout_graph_preserves_each_thread_and_all_depths() -> Result<(), AppError>
+    {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let root = rollout_path(temp.path(), PARENT_ID);
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+        let grandchild = rollout_path(temp.path(), CHILD_B_ID);
+        write_jsonl(&root, &[session_meta(PARENT_ID)]);
+        write_jsonl(
+            &child,
+            &[session_meta_at(
+                CHILD_A_ID,
+                Some(PARENT_ID),
+                Some(PARENT_ID),
+                "2026-07-10T03:00:05Z",
+            )],
+        );
+        write_jsonl(
+            &grandchild,
+            &[session_meta_at(
+                CHILD_B_ID,
+                None,
+                Some(CHILD_A_ID),
+                "2026-07-10T03:00:06Z",
+            )],
+        );
+
+        persist_codex_nodes_for_files(&db, &[root.clone(), child.clone(), grandchild.clone()])?;
+
+        let conn = lock_conn!(db.conn);
+        let rows = conn
+            .prepare(
+                "SELECT session_id, parent_session_id, root_session_id, node_kind,
+                        relation_confidence
+                 FROM agent_session_nodes WHERE app_type = 'codex'
+                 ORDER BY session_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    PARENT_ID.to_string(),
+                    None,
+                    PARENT_ID.to_string(),
+                    "root".to_string(),
+                    "explicit".to_string(),
+                ),
+                (
+                    CHILD_A_ID.to_string(),
+                    Some(PARENT_ID.to_string()),
+                    PARENT_ID.to_string(),
+                    "child".to_string(),
+                    "explicit".to_string(),
+                ),
+                (
+                    CHILD_B_ID.to_string(),
+                    Some(CHILD_A_ID.to_string()),
+                    PARENT_ID.to_string(),
+                    "child".to_string(),
+                    "explicit".to_string(),
+                ),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parent_confidence_cases_fail_closed_for_self_and_filename_mismatch(
+    ) -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let self_file = rollout_path(temp.path(), CHILD_A_ID);
+        let mismatch_file = rollout_path(temp.path(), CHILD_B_ID);
+        write_jsonl(
+            &self_file,
+            &[session_meta_at(
+                CHILD_A_ID,
+                None,
+                Some(CHILD_A_ID),
+                "2026-07-10T03:00:05Z",
+            )],
+        );
+        write_jsonl(&mismatch_file, &[session_meta(PARENT_ID)]);
+        persist_codex_nodes_for_files(&db, &[self_file, mismatch_file])?;
+
+        let conn = lock_conn!(db.conn);
+        let rows = conn
+            .prepare(
+                "SELECT session_id, root_session_id, node_kind, relation_confidence
+                 FROM agent_session_nodes WHERE app_type = 'codex'
+                 ORDER BY session_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(rows.len(), 2);
+        for (session_id, root, kind, confidence) in rows {
+            assert_eq!(session_id, root);
+            assert_eq!(kind, "conflict");
+            assert_eq!(confidence, "conflict");
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_partial_fact_retains_known_components_and_coverage_marker() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let file = rollout_path(temp.path(), PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context_for_model_at("fixture-model", "2026-07-10T03:00:01Z"),
+                token_count_at(100, 10, 5, "2026-07-10T03:00:02Z"),
+                token_count_at(140, 14, 7, "2026-07-10T03:00:03Z"),
+            ],
+        );
+        let first = sync_test_file(&db, &file, &[&file])?;
+        assert_eq!(first.imported, 2);
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 0);
+        let conn = lock_conn!(db.conn);
+        let fact: (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) = conn.query_row(
+            "SELECT input_tokens, output_tokens, cache_read_tokens,
+                        cache_creation_tokens, total_cost_usd
+                 FROM agent_session_usage_rollups
+                 WHERE app_type = 'codex' AND session_id = ?1",
+            [PARENT_ID],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(fact, (Some(140), Some(7), Some(14), None, None));
+        let marker_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_canonical_coverage
+             WHERE app_type = 'codex' AND data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(marker_count, 2);
+        let marker_ids = conn
+            .prepare(
+                "SELECT request_id, canonical_session_id
+                 FROM agent_session_canonical_coverage
+                 WHERE app_type = 'codex' AND data_source = 'codex_session'
+                 ORDER BY request_id",
+            )?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            marker_ids,
+            vec![
+                (
+                    format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{PARENT_ID}:1"),
+                    Some(PARENT_ID.to_string()),
+                ),
+                (
+                    format!("{CODEX_THREAD_REQUEST_ID_PREFIX}:{PARENT_ID}:2"),
+                    Some(PARENT_ID.to_string()),
+                ),
+            ]
+        );
+        drop(conn);
+        rebuild_codex_normalized_rollups(&db)?;
+        let conn = lock_conn!(db.conn);
+        let rebuilt_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_usage_rollups
+             WHERE app_type = 'codex' AND session_id = ?1",
+            [PARENT_ID],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rebuilt_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_missing_timestamp_never_inserts_unmarked_raw_or_fact() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let file = rollout_path(temp.path(), PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count_without_timestamp(100, 10, 5),
+            ],
+        );
+
+        let result = sync_test_file(&db, &file, &[&file])?;
+        assert!(result.deferred);
+        let conn = lock_conn!(db.conn);
+        let raw_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs
+             WHERE app_type = 'codex' AND data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        let fact_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_usage_rollups
+             WHERE app_type = 'codex' AND data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        let marker_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_canonical_coverage
+             WHERE app_type = 'codex' AND data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!((raw_count, fact_count, marker_count), (0, 0, 0));
+        drop(conn);
+        assert_eq!(get_sync_state(&db, &file.to_string_lossy())?, (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_unknown_source_components_never_insert_unmarked_raw_or_fact() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let file = rollout_path(temp.path(), PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count_without_source_components("2026-07-10T03:00:02Z"),
+            ],
+        );
+
+        let result = sync_test_file(&db, &file, &[&file])?;
+        assert!(!result.deferred);
+        let conn = lock_conn!(db.conn);
+        let raw_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs
+             WHERE app_type = 'codex' AND data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        let fact_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_usage_rollups
+             WHERE app_type = 'codex' AND data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        let marker_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_canonical_coverage
+             WHERE app_type = 'codex' AND data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!((raw_count, fact_count, marker_count), (0, 0, 0));
+        drop(conn);
+        assert_eq!(get_sync_state(&db, &file.to_string_lossy())?.1, 3);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_empty_source_version_replaces_migrated_codex_fact_key() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO agent_session_usage_rollups (
+                    date, app_type, session_id, provider_id, model, request_model,
+                    pricing_model, data_source, precision, time_semantics,
+                    request_count_semantics, request_count, input_tokens,
+                    output_tokens, cache_read_tokens, cache_creation_tokens,
+                    first_event_at, last_event_at
+                 ) VALUES (
+                    '2026-07-10', 'codex', ?1, '_codex_session', 'fixture-model',
+                    'fixture-model', '', 'codex_session', 'session_exact',
+                    'event_time', 'agent_call', 1, 1, 1, 0, NULL, 1, 1
+                 )",
+                [PARENT_ID],
+            )?;
+        }
+        let temp = tempdir().unwrap();
+        let file = rollout_path(temp.path(), PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context_for_model_at("fixture-model", "2026-07-10T03:00:01Z"),
+                token_count_at(10, 0, 2, "2026-07-10T03:00:02Z"),
+            ],
+        );
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+
+        let conn = lock_conn!(db.conn);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_usage_rollups
+             WHERE app_type = 'codex' AND session_id = ?1
+               AND model = 'fixture-model' AND source_version = ''",
+            [PARENT_ID],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 1);
+        let row: (Option<i64>, Option<i64>, Option<i64>, Option<String>) = conn.query_row(
+            "SELECT request_count, input_tokens, output_tokens, source_version
+             FROM agent_session_usage_rollups
+             WHERE app_type = 'codex' AND session_id = ?1
+               AND model = 'fixture-model' AND source_version = ''",
+            [PARENT_ID],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(row, (Some(2), Some(11), Some(3), Some(String::new())));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_cache_read_zero_is_distinct_from_missing_and_cost_stays_unknown() -> Result<(), AppError>
+    {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let file = rollout_path(temp.path(), PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context_for_model_at("known-zero", "2026-07-10T03:00:01Z"),
+                token_count_with_last_at(10, 0, 2, 10, 0, 2, "zero-cache", "2026-07-10T03:00:02Z"),
+                turn_context_for_model_at("missing-cache", "2026-07-10T03:00:03Z"),
+                token_count_with_last_missing_cache_at(
+                    20,
+                    4,
+                    10,
+                    2,
+                    "missing-cache",
+                    "2026-07-10T03:00:04Z",
+                ),
+            ],
+        );
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 2);
+
+        let conn = lock_conn!(db.conn);
+        let rows = conn
+            .prepare(
+                "SELECT model, input_tokens, output_tokens, cache_read_tokens,
+                        cache_creation_tokens, total_cost_usd
+                 FROM agent_session_usage_rollups
+                 WHERE app_type = 'codex' ORDER BY model",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "known-zero".to_string(),
+                    Some(10),
+                    Some(2),
+                    Some(0),
+                    None,
+                    None,
+                ),
+                (
+                    "missing-cache".to_string(),
+                    Some(10),
+                    Some(2),
+                    None,
+                    None,
+                    None,
+                ),
+            ]
+        );
+        let marker_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_canonical_coverage
+             WHERE app_type = 'codex' AND data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(marker_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_cumulative_missing_cache_read_never_becomes_zero() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let file = rollout_path(temp.path(), PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context_for_model_at("cumulative-missing", "2026-07-10T03:00:01Z"),
+                token_count_missing_cache_at(30, 3, "2026-07-10T03:00:02Z"),
+                token_count_missing_cache_at(40, 4, "2026-07-10T03:00:03Z"),
+            ],
+        );
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 2);
+        let conn = lock_conn!(db.conn);
+        let row: (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) = conn.query_row(
+            "SELECT input_tokens, output_tokens, cache_read_tokens,
+                        cache_creation_tokens, total_cost_usd
+                 FROM agent_session_usage_rollups
+                 WHERE app_type = 'codex' AND model = 'cumulative-missing'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(row, (Some(40), Some(4), None, None, None));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_child_usage_stays_on_own_thread_and_root_self_excludes_descendant(
+    ) -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let parent = rollout_path(temp.path(), PARENT_ID);
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count_at(100, 10, 5, "2026-07-10T03:00:01Z"),
+                turn_context_at("2026-07-10T03:00:05Z"),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(
+                    CHILD_A_ID,
+                    Some(PARENT_ID),
+                    Some(PARENT_ID),
+                    "2026-07-10T03:00:05Z",
+                ),
+                turn_context(),
+                token_count_at(100, 10, 5, "2026-07-10T03:00:06Z"),
+                token_count_at(130, 13, 7, "2026-07-10T03:00:07Z"),
+            ],
+        );
+        assert_eq!(
+            sync_test_file(&db, &parent, &[&parent, &child])?.imported,
+            1
+        );
+        assert_eq!(sync_test_file(&db, &child, &[&parent, &child])?.imported, 1);
+        persist_codex_nodes_for_files(&db, &[parent, child])?;
+
+        let conn = lock_conn!(db.conn);
+        let rows = conn
+            .prepare(
+                "SELECT session_id, input_tokens, output_tokens
+                 FROM proxy_request_logs
+                 WHERE app_type = 'codex' AND data_source = 'codex_session'
+                 ORDER BY session_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            rows,
+            vec![
+                (PARENT_ID.to_string(), 100, 5),
+                (CHILD_A_ID.to_string(), 30, 2),
+            ]
+        );
+        let durable_rows = conn
+            .prepare(
+                "SELECT session_id, input_tokens, output_tokens, cache_read_tokens,
+                        cache_creation_tokens, total_cost_usd
+                 FROM agent_session_usage_rollups
+                 WHERE app_type = 'codex' ORDER BY session_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            durable_rows,
+            vec![
+                (
+                    PARENT_ID.to_string(),
+                    Some(100),
+                    Some(5),
+                    Some(10),
+                    None,
+                    None,
+                ),
+                (
+                    CHILD_A_ID.to_string(),
+                    Some(30),
+                    Some(2),
+                    Some(3),
+                    None,
+                    None,
+                ),
+            ]
+        );
+        let marker_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_canonical_coverage
+             WHERE app_type = 'codex' AND data_source = 'codex_session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(marker_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_grandchild_usage_keeps_own_canonical_session_id() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let parent = rollout_path(temp.path(), PARENT_ID);
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+        let grandchild = rollout_path(temp.path(), CHILD_B_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count_at(100, 10, 5, "2026-07-10T03:00:01Z"),
+                turn_context_at("2026-07-10T03:00:05Z"),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(
+                    CHILD_A_ID,
+                    Some(PARENT_ID),
+                    Some(PARENT_ID),
+                    "2026-07-10T03:00:02Z",
+                ),
+                turn_context(),
+                token_count_at(100, 10, 5, "2026-07-10T03:00:03Z"),
+                token_count_at(130, 13, 7, "2026-07-10T03:00:04Z"),
+                turn_context_at("2026-07-10T03:00:05Z"),
+            ],
+        );
+        write_jsonl(
+            &grandchild,
+            &[
+                session_meta_at(CHILD_B_ID, None, Some(CHILD_A_ID), "2026-07-10T03:00:05Z"),
+                turn_context(),
+                token_count_at(130, 13, 7, "2026-07-10T03:00:06Z"),
+                token_count_at(150, 15, 9, "2026-07-10T03:00:07Z"),
+            ],
+        );
+        assert_eq!(
+            sync_test_file(&db, &parent, &[&parent, &child, &grandchild])?.imported,
+            1
+        );
+        assert_eq!(
+            sync_test_file(&db, &child, &[&parent, &child, &grandchild])?.imported,
+            1
+        );
+        assert_eq!(
+            sync_test_file(&db, &grandchild, &[&parent, &child, &grandchild])?.imported,
+            1
+        );
+
+        let conn = lock_conn!(db.conn);
+        let rows = conn
+            .prepare(
+                "SELECT session_id, request_count, input_tokens, output_tokens
+                 FROM agent_session_usage_rollups
+                 WHERE app_type = 'codex' ORDER BY session_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            rows,
+            vec![
+                (PARENT_ID.to_string(), Some(1), Some(100), Some(5)),
+                (CHILD_A_ID.to_string(), Some(1), Some(30), Some(2)),
+                (CHILD_B_ID.to_string(), Some(1), Some(20), Some(2)),
+            ]
+        );
+        Ok(())
     }
 
     /// 真实语料回放验收 harness（仅手动运行，勿在 CI 跑）。

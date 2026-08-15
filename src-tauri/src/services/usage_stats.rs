@@ -336,6 +336,37 @@ pub(crate) fn effective_usage_log_filter(log_alias: &str) -> String {
                       OR LOWER({log_alias}.model) = 'unknown'
                   )
             )
+    )"
+    )
+}
+
+/// Filter used by the session-retention boundary (T01 DAO).  The ordinary
+/// usage filter above intentionally keeps direct-session rows available to
+/// global usage summaries.  Before inserting into the canonical session table,
+/// however, a source-owned canonical bucket must win over its matching raw
+/// compatibility rows; otherwise pruning adds the same direct bucket twice.
+///
+/// This helper is deliberately separate so changing the retention boundary
+/// cannot silently remove direct-session rows from existing global queries.
+/// Raw rows with no per-request marker remain eligible and therefore preserve
+/// historical/failed source data, including partial facts whose source leaves
+/// one token component unknown. Adapters must write the marker in the same
+/// transaction as their canonical bucket; an aggregate bucket alone cannot
+/// prove request coverage.
+pub(crate) fn effective_session_usage_log_filter(log_alias: &str) -> String {
+    let base_filter = effective_usage_log_filter(log_alias);
+    let data_source = data_source_expr(log_alias);
+    format!(
+        "({base_filter})
+         AND NOT (
+            {data_source} IN ('session_log', 'codex_session', 'gemini_session', 'grok_session', 'opencode_session')
+            AND EXISTS (
+                SELECT 1
+                FROM agent_session_canonical_coverage canonical_coverage
+                WHERE canonical_coverage.app_type = {log_alias}.app_type
+                  AND canonical_coverage.data_source = {data_source}
+                  AND canonical_coverage.request_id = {log_alias}.request_id
+            )
         )"
     )
 }
@@ -462,6 +493,54 @@ pub(crate) fn has_recent_grokbuild_proxy_activity(
         |row| row.get::<_, bool>(0),
     )
     .map_err(|e| AppError::Database(format!("查询 Grok 接管活动失败: {e}")))
+}
+
+/// Central Cowork transcript-versus-gateway arbitration.  Cowork transcript
+/// records use the actual `claude-desktop` app entry; only a successful proxy
+/// row with the same model, all four token components, and event-time window
+/// shadows that transcript event.  In particular, cache-token differences are
+/// not treated as a match and no generic fingerprint is shared with Grok's
+/// face-value `turn_completed` events.
+pub(crate) fn has_matching_cowork_proxy_usage(
+    conn: &Connection,
+    model: &str,
+    created_at: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_creation_tokens: i64,
+) -> Result<bool, AppError> {
+    conn.prepare_cached(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM proxy_request_logs
+            WHERE COALESCE(data_source, 'proxy') = 'proxy'
+              AND app_type = 'claude-desktop'
+              AND status_code >= 200
+              AND status_code < 300
+              AND input_tokens = ?1
+              AND output_tokens = ?2
+              AND cache_read_tokens = ?3
+              AND cache_creation_tokens = ?4
+              AND created_at BETWEEN ?5 - ?6 AND ?5 + ?6
+              AND LOWER(model) = LOWER(?7)
+        )",
+    )
+    .and_then(|mut statement| {
+        statement.query_row(
+            params![
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                created_at,
+                SESSION_PROXY_DEDUP_WINDOW_SECONDS,
+                model,
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+    })
+    .map_err(|error| AppError::Database(format!("查询 Cowork 网关重复用量失败: {error}")))
 }
 
 static SUSPECTED_CODEX_DUPLICATE_SQL: LazyLock<String> = LazyLock::new(|| {
@@ -2527,6 +2606,49 @@ mod tests {
     }
 
     #[test]
+    fn test_cowork_gateway_arbitration_requires_exact_cache_tokens() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        create_legacy_nullable_logs_table(&conn)?;
+        conn.execute(
+            "INSERT INTO proxy_request_logs (
+                request_id, app_type, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, status_code, created_at, data_source
+            ) VALUES ('cowork-proxy', 'claude-desktop', 'claude-sonnet-4-5',
+                      100, 20, 10, 5, 200, 1000, 'proxy')",
+            [],
+        )?;
+
+        assert!(has_matching_cowork_proxy_usage(
+            &conn,
+            "claude-sonnet-4-5",
+            1060,
+            100,
+            20,
+            10,
+            5,
+        )?);
+        assert!(!has_matching_cowork_proxy_usage(
+            &conn,
+            "claude-sonnet-4-5",
+            1060,
+            100,
+            20,
+            10,
+            6,
+        )?);
+        assert!(!has_matching_cowork_proxy_usage(
+            &conn,
+            "claude-sonnet-4-5",
+            1060,
+            100,
+            20,
+            11,
+            5,
+        )?);
+        Ok(())
+    }
+
+    #[test]
     fn test_effective_filter_dedups_claude_session_against_desktop_proxy() -> Result<(), AppError> {
         let conn = Connection::open_in_memory()?;
         create_legacy_nullable_logs_table(&conn)?;
@@ -2547,6 +2669,164 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(request_ids, vec!["desktop-proxy"]);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_effective_filter_keeps_session_when_cache_read_differs() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        create_legacy_nullable_logs_table(&conn)?;
+        conn.execute_batch(
+            "INSERT INTO proxy_request_logs (
+                request_id, app_type, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, status_code, created_at, data_source
+            ) VALUES
+                ('proxy-cache-mismatch', 'gemini', 'gemini-model', 10, 2, 99, 0, 200, 1000, 'proxy'),
+                ('gemini-session-cache-mismatch', 'gemini', 'gemini-model', 10, 2, 1, 0, 200, 1060, 'gemini_session');",
+        )?;
+
+        let filter = effective_usage_log_filter("l");
+        let ids: Vec<String> = conn
+            .prepare(&format!(
+                "SELECT request_id FROM proxy_request_logs l WHERE {filter} ORDER BY request_id"
+            ))?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            ids,
+            vec![
+                "gemini-session-cache-mismatch".to_string(),
+                "proxy-cache-mismatch".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_effective_filter_does_not_token_dedup_grok_face_value_turns() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        create_legacy_nullable_logs_table(&conn)?;
+        conn.execute_batch(
+            "INSERT INTO proxy_request_logs (
+                request_id, app_type, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, status_code, created_at, data_source
+            ) VALUES
+                ('grok-proxy', 'grokbuild', 'grok-model', 10, 2, 1, 0, 200, 1000, 'proxy'),
+                ('grok-session', 'grokbuild', 'grok-model', 10, 2, 1, 0, 200, 1060, 'grok_session');",
+        )?;
+
+        let filter = effective_usage_log_filter("l");
+        let count: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM proxy_request_logs l WHERE {filter}"),
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            count, 2,
+            "Grok turn_completed must not use generic token dedup"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_session_retention_filter_holds_raw_when_coverage_marker_exists() -> Result<(), AppError>
+    {
+        let db = Database::memory()?;
+        let conn = lock_conn!(db.conn);
+        conn.execute(
+            "INSERT INTO proxy_request_logs (
+                request_id, provider_id, app_type, model, request_model, pricing_model,
+                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                total_cost_usd, latency_ms, status_code, created_at, session_id, data_source
+            ) VALUES ('session-raw', '_gemini_session', 'gemini', 'fixture-model',
+                      'fixture-model', 'fixture-model', 10, 2, 1, 0,
+                      '0.01', 0, 200, 1000, 'session-a', 'gemini_session')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO agent_session_usage_rollups (
+                date, app_type, session_id, provider_id, model, request_model,
+                pricing_model, data_source, precision, time_semantics,
+                request_count_semantics, request_count, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, total_cost_usd
+            ) VALUES ('1970-01-01', 'gemini', 'session-a', '_gemini_session',
+                      'fixture-model', 'fixture-model', 'fixture-model', 'gemini_session',
+                      'request_exact', 'event_time', 'assistant_message', 1, 10, 2, 1, 0, '0.01')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO agent_session_canonical_coverage (
+                app_type, data_source, request_id, canonical_session_id, marked_at
+             ) VALUES ('gemini', 'gemini_session', 'session-raw', 'session-a', 1000)",
+            [],
+        )?;
+
+        let held_filter = effective_session_usage_log_filter("l");
+        let held: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM proxy_request_logs l WHERE {held_filter}"),
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(held, 0, "coverage marker owns matching direct raw row");
+
+        conn.execute("DELETE FROM agent_session_canonical_coverage", [])?;
+        let retained: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM proxy_request_logs l WHERE {}",
+                effective_session_usage_log_filter("l")
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(retained, 1, "unmarked raw history remains eligible");
+        Ok(())
+    }
+
+    #[test]
+    fn test_session_retention_filter_keeps_unmarked_codex_partial_fact() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let conn = lock_conn!(db.conn);
+        conn.execute(
+            "INSERT INTO proxy_request_logs (
+                request_id, provider_id, app_type, model, request_model,
+                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                total_cost_usd, latency_ms, status_code, created_at, session_id, data_source
+            ) VALUES ('codex-legacy', '_codex_session', 'codex', 'fixture-model',
+                      'fixture-model', 10, 2, 1, 0, '0', 0, 200, 1000,
+                      'codex-session', 'codex_session')",
+            [],
+        )?;
+
+        let retained_for_session_rollup: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM proxy_request_logs l WHERE {}",
+                effective_session_usage_log_filter("l")
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            retained_for_session_rollup, 1,
+            "the marker-only filter must retain an unmarked Codex row"
+        );
+
+        // A source-owned marker, rather than the token value, is the sole
+        // exclusion boundary. This row is then ineligible for reaggregation.
+        conn.execute(
+            "INSERT INTO agent_session_canonical_coverage (
+                app_type, data_source, request_id, canonical_session_id, marked_at
+             ) VALUES ('codex', 'codex_session', 'codex-legacy', 'codex-session', 1000)",
+            [],
+        )?;
+        let covered: i64 = conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM proxy_request_logs l WHERE {}",
+                effective_session_usage_log_filter("l")
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(covered, 0, "only the exact marker suppresses the raw row");
         Ok(())
     }
 

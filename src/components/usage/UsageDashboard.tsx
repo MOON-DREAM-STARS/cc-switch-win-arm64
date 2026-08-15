@@ -5,6 +5,7 @@ import { UsageTrendChart } from "./UsageTrendChart";
 import { RequestLogTable } from "./RequestLogTable";
 import { ProviderStatsTable } from "./ProviderStatsTable";
 import { ModelStatsTable } from "./ModelStatsTable";
+import { TaskUsageTable } from "./TaskUsageTable";
 import {
   KNOWN_APP_TYPES,
   type AppType,
@@ -21,6 +22,7 @@ import {
   LayoutGrid,
   DatabaseBackup,
   Loader2,
+  ListTodo,
 } from "lucide-react";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import {
@@ -400,6 +402,10 @@ export function UsageDashboard({
                 <BarChart3 className="h-4 w-4" />
                 {t("usage.modelStats")}
               </TabsTrigger>
+              <TabsTrigger value="tasks" className="gap-2">
+                <ListTodo className="h-4 w-4" />
+                {t("usage.taskView", { defaultValue: "Task Statistics" })}
+              </TabsTrigger>
             </TabsList>
           </div>
 
@@ -437,6 +443,14 @@ export function UsageDashboard({
                 providerName={providerName}
                 model={model}
                 refreshIntervalMs={refreshIntervalMs}
+              />
+            </TabsContent>
+
+            <TabsContent value="tasks" className="mt-0">
+              <TaskUsageTable
+                range={range}
+                refreshIntervalMs={refreshIntervalMs}
+                initialAppType={appType === "all" ? undefined : appType}
               />
             </TabsContent>
           </motion.div>

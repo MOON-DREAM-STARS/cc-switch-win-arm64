@@ -1544,6 +1544,10 @@ pub fn run() {
             commands::sync_session_usage,
             commands::rebuild_codex_usage,
             commands::get_usage_data_sources,
+            commands::get_agent_session_usage,
+            commands::list_agent_task_usage,
+            commands::get_agent_task_usage_filter_options,
+            commands::get_agent_usage_capabilities,
             // Stream health check
             commands::stream_check_provider,
             commands::stream_check_all_providers,

@@ -6,6 +6,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import type { ComponentProps } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { UsageDashboard } from "@/components/usage/UsageDashboard";
@@ -15,7 +16,8 @@ const useModelStatsMock = vi.hoisted(() => vi.fn());
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
-    t: (key: string, fallback?: string) => fallback ?? key,
+    t: (key: string, options?: string | { defaultValue?: string }) =>
+      typeof options === "string" ? options : (options?.defaultValue ?? key),
     i18n: {
       resolvedLanguage: "en",
       language: "en",
@@ -63,6 +65,10 @@ vi.mock("@/components/usage/ProviderStatsTable", () => ({
 
 vi.mock("@/components/usage/ModelStatsTable", () => ({
   ModelStatsTable: () => <div data-testid="model-stats-table" />,
+}));
+
+vi.mock("@/components/usage/TaskUsageTable", () => ({
+  TaskUsageTable: () => <div data-testid="task-usage-table" />,
 }));
 
 vi.mock("@/components/usage/PricingConfigPanel", () => ({
@@ -151,5 +157,23 @@ describe("UsageDashboard", () => {
     await waitFor(() =>
       expect(screen.getByTestId("select-30000")).toBeInTheDocument(),
     );
+  });
+
+  it("keeps the existing controls while exposing the task view", async () => {
+    renderDashboard();
+
+    expect(screen.getByTestId("usage-hero")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "date-range" }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("tab", { name: "Task Statistics" }),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("task-usage-table")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("usage-hero")).toBeInTheDocument();
   });
 });

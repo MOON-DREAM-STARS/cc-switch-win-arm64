@@ -15,6 +15,7 @@ import type {
 } from "@/types/usage";
 
 const useAgentTaskUsageMock = vi.hoisted(() => vi.fn());
+const useAgentTaskUsageFilterOptionsMock = vi.hoisted(() => vi.fn());
 const useAgentUsageCapabilitiesMock = vi.hoisted(() => vi.fn());
 
 vi.mock("react-i18next", () => ({
@@ -32,6 +33,8 @@ vi.mock("@/lib/query/usage", async () => {
   return {
     ...actual,
     useAgentTaskUsage: (...args: unknown[]) => useAgentTaskUsageMock(...args),
+    useAgentTaskUsageFilterOptions: (...args: unknown[]) =>
+      useAgentTaskUsageFilterOptionsMock(...args),
     useAgentUsageCapabilities: (...args: unknown[]) =>
       useAgentUsageCapabilitiesMock(...args),
   };
@@ -144,8 +147,25 @@ const setContainerWidth = (width: number) => {
 
 describe("TaskUsageTable", () => {
   beforeEach(() => {
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: vi.fn(),
+    });
     useAgentTaskUsageMock.mockReset();
+    useAgentTaskUsageFilterOptionsMock.mockReset();
     useAgentUsageCapabilitiesMock.mockReset();
+    useAgentTaskUsageFilterOptionsMock.mockReturnValue({
+      data: {
+        titles: ["Build title", "Another title"],
+        projects: [
+          { projectDir: "/workspace/cc-switch" },
+          { projectDir: "/workspace/other" },
+        ],
+      },
+      isLoading: false,
+      isError: false,
+      isFetching: false,
+    });
     useAgentUsageCapabilitiesMock.mockReturnValue({
       data: [
         capability("claude"),
@@ -169,7 +189,7 @@ describe("TaskUsageTable", () => {
     installQueryResult([row()], 21);
   });
 
-  it("passes app, date, title, project and project-dir filters with limit/offset", async () => {
+  it("passes app/date and exact combobox selections with limit/offset", async () => {
     render(
       <TaskUsageTable
         range={{ preset: "custom", customStartDate: 100, customEndDate: 200 }}
@@ -186,26 +206,24 @@ describe("TaskUsageTable", () => {
     fireEvent.change(screen.getByLabelText("Agent"), {
       target: { value: "codex" },
     });
-    fireEvent.change(screen.getByLabelText("Task title"), {
-      target: { value: "build" },
-    });
-    fireEvent.change(screen.getByLabelText("Project"), {
-      target: { value: "cc-switch" },
-    });
-    fireEvent.change(screen.getByLabelText("Project directory"), {
-      target: { value: "/workspace" },
-    });
+    fireEvent.click(screen.getByRole("combobox", { name: "Task title" }));
+    fireEvent.click(screen.getByText("Build title"));
+    fireEvent.click(screen.getByRole("combobox", { name: "Project" }));
+    fireEvent.click(screen.getByText("/workspace/cc-switch", { exact: true }));
 
     await waitFor(() =>
       expect(lastFilter()).toMatchObject({
         appType: "codex",
-        title: "build",
-        project: "cc-switch",
-        projectDir: "/workspace",
+        titleExact: "Build title",
+        projectDirExact: "/workspace/cc-switch",
         range: { startAt: 100, endAt: 200 },
         offset: 0,
       }),
     );
+    expect(lastFilter().title).toBeUndefined();
+    expect(lastFilter().project).toBeUndefined();
+    expect(lastFilter().projectDir).toBeUndefined();
+    expect(screen.queryByText("Project directory")).not.toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Codex" })).toBeInTheDocument();
     expect(
       screen.queryByRole("option", { name: /Codex.*Partial/ }),
@@ -216,6 +234,76 @@ describe("TaskUsageTable", () => {
       expect(lastFilter()).toMatchObject({ limit: 20, offset: 20 }),
     );
     expect(screen.queryByLabelText("Rows per page")).not.toBeInTheDocument();
+  });
+
+  it("does not turn a missing native title into a UUID or a candidate", () => {
+    installQueryResult([
+      row({
+        sessionId: "missing-title-session",
+        rootSessionId: "missing-title-session",
+        root: {
+          ...row().root!,
+          sessionId: "missing-title-session",
+          rootSessionId: "missing-title-session",
+          title: null,
+        },
+      }),
+    ]);
+
+    render(
+      <TaskUsageTable range={{ preset: "today" }} refreshIntervalMs={0} />,
+    );
+
+    expect(screen.getByText("Task title not provided · missing-")).toBeInTheDocument();
+    expect(
+      screen.queryByText("missing-title-session", { exact: true }),
+    ).not.toBeInTheDocument();
+    expect(useAgentTaskUsageFilterOptionsMock).toHaveBeenCalled();
+  });
+
+  it("clears selected title and project when the agent or date scope changes", async () => {
+    const view = render(
+      <TaskUsageTable
+        range={{ preset: "custom", customStartDate: 100, customEndDate: 200 }}
+        refreshIntervalMs={0}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Task title" }));
+    fireEvent.click(screen.getByText("Build title"));
+    fireEvent.click(screen.getByRole("combobox", { name: "Project" }));
+    fireEvent.click(screen.getByText("/workspace/cc-switch", { exact: true }));
+
+    fireEvent.change(screen.getByLabelText("Agent"), {
+      target: { value: "codex" },
+    });
+    await waitFor(() =>
+      expect(lastFilter()).toMatchObject({
+        appType: "codex",
+        titleExact: undefined,
+        projectDirExact: undefined,
+      }),
+    );
+    expect(
+      screen.getByRole("combobox", { name: "Task title" }),
+    ).toHaveTextContent("Select task title");
+    expect(
+      screen.getByRole("combobox", { name: "Project" }),
+    ).toHaveTextContent("Select project");
+
+    view.rerender(
+      <TaskUsageTable
+        range={{ preset: "custom", customStartDate: 101, customEndDate: 201 }}
+        refreshIntervalMs={0}
+      />,
+    );
+    await waitFor(() =>
+      expect(lastFilter()).toMatchObject({
+        range: { startAt: 101, endAt: 201 },
+        titleExact: undefined,
+        projectDirExact: undefined,
+      }),
+    );
   });
 
   it("renders a complete narrow card without horizontal table clipping", async () => {
@@ -241,6 +329,7 @@ describe("TaskUsageTable", () => {
       expect(screen.getByTestId("task-usage-cards")).toBeInTheDocument(),
     );
     expect(screen.getByTitle(longTitle)).toBeInTheDocument();
+    expect(screen.getByText("path", { exact: true })).toBeInTheDocument();
     expect(screen.getByTitle(longProject)).toBeInTheDocument();
     expect(screen.getAllByTestId(/^task-row-/)).toHaveLength(1);
   });

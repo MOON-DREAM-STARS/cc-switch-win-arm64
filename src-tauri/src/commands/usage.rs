@@ -1,10 +1,52 @@
 //! 使用统计相关命令
 
 use crate::error::AppError;
+use crate::services::agent_session_usage::{
+    AgentSessionUsageRequest, AgentSessionUsageSummary, AgentTaskUsageFilter,
+    AgentTaskUsageFilterOptions, AgentTaskUsageFilterOptionsRequest, AgentTaskUsagePage,
+    AgentUsageCapability,
+};
 use crate::services::model_pricing::{ModelPricingInfo, ModelsDevSyncConfig, ModelsDevSyncState};
 use crate::services::usage_stats::*;
 use crate::store::AppState;
 use tauri::State;
+
+/// 获取规范化 Agent 会话自身、全部后代及派生任务总量。
+#[tauri::command]
+pub fn get_agent_session_usage(
+    state: State<'_, AppState>,
+    request: AgentSessionUsageRequest,
+) -> Result<AgentSessionUsageSummary, AppError> {
+    crate::services::agent_session_usage::get_agent_session_usage(&state.db, &request)
+}
+
+/// 分页获取根/独立 Agent 任务用量。子代理只参与根任务聚合，不作为默认行返回。
+#[tauri::command]
+pub fn list_agent_task_usage(
+    state: State<'_, AppState>,
+    filter: AgentTaskUsageFilter,
+) -> Result<AgentTaskUsagePage, AppError> {
+    crate::services::agent_session_usage::list_agent_task_usage(&state.db, &filter)
+}
+
+/// 获取任务统计筛选器的完整原生标题/项目候选项。
+#[tauri::command]
+pub fn get_agent_task_usage_filter_options(
+    state: State<'_, AppState>,
+    request: AgentTaskUsageFilterOptionsRequest,
+) -> Result<AgentTaskUsageFilterOptions, AppError> {
+    crate::services::agent_session_usage::get_agent_task_usage_filter_options(
+        &state.db, &request,
+    )
+}
+
+/// 获取统一的八个受管理 Agent 会话用量能力注册表。
+#[tauri::command]
+pub fn get_agent_usage_capabilities(
+    _state: State<'_, AppState>,
+) -> Result<Vec<AgentUsageCapability>, AppError> {
+    Ok(crate::services::agent_session_usage::get_agent_usage_capabilities())
+}
 
 /// 获取使用量汇总
 #[tauri::command]

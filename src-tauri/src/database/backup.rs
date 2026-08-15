@@ -89,6 +89,10 @@ const SYNC_SKIP_TABLES: &[&str] = &[
     "provider_health",
     "proxy_live_backup",
     "usage_daily_rollups",
+    "agent_session_nodes",
+    "agent_session_usage_rollups",
+    "agent_session_usage_snapshots",
+    "agent_session_canonical_coverage",
     "session_log_sync",
 ];
 
@@ -99,6 +103,10 @@ const SYNC_PRESERVE_TABLES: &[&str] = &[
     "stream_check_logs",
     "proxy_live_backup",
     "usage_daily_rollups",
+    "agent_session_nodes",
+    "agent_session_usage_rollups",
+    "agent_session_usage_snapshots",
+    "agent_session_canonical_coverage",
     "session_log_sync",
 ];
 
@@ -1318,6 +1326,215 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(name, "Provider One");
+        Ok(())
+    }
+
+    #[test]
+    fn sql_backup_manifest_contains_agent_session_tables() -> Result<(), AppError> {
+        let source = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(source.conn);
+            conn.execute(
+                "INSERT INTO agent_session_nodes (
+                    app_type, session_id, root_session_id, node_kind,
+                    relation_confidence, title, last_synced_at
+                 ) VALUES ('claude', 'anonymous-session', 'anonymous-session',
+                           'standalone', 'unavailable', 'Anonymous fixture', 42)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO agent_session_usage_rollups (
+                    date, app_type, session_id, provider_id, model,
+                    data_source, precision, time_semantics,
+                    request_count_semantics, input_token_semantics,
+                    source_identity, profile_id, database_identity,
+                    base_url_digest, billing_mode, task, source_version,
+                    sync_window_start, sync_window_end, request_count,
+                    api_call_count, input_tokens, output_tokens,
+                    cache_read_tokens, cache_creation_tokens, cache_write_tokens,
+                    reasoning_tokens,
+                    total_cost_usd, cost_status, cost_source, cost_delta_kind
+                 ) VALUES ('2026-08-01', 'claude', 'anonymous-session', 'p1',
+                           'fixture-model', 'fixture', 'sync_window', 'source_event_time',
+                           'assistant_message', 2, 'fixture-source', 'profile-fixture',
+                           'db-fixture', 'sha256:fixture-base', 'actual', 'task-fixture',
+                           'v1', 100, 200, NULL, 3, 10, 5, 1, NULL, 6, NULL,
+                           NULL, 'unknown', 'fixture', 'normal')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO agent_session_usage_snapshots (
+                    app_type, source_identity, profile_id, database_identity,
+                    session_id, model, provider_id, base_url_digest, billing_mode,
+                    task, data_source, source_version, api_call_count, input_tokens,
+                    output_tokens, cache_read_tokens, cache_write_tokens,
+                    reasoning_tokens, last_synced_at, estimated_cost_usd,
+                    actual_cost_usd, cost_status, cost_source
+                 ) VALUES (
+                    'hermes', 'hermes:fixture:v1', 'profile-a', 'db-a',
+                    'snapshot-session', 'fixture-model', 'fixture-provider',
+                    'sha256:fixture-base', 'actual', 'task-null', 'fixture', '1',
+                    3, 10, 5, 1, 2, 0, 42, NULL, NULL, NULL, NULL
+                 )",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO agent_session_canonical_coverage (
+                    app_type, data_source, request_id, canonical_session_id, marked_at
+                 ) VALUES ('claude', 'session_log', 'session:coverage-1',
+                           'anonymous-session', 44)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO agent_session_usage_snapshots (
+                    app_type, source_identity, profile_id, database_identity,
+                    session_id, model, provider_id, base_url_digest, billing_mode,
+                    task, data_source, source_version, api_call_count, input_tokens,
+                    output_tokens, cache_read_tokens, cache_write_tokens,
+                    reasoning_tokens, last_synced_at, estimated_cost_usd,
+                    actual_cost_usd, cost_status, cost_source
+                 ) VALUES (
+                    'hermes', 'hermes:fixture:v1', 'profile-a', 'db-a',
+                    'snapshot-session', 'fixture-model', 'fixture-provider',
+                    'sha256:fixture-base', 'actual', 'task-zero', 'fixture', '1',
+                    4, 12, 6, 2, 3, 1, 43, '0', '0', 'actual', 'fixture'
+                 )",
+                [],
+            )?;
+        }
+        let sql = source.export_sql_string()?;
+        assert!(sql.contains("CREATE TABLE agent_session_nodes"));
+        assert!(sql.contains("CREATE TABLE agent_session_usage_rollups"));
+        assert!(sql.contains("CREATE TABLE agent_session_usage_snapshots"));
+        assert!(sql.contains("CREATE TABLE agent_session_canonical_coverage"));
+
+        let restored = Database::memory()?;
+        restored.import_sql_string(&sql)?;
+        let conn = crate::database::lock_conn!(restored.conn);
+        let node_table: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'agent_session_nodes'",
+            [],
+            |row| row.get(0),
+        )?;
+        let usage_table: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'agent_session_usage_rollups'",
+            [],
+            |row| row.get(0),
+        )?;
+        let snapshot_table: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'agent_session_usage_snapshots'",
+            [],
+            |row| row.get(0),
+        )?;
+        let coverage_table: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'agent_session_canonical_coverage'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            (node_table, usage_table, snapshot_table, coverage_table),
+            (1, 1, 1, 1)
+        );
+        let node: (String, String, String, i64) = conn.query_row(
+            "SELECT session_id, node_kind, title, last_synced_at
+             FROM agent_session_nodes WHERE session_id = 'anonymous-session'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            node,
+            (
+                "anonymous-session".to_string(),
+                "standalone".to_string(),
+                "Anonymous fixture".to_string(),
+                42,
+            )
+        );
+        let usage: (
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = conn.query_row(
+            "SELECT source_identity, profile_id, database_identity, task,
+                    source_version, sync_window_start, sync_window_end,
+                    cache_creation_tokens, cache_write_tokens, total_cost_usd, cost_delta_kind
+             FROM agent_session_usage_rollups
+             WHERE session_id = 'anonymous-session'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )?;
+        assert_eq!(
+            usage,
+            (
+                "fixture-source".to_string(),
+                "profile-fixture".to_string(),
+                "db-fixture".to_string(),
+                "task-fixture".to_string(),
+                "v1".to_string(),
+                100,
+                200,
+                None,
+                Some(6),
+                None,
+                Some("normal".to_string()),
+            )
+        );
+        let snapshot_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_session_usage_snapshots
+             WHERE source_identity = 'hermes:fixture:v1' AND session_id = 'snapshot-session'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(snapshot_rows, 2);
+        let nullable_cost: (Option<String>, Option<String>) = conn.query_row(
+            "SELECT estimated_cost_usd, actual_cost_usd
+             FROM agent_session_usage_snapshots
+             WHERE task = 'task-null'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(nullable_cost, (None, None));
+        let explicit_zero: (Option<String>, Option<String>) = conn.query_row(
+            "SELECT estimated_cost_usd, actual_cost_usd
+             FROM agent_session_usage_snapshots
+             WHERE task = 'task-zero'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(explicit_zero, (Some("0".into()), Some("0".into())));
+        let coverage: (String, String, i64) = conn.query_row(
+            "SELECT request_id, canonical_session_id, marked_at
+             FROM agent_session_canonical_coverage
+             WHERE app_type = 'claude' AND data_source = 'session_log'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(
+            coverage,
+            ("session:coverage-1".into(), "anonymous-session".into(), 44)
+        );
         Ok(())
     }
 

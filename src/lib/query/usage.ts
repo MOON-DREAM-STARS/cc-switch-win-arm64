@@ -5,7 +5,16 @@ import type {
   LogFilters,
   UsageRangeSelection,
   UsageScopeFilters,
+  AgentUsageAppType,
+  AgentUsageRange,
+  AgentSessionUsageSummary,
+  AgentTaskUsageFilter,
+  AgentTaskUsageFilterOptions,
+  AgentTaskUsageFilterOptionsRequest,
+  AgentTaskUsagePage,
+  AgentUsageCapability,
 } from "@/types/usage";
+import { AGENT_TASK_USAGE_DEFAULT_LIMIT } from "@/types/usage";
 
 const DEFAULT_REFETCH_INTERVAL_MS = 30000;
 
@@ -33,9 +42,87 @@ type RequestLogsKey = {
   statusCode?: number;
 };
 
+export interface NormalizedAgentUsageRange {
+  startAt: number | null;
+  endAt: number | null;
+}
+
+/** Treat omitted/empty ranges as the same cache identity. */
+export function normalizeAgentUsageRange(
+  range?: AgentUsageRange | null,
+): NormalizedAgentUsageRange {
+  return {
+    startAt: range?.startAt ?? null,
+    endAt: range?.endAt ?? null,
+  };
+}
+
+function denormalizeAgentUsageRange(
+  range: NormalizedAgentUsageRange,
+): AgentUsageRange | undefined {
+  if (range.startAt === null && range.endAt === null) return undefined;
+  return {
+    ...(range.startAt === null ? {} : { startAt: range.startAt }),
+    ...(range.endAt === null ? {} : { endAt: range.endAt }),
+  };
+}
+
+export interface NormalizedAgentTaskUsageFilter {
+  appType: AgentUsageAppType | null;
+  title: string | null;
+  project: string | null;
+  projectDir: string | null;
+  titleExact: string | null;
+  projectDirExact: string | null;
+  range: NormalizedAgentUsageRange;
+  limit: number;
+  offset: number;
+}
+
+export function normalizeAgentTaskUsageFilter(
+  filter: AgentTaskUsageFilter = {},
+): NormalizedAgentTaskUsageFilter {
+  return {
+    appType: filter.appType ?? null,
+    title: filter.title ?? null,
+    project: filter.project ?? null,
+    projectDir: filter.projectDir ?? null,
+    titleExact: filter.titleExact ?? null,
+    projectDirExact: filter.projectDirExact ?? null,
+    range: normalizeAgentUsageRange(filter.range),
+    limit: filter.limit ?? AGENT_TASK_USAGE_DEFAULT_LIMIT,
+    offset: filter.offset ?? 0,
+  };
+}
+
 // Query keys
 export const usageKeys = {
   all: ["usage"] as const,
+  agent: ["usage", "agent-session"] as const,
+  agentSession: (
+    appType: AgentUsageAppType,
+    sessionId: string,
+    range: NormalizedAgentUsageRange,
+  ) => [...usageKeys.agent, "session", appType, sessionId, range] as const,
+  agentTasks: (filter: NormalizedAgentTaskUsageFilter) =>
+    [
+      ...usageKeys.agent,
+      "tasks",
+      filter.appType,
+      filter.title,
+      filter.project,
+      filter.projectDir,
+      filter.titleExact,
+      filter.projectDirExact,
+      filter.range,
+      filter.limit,
+      filter.offset,
+    ] as const,
+  agentTaskFilterOptions: (
+    appType: AgentUsageAppType | null,
+    range: NormalizedAgentUsageRange,
+  ) => [...usageKeys.agent, "task-filter-options", appType, range] as const,
+  agentCapabilities: () => [...usageKeys.agent, "capabilities"] as const,
   summary: (
     preset: UsageRangeSelection["preset"],
     customStartDate: number | undefined,
@@ -390,3 +477,105 @@ export function useDeleteModelPricing() {
     },
   });
 }
+
+export interface AgentUsageQueryOptions {
+  enabled?: boolean;
+  staleTime?: number;
+  refetchInterval?: number | false;
+  refetchIntervalInBackground?: boolean;
+}
+
+/**
+ * Query one selected session/root.  There is intentionally no
+ * `placeholderData`/`keepPreviousData`: switching app/session/range must show
+ * the new query's loading state rather than the previous session's usage.
+ */
+export function useAgentSessionUsage(
+  appType: AgentUsageAppType,
+  sessionId: string,
+  range?: AgentUsageRange | null,
+  options?: AgentUsageQueryOptions,
+) {
+  const normalizedRange = normalizeAgentUsageRange(range);
+  return useQuery<AgentSessionUsageSummary>({
+    queryKey: usageKeys.agentSession(appType, sessionId, normalizedRange),
+    queryFn: () =>
+      usageApi.getAgentSessionUsage({
+        appType,
+        sessionId,
+        range: denormalizeAgentUsageRange(normalizedRange),
+      }),
+    enabled: (options?.enabled ?? true) && Boolean(appType && sessionId),
+    staleTime: options?.staleTime,
+    refetchInterval: options?.refetchInterval,
+    refetchIntervalInBackground: options?.refetchIntervalInBackground,
+  });
+}
+
+/** Query root/standalone task rows with every filter represented in its key. */
+export function useAgentTaskUsage(
+  filter: AgentTaskUsageFilter = {},
+  options?: AgentUsageQueryOptions,
+) {
+  const normalizedFilter = normalizeAgentTaskUsageFilter(filter);
+  return useQuery<AgentTaskUsagePage>({
+    queryKey: usageKeys.agentTasks(normalizedFilter),
+    queryFn: () =>
+      usageApi.listAgentTaskUsage({
+        appType: normalizedFilter.appType ?? undefined,
+        title: normalizedFilter.title ?? undefined,
+        project: normalizedFilter.project ?? undefined,
+        projectDir: normalizedFilter.projectDir ?? undefined,
+        titleExact: normalizedFilter.titleExact ?? undefined,
+        projectDirExact: normalizedFilter.projectDirExact ?? undefined,
+        range: denormalizeAgentUsageRange(normalizedFilter.range),
+        limit: normalizedFilter.limit,
+        offset: normalizedFilter.offset,
+      }),
+    enabled: options?.enabled ?? true,
+    staleTime: options?.staleTime,
+    refetchInterval: options?.refetchInterval,
+    refetchIntervalInBackground: options?.refetchIntervalInBackground,
+  });
+}
+
+/** Query the complete native title/project candidate list for a scope. */
+export function useAgentTaskUsageFilterOptions(
+  request: AgentTaskUsageFilterOptionsRequest = {},
+  options?: AgentUsageQueryOptions,
+) {
+  const normalizedRange = normalizeAgentUsageRange(request.range);
+  const appType = request.appType ?? null;
+  return useQuery<AgentTaskUsageFilterOptions>({
+    queryKey: usageKeys.agentTaskFilterOptions(appType, normalizedRange),
+    queryFn: () =>
+      usageApi.getAgentTaskUsageFilterOptions({
+        appType: request.appType,
+        range: denormalizeAgentUsageRange(normalizedRange),
+      }),
+    enabled: options?.enabled ?? true,
+    staleTime: options?.staleTime,
+    refetchInterval: options?.refetchInterval,
+    refetchIntervalInBackground: options?.refetchIntervalInBackground,
+  });
+}
+
+/** Query the backend-authoritative capability registry (all eight app IDs). */
+export function useAgentUsageCapabilities(options?: AgentUsageQueryOptions) {
+  return useQuery<AgentUsageCapability[]>({
+    queryKey: usageKeys.agentCapabilities(),
+    queryFn: usageApi.getAgentUsageCapabilities,
+    enabled: options?.enabled ?? true,
+    staleTime: options?.staleTime,
+    refetchInterval: options?.refetchInterval,
+    refetchIntervalInBackground: options?.refetchIntervalInBackground,
+  });
+}
+
+// Explicit Query-suffixed aliases make the data layer easy to discover while
+// retaining the concise naming convention used by the existing usage hooks.
+export const useAgentSessionUsageQuery = useAgentSessionUsage;
+export const useAgentTaskUsageQuery = useAgentTaskUsage;
+export const useAgentTaskUsageFilterOptionsQuery =
+  useAgentTaskUsageFilterOptions;
+export const useAgentUsageCapabilitiesQuery = useAgentUsageCapabilities;

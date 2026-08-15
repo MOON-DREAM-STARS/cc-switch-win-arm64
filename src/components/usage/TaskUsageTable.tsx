@@ -1,13 +1,16 @@
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import {
+  Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   ChevronUp,
+  ChevronsUpDown,
 } from "lucide-react";
 import {
   useAgentTaskUsage,
+  useAgentTaskUsageFilterOptions,
   useAgentUsageCapabilities,
 } from "@/lib/query/usage";
 import {
@@ -20,8 +23,20 @@ import {
 } from "@/types/usage";
 import { resolveUsageRange } from "@/lib/usageRange";
 import { fmtInt, fmtUsd, formatKnownTokenTotal } from "./format";
-import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import {
   Table,
   TableBody,
@@ -97,12 +112,50 @@ function displayCost(measure: AgentUsageMeasure | null) {
   return fmtUsd(measure.totalCostUsd, 4, "—");
 }
 
-function taskTitle(row: AgentTaskUsageRow) {
+function shortSessionId(row: AgentTaskUsageRow) {
+  const sessionId = row.rootSessionId || row.sessionId;
+  return sessionId.length > 8 ? sessionId.slice(0, 8) : sessionId;
+}
+
+function taskTitle(
+  row: AgentTaskUsageRow,
+  t: (key: string, options?: { defaultValue?: string }) => string,
+) {
+  const title = row.root?.title?.trim();
+  return (
+    title ||
+    `${t("usage.task.titleUnavailable", {
+      defaultValue: "Task title not provided",
+    })} · ${shortSessionId(row)}`
+  );
+}
+
+function taskTitleTooltip(row: AgentTaskUsageRow) {
   return row.root?.title?.trim() || row.rootSessionId || row.sessionId;
 }
 
+function projectBasename(projectDir: string) {
+  const trimmed = projectDir.trim();
+  if (!trimmed) return "";
+  const withoutTrailingSeparators = trimmed.replace(/[\\/]+$/, "");
+  if (!withoutTrailingSeparators) return trimmed;
+  if (/^[A-Za-z]:$/.test(withoutTrailingSeparators)) return trimmed;
+  const separator = Math.max(
+    withoutTrailingSeparators.lastIndexOf("/"),
+    withoutTrailingSeparators.lastIndexOf("\\"),
+  );
+  return separator >= 0
+    ? withoutTrailingSeparators.slice(separator + 1) || trimmed
+    : withoutTrailingSeparators;
+}
+
 function taskProject(row: AgentTaskUsageRow) {
-  return row.root?.projectDir?.trim() || "—";
+  const projectDir = row.root?.projectDir?.trim();
+  if (!projectDir) return null;
+  return {
+    name: projectBasename(projectDir),
+    path: projectDir,
+  };
 }
 
 function rowKey(row: AgentTaskUsageRow) {
@@ -117,6 +170,127 @@ function taskTokenTotal(
     measure,
     undefined,
     t("usage.task.unavailable", { defaultValue: "Unavailable" }),
+  );
+}
+
+interface TaskFilterComboboxOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+function TaskFilterCombobox({
+  label,
+  placeholder,
+  searchPlaceholder,
+  loadingText,
+  emptyText,
+  clearText,
+  value,
+  options,
+  loading,
+  onChange,
+}: {
+  label: string;
+  placeholder: string;
+  searchPlaceholder: string;
+  loadingText: string;
+  emptyText: string;
+  clearText: string;
+  value: string;
+  options: TaskFilterComboboxOption[];
+  loading?: boolean;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const selected = options.find((option) => option.value === value);
+
+  return (
+    <Popover modal open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          role="combobox"
+          aria-label={label}
+          aria-expanded={open}
+          aria-busy={loading || undefined}
+          className="flex min-h-9 h-auto w-full min-w-0 items-center justify-between gap-2 rounded-md border border-border-default bg-background px-3 py-1.5 text-left text-sm text-foreground shadow-sm outline-none transition-colors focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20"
+        >
+          <span className="min-w-0 truncate">
+            {selected ? (
+              <>
+                <span className="block truncate">{selected.label}</span>
+                {selected.description && (
+                  <span className="block truncate text-[11px] text-muted-foreground">
+                    {selected.description}
+                  </span>
+                )}
+              </>
+            ) : (
+              <span className="text-muted-foreground">{placeholder}</span>
+            )}
+          </span>
+          <ChevronsUpDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        side="bottom"
+        align="start"
+        sideOffset={6}
+        collisionPadding={8}
+        className="z-[1000] w-[var(--radix-popover-trigger-width)] p-0"
+      >
+        <Command label={searchPlaceholder}>
+          <CommandInput aria-label={label} placeholder={searchPlaceholder} />
+          <CommandList>
+            <CommandEmpty>{loading ? loadingText : emptyText}</CommandEmpty>
+            <CommandGroup>
+              {value && (
+                <CommandItem
+                  value="__clear_task_filter__"
+                  onSelect={() => {
+                    onChange("");
+                    setOpen(false);
+                  }}
+                >
+                  <Check className="mr-2 h-4 w-4 opacity-0" />
+                  {clearText}
+                </CommandItem>
+              )}
+              {options.map((option) => (
+                <CommandItem
+                  key={option.value}
+                  value={option.value}
+                  keywords={
+                    option.description
+                      ? [option.label, option.description]
+                      : [option.label]
+                  }
+                  onSelect={() => {
+                    onChange(option.value);
+                    setOpen(false);
+                  }}
+                >
+                  <Check
+                    className={`mr-2 h-4 w-4 ${
+                      value === option.value ? "opacity-100" : "opacity-0"
+                    }`}
+                  />
+                  <span className="min-w-0">
+                    <span className="block truncate">{option.label}</span>
+                    {option.description && (
+                      <span className="block truncate text-xs text-muted-foreground">
+                        {option.description}
+                      </span>
+                    )}
+                  </span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -370,7 +544,8 @@ function TaskUsageRowView({
   t: (key: string, options?: { defaultValue?: string }) => string;
 }) {
   const key = rowKey(row);
-  const title = taskTitle(row);
+  const title = taskTitle(row, t);
+  const titleTooltip = taskTitleTooltip(row);
   const project = taskProject(row);
   const total = row.totalUsage;
   const countLabel = total
@@ -380,20 +555,29 @@ function TaskUsageRowView({
   return (
     <TableRow data-testid={`task-row-${key}`}>
       <TableCell className="min-w-[220px] max-w-[360px] align-top">
-        <div className="truncate font-medium" title={title}>
+        <div className="truncate font-medium" title={titleTooltip}>
           {title}
         </div>
         <div className="mt-1 text-xs text-muted-foreground">
           {agentLabel(row.appType, t)}
         </div>
       </TableCell>
-      <TableCell className="min-w-[180px] max-w-[320px] align-top">
-        <div
-          className="break-all text-xs text-muted-foreground"
-          title={project}
-        >
-          {project}
-        </div>
+      <TableCell className="min-w-[200px] max-w-[360px] align-top">
+        {project ? (
+          <>
+            <div className="truncate font-medium" title={project.path}>
+              {project.name}
+            </div>
+            <div
+              className="mt-1 break-all text-xs text-muted-foreground"
+              title={project.path}
+            >
+              {project.path}
+            </div>
+          </>
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        )}
       </TableCell>
       <TableCell className="min-w-[170px] align-top">
         <div className="font-semibold tabular-nums">
@@ -432,7 +616,8 @@ function TaskUsageCardView({
   t: (key: string, options?: { defaultValue?: string }) => string;
 }) {
   const key = rowKey(row);
-  const title = taskTitle(row);
+  const title = taskTitle(row, t);
+  const titleTooltip = taskTitleTooltip(row);
   const project = taskProject(row);
   const total = row.totalUsage;
   const countLabel = total
@@ -446,18 +631,25 @@ function TaskUsageCardView({
     >
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
-          <div className="line-clamp-2 break-words font-medium" title={title}>
+          <div
+            className="line-clamp-2 break-words font-medium"
+            title={titleTooltip}
+          >
             {title}
           </div>
           <div className="mt-1 text-xs text-muted-foreground">
             {agentLabel(row.appType, t)}
           </div>
-          <div
-            className="mt-2 break-all text-xs text-muted-foreground"
-            title={project}
-          >
-            {project}
-          </div>
+          {project ? (
+            <div className="mt-2 min-w-0" title={project.path}>
+              <div className="truncate font-medium">{project.name}</div>
+              <div className="mt-1 break-all text-xs text-muted-foreground">
+                {project.path}
+              </div>
+            </div>
+          ) : (
+            <div className="mt-2 text-xs text-muted-foreground">—</div>
+          )}
         </div>
       </div>
 
@@ -514,7 +706,6 @@ export function TaskUsageTable({
     initialAppType ?? "all",
   );
   const [title, setTitle] = useState("");
-  const [project, setProject] = useState("");
   const [projectDir, setProjectDir] = useState("");
   const [page, setPage] = useState(0);
   const [expandedRows, setExpandedRows] = useState<string[]>([]);
@@ -536,14 +727,13 @@ export function TaskUsageTable({
   const filter = useMemo<AgentTaskUsageFilter>(
     () => ({
       appType: agentAppType === "all" ? undefined : agentAppType,
-      title: title.trim() || undefined,
-      project: project.trim() || undefined,
-      projectDir: projectDir.trim() || undefined,
+      titleExact: title.trim() || undefined,
+      projectDirExact: projectDir.trim() || undefined,
       range: queryRange,
       limit: TASK_PAGE_SIZE,
       offset: page * TASK_PAGE_SIZE,
     }),
-    [agentAppType, page, project, projectDir, queryRange, title],
+    [agentAppType, page, projectDir, queryRange, title],
   );
 
   const { data, isLoading, isError, error, isFetching } = useAgentTaskUsage(
@@ -555,8 +745,27 @@ export function TaskUsageTable({
   const capabilitiesQuery = useAgentUsageCapabilities({
     refetchInterval: refreshIntervalMs > 0 ? refreshIntervalMs : false,
   });
+  const filterOptionsQuery = useAgentTaskUsageFilterOptions(
+    {
+      appType: agentAppType === "all" ? undefined : agentAppType,
+      range: queryRange,
+    },
+    {
+      refetchInterval: refreshIntervalMs > 0 ? refreshIntervalMs : false,
+    },
+  );
 
   const capabilities = capabilitiesQuery.data ?? [];
+  const filterOptions = filterOptionsQuery.data;
+  const titleOptions = (filterOptions?.titles ?? []).map((value) => ({
+    value,
+    label: value,
+  }));
+  const projectOptions = (filterOptions?.projects ?? []).map((option) => ({
+    value: option.projectDir,
+    label: projectBasename(option.projectDir),
+    description: option.projectDir,
+  }));
 
   const rows = data?.items ?? [];
   const total = data?.total ?? 0;
@@ -567,13 +776,21 @@ export function TaskUsageTable({
     setExpandedRows([]);
   }, [
     agentAppType,
-    project,
     projectDir,
     range.customEndDate,
     range.customStartDate,
     range.liveEndTime,
     range.preset,
     title,
+  ]);
+
+  useEffect(() => {
+    setTitle("");
+    setProjectDir("");
+  }, [
+    agentAppType,
+    queryRange.startAt,
+    queryRange.endAt,
   ]);
 
   const toggleExpanded = (key: string) => {
@@ -613,46 +830,54 @@ export function TaskUsageTable({
               ))}
             </select>
           </label>
-          <label className="flex w-full min-w-0 flex-col gap-1 text-xs text-muted-foreground sm:min-w-[180px] sm:flex-1">
+          <label className="flex w-full min-w-0 flex-col gap-1 text-xs text-muted-foreground sm:min-w-[220px] sm:flex-1">
             <span>{t("usage.task.title", { defaultValue: "Task title" })}</span>
-            <Input
-              aria-label={t("usage.task.title", { defaultValue: "Task title" })}
+            <TaskFilterCombobox
+              label={t("usage.task.title", { defaultValue: "Task title" })}
+              placeholder={t("usage.task.selectTitle", {
+                defaultValue: "Select task title",
+              })}
+              searchPlaceholder={t("usage.task.searchTitle", {
+                defaultValue: "Search task titles",
+              })}
+              loadingText={t("usage.task.loadingOptions", {
+                defaultValue: "Loading options…",
+              })}
+              emptyText={t("usage.task.noFilterOptions", {
+                defaultValue: "No matching options",
+              })}
+              clearText={t("usage.task.clearFilter", {
+                defaultValue: "Clear selection",
+              })}
               value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              placeholder={t("usage.task.searchTitle", {
-                defaultValue: "Search title",
-              })}
-              className="h-9"
+              options={titleOptions}
+              loading={filterOptionsQuery.isLoading}
+              onChange={setTitle}
             />
           </label>
-          <label className="flex w-full min-w-0 flex-col gap-1 text-xs text-muted-foreground sm:min-w-[180px] sm:flex-1">
+          <label className="flex w-full min-w-0 flex-col gap-1 text-xs text-muted-foreground sm:min-w-[220px] sm:flex-1">
             <span>{t("usage.task.project", { defaultValue: "Project" })}</span>
-            <Input
-              aria-label={t("usage.task.project", { defaultValue: "Project" })}
-              value={project}
-              onChange={(event) => setProject(event.target.value)}
-              placeholder={t("usage.task.searchProject", {
-                defaultValue: "Search project",
+            <TaskFilterCombobox
+              label={t("usage.task.project", { defaultValue: "Project" })}
+              placeholder={t("usage.task.selectProject", {
+                defaultValue: "Select project",
               })}
-              className="h-9"
-            />
-          </label>
-          <label className="flex w-full min-w-0 flex-col gap-1 text-xs text-muted-foreground sm:min-w-[180px] sm:flex-[1.2]">
-            <span>
-              {t("usage.task.projectDir", {
-                defaultValue: "Project directory",
+              searchPlaceholder={t("usage.task.searchProject", {
+                defaultValue: "Search projects",
               })}
-            </span>
-            <Input
-              aria-label={t("usage.task.projectDir", {
-                defaultValue: "Project directory",
+              loadingText={t("usage.task.loadingOptions", {
+                defaultValue: "Loading options…",
+              })}
+              emptyText={t("usage.task.noFilterOptions", {
+                defaultValue: "No matching options",
+              })}
+              clearText={t("usage.task.clearFilter", {
+                defaultValue: "Clear selection",
               })}
               value={projectDir}
-              onChange={(event) => setProjectDir(event.target.value)}
-              placeholder={t("usage.task.searchProjectDir", {
-                defaultValue: "Search project path",
-              })}
-              className="h-9"
+              options={projectOptions}
+              loading={filterOptionsQuery.isLoading}
+              onChange={setProjectDir}
             />
           </label>
         </div>
@@ -666,7 +891,17 @@ export function TaskUsageTable({
             })}
           </p>
         )}
-        {isFetching && !isLoading && (
+        {filterOptionsQuery.isError && (
+          <p
+            className="mt-2 text-xs text-amber-600 dark:text-amber-400"
+            role="status"
+          >
+            {t("usage.task.filterOptionsUnavailable", {
+              defaultValue: "Task title and project options are unavailable.",
+            })}
+          </p>
+        )}
+        {(isFetching || filterOptionsQuery.isFetching) && !isLoading && (
           <p className="mt-2 text-xs text-muted-foreground" role="status">
             {t("usage.task.refreshing", { defaultValue: "Refreshing…" })}
           </p>
