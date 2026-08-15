@@ -1585,6 +1585,8 @@
       "project": "プロジェクト",
       "projectDir": "プロジェクトディレクトリ",
       "refreshing": "更新中…",
+      "rebuilding": "Codex セッション統計を再構築中です。完了するまで未帰属セッションは計算しません。",
+      "rebuildingWithSnapshot": "Codex セッション統計を更新中です。前回の完全な結果を表示しています。完了するまで未帰属セッションは計算しません。",
       "searchProject": "プロジェクトを検索",
       "searchProjectDir": "プロジェクトパスを検索",
       "searchTitle": "タスクタイトルを検索",

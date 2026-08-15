@@ -1586,6 +1586,8 @@
       "project": "專案",
       "projectDir": "專案目錄",
       "refreshing": "重新整理中…",
+      "rebuilding": "正在重建 Codex 工作階段統計，完成前不會計算未歸屬工作階段。",
+      "rebuildingWithSnapshot": "Codex 工作階段統計正在更新，目前顯示上次完整結果；完成前不會計算未歸屬工作階段。",
       "searchProject": "搜尋專案",
       "searchProjectDir": "搜尋專案路徑",
       "searchTitle": "搜尋任務標題",

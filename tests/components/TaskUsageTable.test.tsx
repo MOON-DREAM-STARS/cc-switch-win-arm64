@@ -141,6 +141,7 @@ const installQueryResult = (
   items: AgentTaskUsageRow[],
   total = items.length,
   unattributedUsage: AgentUsageMeasure | null = null,
+  dataStatus: "ready" | "rebuilding_with_snapshot" | "rebuilding" = "ready",
 ) => {
   useAgentTaskUsageMock.mockReturnValue({
     data: {
@@ -150,6 +151,7 @@ const installQueryResult = (
       offset: 0,
       hasMore: total > items.length,
       unattributedUsage,
+      dataStatus,
     },
     isLoading: false,
     isError: false,
@@ -267,6 +269,22 @@ describe("TaskUsageTable", () => {
       expect(lastFilter()).toMatchObject({ limit: 20, offset: 20 }),
     );
     expect(screen.queryByLabelText("Rows per page")).not.toBeInTheDocument();
+  });
+
+  it("hides the ordinary empty state while Codex replay has no published snapshot", () => {
+    installQueryResult([], 0, null, "rebuilding");
+    render(
+      <TaskUsageTable
+        range={{ preset: "today" }}
+        refreshIntervalMs={0}
+        initialAppType="codex"
+      />,
+    );
+
+    expect(screen.getByTestId("codex-replay-status")).toBeInTheDocument();
+    expect(screen.getByText(/Codex session statistics are being rebuilt/)).toBeInTheDocument();
+    expect(screen.queryByText("No root tasks match these filters.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Unattributed sessions")).not.toBeInTheDocument();
   });
 
   it("does not turn a missing native title into a UUID or a candidate", () => {

@@ -520,6 +520,8 @@ export interface AgentTaskUsagePage {
   hasMore: boolean;
   /** Codex proxy requests without verifiable native session attribution. */
   unattributedUsage: AgentUsageMeasure | null;
+  /** Publication state while Codex canonical usage is rebuilt in the shadow generation. */
+  dataStatus?: "ready" | "rebuilding_with_snapshot" | "rebuilding";
 }
 
 /** Backend default used whenever callers omit pagination values. */

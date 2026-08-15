@@ -1585,6 +1585,8 @@
       "project": "项目",
       "projectDir": "项目目录",
       "refreshing": "正在刷新…",
+      "rebuilding": "正在重建 Codex 会话统计，完成前不会计算未归属会话。",
+      "rebuildingWithSnapshot": "Codex 会话统计正在更新，当前显示上次完整结果；完成前不会计算未归属会话。",
       "searchProject": "搜索项目",
       "searchProjectDir": "搜索项目路径",
       "searchTitle": "搜索任务标题",

@@ -1585,6 +1585,8 @@
       "project": "Project",
       "projectDir": "Project directory",
       "refreshing": "Refreshing…",
+      "rebuilding": "Codex session statistics are being rebuilt. Unattributed sessions will not be calculated until the rebuild finishes.",
+      "rebuildingWithSnapshot": "Codex session statistics are updating; showing the last complete result. Unattributed sessions will be calculated after the rebuild finishes.",
       "searchProject": "Search projects",
       "searchProjectDir": "Search project path",
       "searchTitle": "Search task titles",

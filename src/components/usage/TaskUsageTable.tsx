@@ -257,6 +257,36 @@ function UnattributedUsageSummary({
   );
 }
 
+function CodexReplayStatus({
+  status,
+  t,
+}: {
+  status: "rebuilding_with_snapshot" | "rebuilding";
+  t: (key: string, options?: Record<string, unknown>) => string;
+}) {
+  const message = t(
+    status === "rebuilding_with_snapshot"
+      ? "usage.task.rebuildingWithSnapshot"
+      : "usage.task.rebuilding",
+    {
+      defaultValue:
+        status === "rebuilding_with_snapshot"
+          ? "Codex session statistics are updating; showing the last complete result. Unattributed sessions will be calculated after the rebuild finishes."
+          : "Codex session statistics are being rebuilt. Unattributed sessions will not be calculated until the rebuild finishes.",
+    },
+  );
+  return (
+    <div
+      className="flex min-w-0 items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300"
+      data-testid="codex-replay-status"
+      role="status"
+    >
+      <TriangleAlert className="size-4 shrink-0" aria-hidden="true" />
+      <span className="min-w-0">{message}</span>
+    </div>
+  );
+}
+
 interface TaskFilterComboboxOption {
   value: string;
   label: string;
@@ -817,6 +847,9 @@ export function TaskUsageTable({
   const rows = data?.items ?? [];
   const total = data?.total ?? 0;
   const totalPages = total > 0 ? Math.ceil(total / TASK_PAGE_SIZE) : 0;
+  const dataStatus = data?.dataStatus ?? "ready";
+  const codexRebuildingWithoutSnapshot =
+    agentAppType === "codex" && dataStatus === "rebuilding";
 
   useEffect(() => {
     setPage(0);
@@ -972,10 +1005,13 @@ export function TaskUsageTable({
         </div>
       ) : (
         <>
-          {data?.unattributedUsage ? (
+          {dataStatus !== "ready" ? (
+            <CodexReplayStatus status={dataStatus} t={t} />
+          ) : null}
+          {dataStatus === "ready" && data?.unattributedUsage ? (
             <UnattributedUsageSummary measure={data.unattributedUsage} t={t} />
           ) : null}
-          {isWideLayout ? (
+          {!codexRebuildingWithoutSnapshot && (isWideLayout ? (
             <div
               data-testid="task-usage-table"
               className="overflow-hidden rounded-lg border border-border/50 bg-card/40 backdrop-blur-sm"
@@ -1046,9 +1082,9 @@ export function TaskUsageTable({
                 })
               )}
             </div>
-          )}
+          ))}
 
-          <div className="flex flex-wrap items-center justify-between gap-3 text-sm text-muted-foreground">
+          {!codexRebuildingWithoutSnapshot && <div className="flex flex-wrap items-center justify-between gap-3 text-sm text-muted-foreground">
             <span>
               {t("usage.task.totalRecords", {
                 defaultValue: "{{total}} root tasks",
@@ -1094,7 +1130,7 @@ export function TaskUsageTable({
                 <ChevronRight className="h-4 w-4" />
               </Button>
             </div>
-          </div>
+          </div>}
         </>
       )}
     </div>
