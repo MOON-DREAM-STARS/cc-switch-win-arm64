@@ -1,10 +1,13 @@
 import {
   AlertCircle,
   Coins,
+  ChevronDown,
+  ChevronUp,
   Layers3,
   Loader2,
   MessageSquare,
 } from "lucide-react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { useAgentSessionUsage } from "@/lib/query/usage";
@@ -12,44 +15,14 @@ import type {
   AgentSessionUsageSummary,
   AgentUsageAppType,
   AgentUsageMeasure,
-  AgentUsagePrecision,
   AgentUsageRequestCountSemantics,
 } from "@/types/usage";
-import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { formatKnownTokenTotal } from "@/components/usage/format";
 
 type SessionUsageSummaryProps = {
   appType: AgentUsageAppType;
   sessionId: string;
-};
-
-const precisionLabel = (
-  precision: AgentUsagePrecision,
-  t: ReturnType<typeof useTranslation>["t"],
-) => {
-  switch (precision) {
-    case "request_exact":
-      return t("sessionManager.usagePrecisionRequest", {
-        defaultValue: "Request-exact",
-      });
-    case "session_exact":
-      return t("sessionManager.usagePrecisionSession", {
-        defaultValue: "Session aggregate",
-      });
-    case "sync_window_delta":
-      return t("sessionManager.usagePrecisionSyncWindow", {
-        defaultValue: "Sync-window delta",
-      });
-    case "estimated":
-      return t("sessionManager.usagePrecisionEstimated", {
-        defaultValue: "Estimated",
-      });
-    default:
-      return t("sessionManager.usagePrecisionUnavailable", {
-        defaultValue: "Unavailable",
-      });
-  }
 };
 
 const requestCountLabel = (
@@ -102,7 +75,6 @@ type MeasureCardProps = {
   count?: number;
   countUnavailableLabel: string;
   unavailableLabel: string;
-  partialLabel: string;
 };
 
 function MeasureCard({
@@ -114,7 +86,6 @@ function MeasureCard({
   count,
   countUnavailableLabel,
   unavailableLabel,
-  partialLabel,
 }: MeasureCardProps) {
   const effectiveCountLabel = measure
     ? requestCountLabel(measure.requestCountSemantics, t)
@@ -123,22 +94,12 @@ function MeasureCard({
     measure?.requestCount === null || measure == null
       ? unavailableLabel
       : formatNumber(measure.requestCount, language);
-  const precision = measure?.precision ?? "unavailable";
-  const syncWindow =
-    measure?.precision === "sync_window_delta" ||
-    measure?.timeSemantics === "sync_window_end";
-
   return (
     <div className="min-w-0 rounded-md border border-border/60 bg-background/40 p-2.5">
       <div className="flex min-w-0 items-start justify-between gap-2">
         <span className="min-w-0 truncate text-xs font-medium" title={label}>
           {label}
         </span>
-        {measure?.partial && (
-          <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[10px]">
-            {partialLabel}
-          </Badge>
-        )}
       </div>
       <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 text-[11px]">
         <div className="min-w-0">
@@ -179,28 +140,7 @@ function MeasureCard({
                 : `${countValue} ${effectiveCountLabel}`}
           </div>
         </div>
-        <div className="min-w-0">
-          <div className="text-muted-foreground">
-            {t("sessionManager.usagePrecision", { defaultValue: "Precision" })}
-          </div>
-          <div className="truncate" data-testid="usage-precision">
-            {precisionLabel(precision, t)}
-          </div>
-        </div>
       </div>
-      {syncWindow && (
-        <div className="mt-2 flex min-w-0 items-start gap-1 text-[10px] text-muted-foreground">
-          <MessageSquare
-            className="mt-0.5 size-3 shrink-0"
-            aria-hidden="true"
-          />
-          <span className="min-w-0 break-words">
-            {t("sessionManager.usageSyncWindowHint", {
-              defaultValue: "Sync-window increment; not per-request.",
-            })}
-          </span>
-        </div>
-      )}
     </div>
   );
 }
@@ -237,13 +177,15 @@ export function SessionUsageSummary({
 }: SessionUsageSummaryProps) {
   const { t, i18n } = useTranslation();
   const { data, isLoading, isError } = useAgentSessionUsage(appType, sessionId);
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const language = i18n.resolvedLanguage || i18n.language || "en-US";
   const unavailableLabel = t("sessionManager.usageUnavailableShort", {
     defaultValue: "Unavailable",
   });
-  const partialLabel = t("sessionManager.usagePartial", {
-    defaultValue: "Partial",
-  });
+
+  useEffect(() => {
+    setDetailsOpen(false);
+  }, [appType, sessionId]);
 
   if (isLoading) {
     return (
@@ -268,11 +210,25 @@ export function SessionUsageSummary({
   }
 
   const descendantVisible = hasDescendantEvidence(data);
-  const totalPrecision = data.totalUsage?.precision ?? data.precision;
   const totalIsPartial = data.partial || Boolean(data.totalUsage?.partial);
-  const syncWindow =
-    totalPrecision === "sync_window_delta" ||
-    data.totalUsage?.timeSemantics === "sync_window_end";
+  const measures = [data.totalUsage, data.selfUsage, data.descendantUsage];
+  const measureHasPartial = measures.some(
+    (measure) => measure?.partial || measure?.warnings.length,
+  );
+  const measureHasDetails =
+    measureHasPartial ||
+    measures.some(
+      (measure) =>
+        measure?.timeSemantics != null &&
+        measure.timeSemantics !== "event_time",
+    );
+  const detailTimeSemantics = measures.find(
+    (measure) =>
+      measure?.timeSemantics && measure.timeSemantics !== "event_time",
+  )?.timeSemantics;
+  const syncWindow = detailTimeSemantics === "sync_window_end";
+  const hasDataDetails =
+    totalIsPartial || measureHasDetails || data.warnings.length > 0;
   const totalLabel = t("sessionManager.usageTaskTotal", {
     defaultValue: "Task total",
   });
@@ -294,14 +250,6 @@ export function SessionUsageSummary({
           <div className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-muted-foreground">
             <Layers3 className="size-3.5 shrink-0" aria-hidden="true" />
             <span className="truncate">{totalLabel}</span>
-            {totalIsPartial && (
-              <Badge
-                variant="outline"
-                className="shrink-0 px-1.5 py-0 text-[10px]"
-              >
-                {partialLabel}
-              </Badge>
-            )}
           </div>
           <div className="mt-1 flex min-w-0 items-baseline gap-2">
             <span
@@ -323,22 +271,6 @@ export function SessionUsageSummary({
           </div>
         </div>
         <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] text-muted-foreground">
-          <Badge
-            variant="secondary"
-            className="max-w-full truncate px-1.5 py-0 font-normal"
-          >
-            {precisionLabel(totalPrecision, t)}
-          </Badge>
-          {syncWindow && (
-            <Badge
-              variant="outline"
-              className="max-w-full truncate px-1.5 py-0 font-normal"
-            >
-              {t("sessionManager.usageSyncWindow", {
-                defaultValue: "Sync window",
-              })}
-            </Badge>
-          )}
           <span
             className="inline-flex min-w-0 items-center gap-1 truncate"
             title={formatCost(data.totalUsage, unavailableLabel)}
@@ -364,7 +296,6 @@ export function SessionUsageSummary({
           t={t}
           countUnavailableLabel={unavailableLabel}
           unavailableLabel={unavailableLabel}
-          partialLabel={partialLabel}
         />
         {descendantVisible && (
           <MeasureCard
@@ -378,23 +309,88 @@ export function SessionUsageSummary({
             t={t}
             countUnavailableLabel={unavailableLabel}
             unavailableLabel={unavailableLabel}
-            partialLabel={partialLabel}
           />
         )}
       </div>
 
-      {(totalIsPartial || syncWindow || data.warnings.length > 0) && (
-        <div className="mt-2 flex min-w-0 items-start gap-1.5 text-[10px] text-muted-foreground">
-          <AlertCircle className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
-          <span className="min-w-0 break-words">
-            {syncWindow
-              ? t("sessionManager.usageSyncWindowHint", {
-                  defaultValue: "Sync-window increment; not per-request.",
-                })
-              : t("sessionManager.usagePartialHint", {
-                  defaultValue: "Some usage fields are partial or unavailable.",
-                })}
-          </span>
+      {hasDataDetails && (
+        <div className="mt-2 min-w-0">
+          <button
+            type="button"
+            className="inline-flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground transition-colors hover:text-foreground"
+            aria-expanded={detailsOpen}
+            aria-controls="session-usage-data-details"
+            onClick={() => setDetailsOpen((open) => !open)}
+          >
+            {detailsOpen ? (
+              <ChevronUp className="size-3 shrink-0" aria-hidden="true" />
+            ) : (
+              <ChevronDown className="size-3 shrink-0" aria-hidden="true" />
+            )}
+            <span>
+              {t(
+                detailsOpen
+                  ? "sessionManager.usageDataDetailsClose"
+                  : "sessionManager.usageDataDetails",
+                {
+                  defaultValue: detailsOpen
+                    ? "Hide data details"
+                    : "Data details",
+                },
+              )}
+            </span>
+          </button>
+          {detailsOpen && (
+            <div
+              id="session-usage-data-details"
+              data-testid="session-usage-data-details"
+              className="mt-1.5 flex min-w-0 items-start gap-1.5 rounded-md border border-border/50 bg-background/30 px-2 py-1.5 text-[10px] text-muted-foreground"
+            >
+              <AlertCircle
+                className="mt-0.5 size-3 shrink-0"
+                aria-hidden="true"
+              />
+              <div className="min-w-0 space-y-1">
+                {(totalIsPartial ||
+                  measureHasPartial ||
+                  data.warnings.length > 0) && (
+                  <div>
+                    {t("sessionManager.usagePartialHint", {
+                      defaultValue:
+                        "Some usage fields are partial or unavailable.",
+                    })}
+                  </div>
+                )}
+                {syncWindow && (
+                  <div className="flex items-start gap-1">
+                    <MessageSquare
+                      className="mt-0.5 size-3 shrink-0"
+                      aria-hidden="true"
+                    />
+                    <span>
+                      {t("sessionManager.usageSyncWindowHint", {
+                        defaultValue: "Sync-window increment; not per-request.",
+                      })}
+                    </span>
+                  </div>
+                )}
+                {detailTimeSemantics === "session_time" && (
+                  <div>
+                    {t("sessionManager.usageSessionTimeHint", {
+                      defaultValue: "Usage is aggregated by session time.",
+                    })}
+                  </div>
+                )}
+                {detailTimeSemantics === "unavailable" && (
+                  <div>
+                    {t("sessionManager.usageTimeUnavailableHint", {
+                      defaultValue: "Source time is unavailable.",
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </section>

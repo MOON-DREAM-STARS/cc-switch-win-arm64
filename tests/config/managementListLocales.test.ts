@@ -17,6 +17,16 @@ const requiredPaths = [
   "prompts.searchPlaceholder",
   "prompts.searchAriaLabel",
   "prompts.noSearchResults",
+  "sessionManager.usageDataDetails",
+  "sessionManager.usageDataDetailsClose",
+  "sessionManager.usageSessionTimeHint",
+  "sessionManager.usageTimeUnavailableHint",
+  "usage.task.dataDetails",
+  "usage.task.dataDetailsClose",
+  "usage.task.partialHint",
+  "usage.task.syncWindowHint",
+  "usage.task.sessionTimeHint",
+  "usage.task.timeUnavailableHint",
 ] as const;
 
 type Locale = Record<string, unknown>;

@@ -68,38 +68,6 @@ function agentLabel(
   return t(key, { defaultValue: fallback });
 }
 
-function precisionLabel(
-  precision: AgentUsageMeasure["precision"],
-  t: (key: string, options?: { defaultValue?: string }) => string,
-) {
-  const labels: Record<AgentUsageMeasure["precision"], [string, string]> = {
-    request_exact: ["usage.task.precision.requestExact", "Request-exact"],
-    session_exact: ["usage.task.precision.sessionExact", "Session-exact"],
-    sync_window_delta: [
-      "usage.task.precision.syncWindowDelta",
-      "Sync-window delta",
-    ],
-    estimated: ["usage.task.precision.estimated", "Estimated"],
-    unavailable: ["usage.task.precision.unavailable", "Unavailable"],
-  };
-  const [key, fallback] = labels[precision];
-  return t(key, { defaultValue: fallback });
-}
-
-function timeSemanticsLabel(
-  semantics: AgentUsageMeasure["timeSemantics"],
-  t: (key: string, options?: { defaultValue?: string }) => string,
-) {
-  const labels: Record<AgentUsageMeasure["timeSemantics"], [string, string]> = {
-    event_time: ["usage.task.time.event", "Event time"],
-    session_time: ["usage.task.time.session", "Session time"],
-    sync_window_end: ["usage.task.time.syncWindow", "Sync-window end"],
-    unavailable: ["usage.task.time.unavailable", "Time unavailable"],
-  };
-  const [key, fallback] = labels[semantics];
-  return t(key, { defaultValue: fallback });
-}
-
 function requestCountSemanticsLabel(
   semantics: AgentUsageMeasure["requestCountSemantics"],
   t: (key: string, options?: { defaultValue?: string }) => string,
@@ -141,19 +109,6 @@ function rowKey(row: AgentTaskUsageRow) {
   return `${row.appType}:${row.rootSessionId || row.sessionId}`;
 }
 
-function measureStatus(
-  row: AgentTaskUsageRow,
-  t: (key: string, options?: { defaultValue?: string }) => string,
-) {
-  if (!row.totalUsage) {
-    return t("usage.task.status.unavailable", { defaultValue: "Unavailable" });
-  }
-  if (row.partial || row.totalUsage.partial) {
-    return t("usage.task.status.partial", { defaultValue: "Partial" });
-  }
-  return t("usage.task.status.available", { defaultValue: "Available" });
-}
-
 function taskTokenTotal(
   measure: AgentUsageMeasure | null,
   t: (key: string, options?: { defaultValue?: string }) => string,
@@ -163,18 +118,6 @@ function taskTokenTotal(
     undefined,
     t("usage.task.unavailable", { defaultValue: "Unavailable" }),
   );
-}
-
-function capabilityStatus(capability: AgentUsageCapability) {
-  const statuses = [
-    capability.sessionEnumeration,
-    capability.usageStatus,
-    capability.tokenStatus,
-    capability.costStatus,
-  ];
-  if (statuses.includes("unavailable")) return "unavailable" as const;
-  if (statuses.includes("partial")) return "partial" as const;
-  return "supported" as const;
 }
 
 function useWideTaskLayout(
@@ -203,6 +146,162 @@ function useWideTaskLayout(
   return isWide;
 }
 
+function hasUsageQualityDetails(row: AgentTaskUsageRow) {
+  const measures = [row.totalUsage, row.selfUsage, row.descendantUsage];
+  return Boolean(
+    row.partial ||
+      row.warnings.length > 0 ||
+      measures.some(
+        (measure) =>
+          measure?.partial ||
+          measure?.warnings.length ||
+          (measure?.timeSemantics != null &&
+            measure.timeSemantics !== "event_time"),
+      ),
+  );
+}
+
+function hasUsageDetails(row: AgentTaskUsageRow) {
+  return row.descendantSessionCount > 0 || hasUsageQualityDetails(row);
+}
+
+function UsageDataDetails({
+  row,
+  t,
+}: {
+  row: AgentTaskUsageRow;
+  t: (key: string, options?: { defaultValue?: string }) => string;
+}) {
+  const measures = [row.totalUsage, row.selfUsage, row.descendantUsage];
+  const partial = Boolean(
+    row.partial ||
+      row.warnings.length > 0 ||
+      measures.some((measure) => measure?.partial || measure?.warnings.length),
+  );
+  const timeSemantics = measures.find(
+    (measure) =>
+      measure?.timeSemantics && measure.timeSemantics !== "event_time",
+  )?.timeSemantics;
+
+  if (!partial && !timeSemantics) return null;
+
+  return (
+    <div
+      data-testid={`task-data-details-${rowKey(row)}`}
+      className="rounded-md border border-border/50 bg-muted/20 p-2 text-xs text-muted-foreground"
+    >
+      {partial && (
+        <div>
+          {t("usage.task.partialHint", {
+            defaultValue: "Some usage fields are partial or unavailable.",
+          })}
+        </div>
+      )}
+      {timeSemantics === "sync_window_end" && (
+        <div className="mt-1">
+          {t("usage.task.syncWindowHint", {
+            defaultValue: "Sync-window increment; not per-request.",
+          })}
+        </div>
+      )}
+      {timeSemantics === "session_time" && (
+        <div className="mt-1">
+          {t("usage.task.sessionTimeHint", {
+            defaultValue: "Usage is aggregated by session time.",
+          })}
+        </div>
+      )}
+      {timeSemantics === "unavailable" && (
+        <div className="mt-1">
+          {t("usage.task.timeUnavailableHint", {
+            defaultValue: "Source time is unavailable.",
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TaskUsageDetails({
+  row,
+  expanded,
+  onToggle,
+  t,
+}: {
+  row: AgentTaskUsageRow;
+  expanded: boolean;
+  onToggle: () => void;
+  t: (key: string, options?: { defaultValue?: string }) => string;
+}) {
+  const key = rowKey(row);
+  const descendantEvidence = row.descendantSessionCount > 0;
+  const qualityDetails = hasUsageQualityDetails(row);
+
+  if (!hasUsageDetails(row)) return null;
+
+  return (
+    <div className="mt-2 border-t border-border/50 pt-2">
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="h-7 px-1.5 text-xs"
+        aria-expanded={expanded}
+        aria-controls={`task-details-${key}`}
+        onClick={onToggle}
+      >
+        {expanded ? (
+          <ChevronUp className="h-3.5 w-3.5" />
+        ) : (
+          <ChevronDown className="h-3.5 w-3.5" />
+        )}
+        {descendantEvidence
+          ? t("usage.task.viewBreakdown", {
+              defaultValue: "Self / descendants",
+            })
+          : t(
+              expanded
+                ? "usage.task.dataDetailsClose"
+                : "usage.task.dataDetails",
+              {
+                defaultValue: expanded ? "Hide data details" : "Data details",
+              },
+            )}
+        {descendantEvidence && (
+          <span className="text-muted-foreground">
+            ({row.descendantSessionCount})
+          </span>
+        )}
+      </Button>
+      {expanded && (
+        <div
+          id={`task-details-${key}`}
+          className="mt-2 space-y-2"
+          data-testid={`task-details-${key}`}
+        >
+          {qualityDetails && <UsageDataDetails row={row} t={t} />}
+          {descendantEvidence && (
+            <div data-testid={`task-breakdown-${key}`} className="space-y-2">
+              <MeasureBreakdown
+                label={t("usage.task.self", { defaultValue: "Self" })}
+                measure={row.selfUsage}
+                t={t}
+              />
+              <MeasureBreakdown
+                label={t("usage.task.descendants", {
+                  defaultValue: "Descendants",
+                })}
+                measure={row.descendantUsage}
+                t={t}
+              />
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MeasureBreakdown({
   label,
   measure,
@@ -225,12 +324,6 @@ function MeasureBreakdown({
     <div className="rounded-md border border-border/50 bg-muted/20 p-2 text-xs">
       <div className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-1">
         <span className="font-medium text-foreground">{label}</span>
-        <span className="text-muted-foreground">
-          {precisionLabel(measure.precision, t)}
-        </span>
-        <span className="text-muted-foreground">
-          {timeSemanticsLabel(measure.timeSemantics, t)}
-        </span>
       </div>
       <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-muted-foreground sm:grid-cols-4">
         <span>
@@ -279,7 +372,6 @@ function TaskUsageRowView({
   const key = rowKey(row);
   const title = taskTitle(row);
   const project = taskProject(row);
-  const descendantEvidence = row.descendantSessionCount > 0;
   const total = row.totalUsage;
   const countLabel = total
     ? requestCountSemanticsLabel(total.requestCountSemantics, t)
@@ -311,78 +403,14 @@ function TaskUsageRowView({
           </span>
         </div>
         <div className="mt-1 text-xs text-muted-foreground">
-          {displayCost(total)} ·{" "}
-          {total
-            ? precisionLabel(total.precision, t)
-            : precisionLabel("unavailable", t)}
+          {displayCost(total)}
         </div>
-        <div className="mt-1 text-xs text-muted-foreground">
-          {countLabel}:{" "}
-          {total?.requestCount == null ? "—" : fmtInt(total.requestCount)}
-        </div>
-        {descendantEvidence && (
-          <div className="mt-2">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-7 px-1.5 text-xs"
-              aria-expanded={expanded}
-              aria-controls={`task-breakdown-${key}`}
-              onClick={onToggle}
-            >
-              {expanded ? (
-                <ChevronUp className="h-3.5 w-3.5" />
-              ) : (
-                <ChevronDown className="h-3.5 w-3.5" />
-              )}
-              {t("usage.task.viewBreakdown", {
-                defaultValue: "Self / descendants",
-              })}{" "}
-              <span className="text-muted-foreground">
-                ({row.descendantSessionCount})
-              </span>
-            </Button>
-            {expanded && (
-              <div
-                id={`task-breakdown-${key}`}
-                data-testid={`task-breakdown-${key}`}
-                className="mt-2 space-y-2"
-              >
-                <MeasureBreakdown
-                  label={t("usage.task.self", { defaultValue: "Self" })}
-                  measure={row.selfUsage}
-                  t={t}
-                />
-                <MeasureBreakdown
-                  label={t("usage.task.descendants", {
-                    defaultValue: "Descendants",
-                  })}
-                  measure={row.descendantUsage}
-                  t={t}
-                />
-              </div>
-            )}
-          </div>
-        )}
-      </TableCell>
-      <TableCell className="min-w-[135px] align-top">
-        <span
-          className={
-            !total
-              ? "text-muted-foreground"
-              : row.partial || total.partial
-                ? "text-amber-600 dark:text-amber-400"
-                : "text-emerald-600 dark:text-emerald-400"
-          }
-        >
-          {measureStatus(row, t)}
-        </span>
-        <div className="mt-1 text-xs text-muted-foreground">
-          {total
-            ? `${precisionLabel(total.precision, t)} · ${timeSemanticsLabel(total.timeSemantics, t)}`
-            : t("usage.task.noMeasure", { defaultValue: "No usage measure" })}
-        </div>
+        <TaskUsageDetails
+          row={row}
+          expanded={expanded}
+          onToggle={onToggle}
+          t={t}
+        />
       </TableCell>
       <TableCell className="min-w-[120px] align-top text-right">
         {total?.requestCount == null ? "—" : fmtInt(total.requestCount)}
@@ -406,17 +434,10 @@ function TaskUsageCardView({
   const key = rowKey(row);
   const title = taskTitle(row);
   const project = taskProject(row);
-  const descendantEvidence = row.descendantSessionCount > 0;
   const total = row.totalUsage;
   const countLabel = total
     ? requestCountSemanticsLabel(total.requestCountSemantics, t)
     : requestCountSemanticsLabel("unavailable", t);
-  const status = measureStatus(row, t);
-  const statusClass = !total
-    ? "text-muted-foreground"
-    : row.partial || total.partial
-      ? "text-amber-600 dark:text-amber-400"
-      : "text-emerald-600 dark:text-emerald-400";
 
   return (
     <article
@@ -425,7 +446,7 @@ function TaskUsageCardView({
     >
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
-          <div className="break-words font-medium" title={title}>
+          <div className="line-clamp-2 break-words font-medium" title={title}>
             {title}
           </div>
           <div className="mt-1 text-xs text-muted-foreground">
@@ -438,17 +459,9 @@ function TaskUsageCardView({
             {project}
           </div>
         </div>
-        <div className="shrink-0 text-left text-xs sm:text-right">
-          <div className={statusClass}>{status}</div>
-          <div className="mt-1 text-muted-foreground">
-            {total
-              ? `${precisionLabel(total.precision, t)} · ${timeSemanticsLabel(total.timeSemantics, t)}`
-              : t("usage.task.noMeasure", { defaultValue: "No usage measure" })}
-          </div>
-        </div>
       </div>
 
-      <div className="mt-3 grid min-w-0 grid-cols-2 gap-x-4 gap-y-2 border-t border-border/50 pt-3 text-xs sm:grid-cols-4">
+      <div className="mt-3 grid min-w-0 grid-cols-3 gap-x-4 gap-y-2 border-t border-border/50 pt-3 text-xs">
         <div className="min-w-0">
           <div className="text-muted-foreground">
             {t("usage.task.total", { defaultValue: "Derived total" })}
@@ -477,63 +490,14 @@ function TaskUsageCardView({
             <span className="text-muted-foreground">{countLabel}</span>
           </div>
         </div>
-        <div className="min-w-0">
-          <div className="text-muted-foreground">
-            {t("usage.task.dataStatus", { defaultValue: "Data status" })}
-          </div>
-          <div className="mt-1 truncate text-muted-foreground">
-            {total
-              ? `${precisionLabel(total.precision, t)} · ${timeSemanticsLabel(total.timeSemantics, t)}`
-              : t("usage.task.noMeasure", { defaultValue: "No usage measure" })}
-          </div>
-        </div>
       </div>
 
-      {descendantEvidence && (
-        <div className="mt-3 border-t border-border/50 pt-2">
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="h-7 px-1.5 text-xs"
-            aria-expanded={expanded}
-            aria-controls={`task-breakdown-${key}`}
-            onClick={onToggle}
-          >
-            {expanded ? (
-              <ChevronUp className="h-3.5 w-3.5" />
-            ) : (
-              <ChevronDown className="h-3.5 w-3.5" />
-            )}
-            {t("usage.task.viewBreakdown", {
-              defaultValue: "Self / descendants",
-            })}{" "}
-            <span className="text-muted-foreground">
-              ({row.descendantSessionCount})
-            </span>
-          </Button>
-          {expanded && (
-            <div
-              id={`task-breakdown-${key}`}
-              data-testid={`task-breakdown-${key}`}
-              className="mt-2 space-y-2"
-            >
-              <MeasureBreakdown
-                label={t("usage.task.self", { defaultValue: "Self" })}
-                measure={row.selfUsage}
-                t={t}
-              />
-              <MeasureBreakdown
-                label={t("usage.task.descendants", {
-                  defaultValue: "Descendants",
-                })}
-                measure={row.descendantUsage}
-                t={t}
-              />
-            </div>
-          )}
-        </div>
-      )}
+      <TaskUsageDetails
+        row={row}
+        expanded={expanded}
+        onToggle={onToggle}
+        t={t}
+      />
     </article>
   );
 }
@@ -645,15 +609,6 @@ export function TaskUsageTable({
               {capabilities.map((capability: AgentUsageCapability) => (
                 <option key={capability.appType} value={capability.appType}>
                   {agentLabel(capability.appType, t)}
-                  {capabilityStatus(capability) === "unavailable"
-                    ? ` — ${t("usage.task.unavailable", {
-                        defaultValue: "Unavailable",
-                      })}`
-                    : capabilityStatus(capability) === "partial"
-                      ? ` — ${t("usage.task.partial", {
-                          defaultValue: "Partial",
-                        })}`
-                      : ""}
                 </option>
               ))}
             </select>
@@ -756,11 +711,6 @@ export function TaskUsageTable({
                     <TableHead>
                       {t("usage.task.total", { defaultValue: "Derived total" })}
                     </TableHead>
-                    <TableHead>
-                      {t("usage.task.dataStatus", {
-                        defaultValue: "Data status",
-                      })}
-                    </TableHead>
                     <TableHead className="text-right">
                       {t("usage.task.count", { defaultValue: "Count" })}
                     </TableHead>
@@ -770,7 +720,7 @@ export function TaskUsageTable({
                   {rows.length === 0 ? (
                     <TableRow>
                       <TableCell
-                        colSpan={5}
+                        colSpan={4}
                         className="h-32 text-center text-muted-foreground"
                       >
                         {t("usage.task.empty", {

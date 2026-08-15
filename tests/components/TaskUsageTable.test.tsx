@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TaskUsageTable } from "@/components/usage/TaskUsageTable";
 import type {
@@ -200,6 +206,10 @@ describe("TaskUsageTable", () => {
         offset: 0,
       }),
     );
+    expect(screen.getByRole("option", { name: "Codex" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("option", { name: /Codex.*Partial/ }),
+    ).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Next page" }));
     await waitFor(() =>
@@ -235,7 +245,7 @@ describe("TaskUsageTable", () => {
     expect(screen.getAllByTestId(/^task-row-/)).toHaveLength(1);
   });
 
-  it("uses the five-column table only when the container is wide enough", async () => {
+  it("uses the four-column table only when the container is wide enough", async () => {
     const restoreWidth = setContainerWidth(1400);
     const view = render(
       <TaskUsageTable range={{ preset: "today" }} refreshIntervalMs={0} />,
@@ -245,6 +255,13 @@ describe("TaskUsageTable", () => {
       expect(screen.getByTestId("task-usage-table")).toBeInTheDocument(),
     );
     expect(screen.queryByTestId("task-usage-cards")).not.toBeInTheDocument();
+    const table = within(screen.getByTestId("task-usage-table"));
+    expect(table.getByText("Task")).toBeInTheDocument();
+    expect(table.getByText("Project")).toBeInTheDocument();
+    expect(table.getByText("Derived total")).toBeInTheDocument();
+    expect(table.getByText("Count")).toBeInTheDocument();
+    expect(screen.queryByText("Data status")).not.toBeInTheDocument();
+    expect(screen.queryByText("Request-exact")).not.toBeInTheDocument();
     view.unmount();
     restoreWidth();
   });
@@ -282,6 +299,7 @@ describe("TaskUsageTable", () => {
     expect(screen.getByText("Self")).toBeInTheDocument();
     expect(screen.getByText("Descendants")).toBeInTheDocument();
     expect(screen.getAllByTestId(/^task-row-/)).toHaveLength(1);
+    expect(screen.queryByText("Request-exact")).not.toBeInTheDocument();
   });
 
   it("keeps partial, sync-window and unavailable semantics truthful", () => {
@@ -373,7 +391,21 @@ describe("TaskUsageTable", () => {
 
     expect(screen.getByText(/7\+/)).toBeInTheDocument();
     expect(screen.getByText("Agent calls")).toBeInTheDocument();
-    expect(screen.getAllByText(/Sync-window delta/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/Sync-window delta/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Partial")).not.toBeInTheDocument();
+    expect(screen.queryByText("Request-exact")).not.toBeInTheDocument();
+    const detailsButtons = screen.getAllByRole("button", {
+      name: "Data details",
+    });
+    expect(detailsButtons).toHaveLength(3);
+    detailsButtons.forEach((button) => fireEvent.click(button));
+    expect(
+      screen.getAllByText("Some usage fields are partial or unavailable.")
+        .length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getByText("Sync-window increment; not per-request."),
+    ).toBeInTheDocument();
     expect(screen.getAllByText(/Count unavailable/).length).toBeGreaterThan(0);
     expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0);
     expect(screen.queryByText("HTTP requests")).not.toBeInTheDocument();

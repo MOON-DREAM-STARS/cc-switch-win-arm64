@@ -988,7 +988,11 @@
     "messageCopied": "已複製訊息內容",
     "conversationHistory": "對話紀錄",
     "expandContent": "展開完整內容",
-    "collapseContent": "收起"
+    "collapseContent": "收起",
+    "usageDataDetails": "資料說明",
+    "usageDataDetailsClose": "收起資料說明",
+    "usageSessionTimeHint": "資料按工作階段時間彙總。",
+    "usageTimeUnavailableHint": "來源時間不可用。"
   },
   "console": {
     "providerSwitchReceived": "收到供應商切換事件：",
@@ -1525,6 +1529,14 @@
       "gemini": "Gemini",
       "opencode": "OpenCode",
       "grokbuild": "Grok Build"
+    },
+    "task": {
+      "dataDetails": "資料說明",
+      "dataDetailsClose": "收起資料說明",
+      "partialHint": "部分用量欄位不完整或不可用。",
+      "syncWindowHint": "同步視窗增量；不是逐請求資料。",
+      "sessionTimeHint": "資料按工作階段時間彙總。",
+      "timeUnavailableHint": "來源時間不可用。"
     },
     "rawInputLabel": "原始",
     "rebuildCodex": {

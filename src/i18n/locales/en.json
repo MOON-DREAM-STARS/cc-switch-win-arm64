@@ -987,7 +987,11 @@
     "messageCopied": "Message copied",
     "conversationHistory": "Conversation History",
     "expandContent": "Expand full content",
-    "collapseContent": "Collapse"
+    "collapseContent": "Collapse",
+    "usageDataDetails": "Data details",
+    "usageDataDetailsClose": "Hide data details",
+    "usageSessionTimeHint": "Usage is aggregated by session time.",
+    "usageTimeUnavailableHint": "Source time is unavailable."
   },
   "console": {
     "providerSwitchReceived": "Received provider switch event:",
@@ -1524,6 +1528,14 @@
       "gemini": "Gemini",
       "opencode": "OpenCode",
       "grokbuild": "Grok Build"
+    },
+    "task": {
+      "dataDetails": "Data details",
+      "dataDetailsClose": "Hide data details",
+      "partialHint": "Some usage fields are partial or unavailable.",
+      "syncWindowHint": "Sync-window increment; not per-request.",
+      "sessionTimeHint": "Usage is aggregated by session time.",
+      "timeUnavailableHint": "Source time is unavailable."
     },
     "rawInputLabel": "Raw",
     "rebuildCodex": {

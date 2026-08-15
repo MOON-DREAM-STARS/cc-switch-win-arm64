@@ -987,7 +987,11 @@
     "messageCopied": "メッセージがコピーされました",
     "conversationHistory": "会話履歴",
     "expandContent": "全文を表示",
-    "collapseContent": "折りたたむ"
+    "collapseContent": "折りたたむ",
+    "usageDataDetails": "データの説明",
+    "usageDataDetailsClose": "データの説明を閉じる",
+    "usageSessionTimeHint": "セッション時間で集計されています。",
+    "usageTimeUnavailableHint": "ソース時刻を利用できません。"
   },
   "console": {
     "providerSwitchReceived": "プロバイダー切り替えイベントを受信:",
@@ -1524,6 +1528,14 @@
       "gemini": "Gemini",
       "opencode": "OpenCode",
       "grokbuild": "Grok Build"
+    },
+    "task": {
+      "dataDetails": "データの説明",
+      "dataDetailsClose": "データの説明を閉じる",
+      "partialHint": "一部の使用量フィールドが不完全または利用できません。",
+      "syncWindowHint": "同期ウィンドウの増分（リクエスト単位ではありません）。",
+      "sessionTimeHint": "セッション時間で集計されています。",
+      "timeUnavailableHint": "ソース時刻を利用できません。"
     },
     "rawInputLabel": "原始",
     "rebuildCodex": {

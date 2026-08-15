@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SessionUsageSummary } from "@/components/sessions/SessionUsageSummary";
@@ -123,6 +123,12 @@ describe("SessionUsageSummary", () => {
     expect(screen.getByText("This task")).toBeInTheDocument();
     expect(screen.getByText("All descendants (2)")).toBeInTheDocument();
     expect(screen.getAllByText(/agent calls/).length).toBeGreaterThan(0);
+    expect(screen.queryByText("Request-exact")).not.toBeInTheDocument();
+    expect(screen.queryByText("Precision")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("usage-precision")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Data details" }),
+    ).not.toBeInTheDocument();
     expect(screen.queryByText(/descendant-1|child-1/i)).not.toBeInTheDocument();
   });
 
@@ -156,17 +162,23 @@ describe("SessionUsageSummary", () => {
       isError: false,
     });
 
-    renderSummary();
+    const view = renderSummary();
 
     expect(screen.getByTestId("session-usage-total-tokens")).toHaveTextContent(
       "16+",
     );
     expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Partial").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Sync-window delta").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Partial")).not.toBeInTheDocument();
+    expect(screen.queryByText("Sync-window delta")).not.toBeInTheDocument();
+    const detailsButton = screen.getByRole("button", { name: "Data details" });
+    expect(detailsButton).toBeInTheDocument();
+    fireEvent.click(detailsButton);
     expect(
-      screen.getAllByText("Sync-window increment; not per-request.").length,
-    ).toBeGreaterThan(0);
+      screen.getByText("Some usage fields are partial or unavailable."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Sync-window increment; not per-request."),
+    ).toBeInTheDocument();
     expect(screen.queryByText(/HTTP requests/)).not.toBeInTheDocument();
 
     const zero = measure({
@@ -182,6 +194,7 @@ describe("SessionUsageSummary", () => {
       isLoading: false,
       isError: false,
     });
+    view.unmount();
     renderSummary("zero-session");
 
     expect(screen.getAllByText("$0.0000").length).toBeGreaterThan(0);
@@ -208,6 +221,11 @@ describe("SessionUsageSummary", () => {
     expect(screen.getByTestId("session-usage-total-tokens")).toHaveTextContent(
       "Unavailable",
     );
+    const detailsButton = screen.getByRole("button", { name: "Data details" });
+    fireEvent.click(detailsButton);
+    expect(
+      screen.getByText("Some usage fields are partial or unavailable."),
+    ).toBeInTheDocument();
   });
 
   it("does not retain the previous selection while the next query loads", () => {
