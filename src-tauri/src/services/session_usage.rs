@@ -83,7 +83,7 @@ pub fn sync_all_unlocked(db: &Database) -> SessionSyncResult {
     merge_sync_step(
         &mut result,
         "Codex",
-        crate::services::session_usage_codex::sync_codex_usage(db),
+        crate::services::session_usage_codex::sync_codex_usage_with_replay(db),
     );
     merge_sync_step(
         &mut result,

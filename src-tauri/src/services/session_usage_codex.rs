@@ -32,7 +32,7 @@ use crate::services::usage_stats::{
     find_model_pricing, has_suspected_codex_session_duplicate, should_skip_session_insert, DedupKey,
 };
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::fs;
@@ -44,13 +44,17 @@ use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
 };
 
 const CODEX_THREAD_REQUEST_ID_PREFIX: &str = "codex_session:thread-v1";
+const CODEX_REPLAY_STATE_KEY: &str = "codex_usage_canonical_replay_v1";
+const CODEX_REPLAY_PENDING: &str = "pending";
+const CODEX_REPLAYING: &str = "replaying";
+const CODEX_REPLAY_COMPLETE: &str = "complete";
 
 /// 累计 token 用量（跟踪 total_token_usage 字段）
 #[derive(Debug, Clone, Default)]
@@ -168,6 +172,23 @@ struct ParentTokenTimeline {
 }
 
 impl ParentTokenTimeline {
+    fn parent_file_is_stable_before_cutoff(parent_path: &Path, cutoff: DateTime<Utc>) -> bool {
+        let Ok(metadata) = fs::metadata(parent_path) else {
+            return false;
+        };
+        let Ok(modified) = metadata.modified() else {
+            return false;
+        };
+        let Ok(duration) = modified.duration_since(SystemTime::UNIX_EPOCH) else {
+            return false;
+        };
+        // A closed parent rollout whose file mtime predates the child fork is
+        // complete evidence, even when its last token snapshot happened much
+        // earlier.  Requiring a token at the exact fork time would otherwise
+        // leave historical forks deferred forever.
+        duration.as_secs() < cutoff.timestamp().max(0) as u64
+    }
+
     fn signatures_before(
         &self,
         parent_path: &Path,
@@ -182,6 +203,7 @@ impl ParentTokenTimeline {
         if self
             .max_timestamp
             .is_none_or(|timestamp| timestamp < cutoff)
+            && !Self::parent_file_is_stable_before_cutoff(parent_path, cutoff)
         {
             return Err(format!(
                 "父 rollout {} 尚未写到 child fork 时刻",
@@ -412,6 +434,122 @@ pub(crate) fn reset_codex_usage_on_conn(
         }
     }
     Ok(())
+}
+
+fn codex_replay_state_on_conn(conn: &Connection) -> Result<String, AppError> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        [CODEX_REPLAY_STATE_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map(|value| value.unwrap_or_else(|| CODEX_REPLAY_COMPLETE.to_string()))
+    .map_err(|error| AppError::Database(format!("读取 Codex 重放状态失败: {error}")))
+}
+
+fn set_codex_replay_state_on_conn(conn: &Connection, state: &str) -> Result<(), AppError> {
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+        rusqlite::params![CODEX_REPLAY_STATE_KEY, state],
+    )
+    .map_err(|error| AppError::Database(format!("写入 Codex 重放状态失败: {error}")))?;
+    Ok(())
+}
+
+pub(crate) fn codex_replay_in_progress_on_conn(conn: &Connection) -> bool {
+    codex_replay_state_on_conn(conn)
+        .map(|state| state == CODEX_REPLAYING)
+        .unwrap_or(false)
+}
+
+fn readable_codex_files(codex_dir: &Path) -> Result<Vec<PathBuf>, AppError> {
+    let files = collect_codex_session_files(codex_dir);
+    if files.is_empty() {
+        return Err(AppError::Config(
+            "没有找到可用于 Codex 用量重放的 rollout 文件".into(),
+        ));
+    }
+    for path in &files {
+        fs::File::open(path).map_err(|error| {
+            AppError::Config(format!(
+                "无法读取 Codex rollout {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(files)
+}
+
+fn reset_codex_usage_and_mark_replaying(db: &Database) -> Result<(), AppError> {
+    let codex_dir = get_codex_config_dir();
+    let conn = lock_conn!(db.conn);
+    conn.execute("SAVEPOINT reset_codex_usage_replay", [])
+        .map_err(|error| AppError::Database(format!("开启 Codex 重放事务失败: {error}")))?;
+    let result = (|| {
+        reset_codex_usage_on_conn(&conn, &codex_dir)?;
+        set_codex_replay_state_on_conn(&conn, CODEX_REPLAYING)
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute("RELEASE reset_codex_usage_replay", [])
+                .map_err(|error| AppError::Database(format!("提交 Codex 重放事务失败: {error}")))?;
+            drop(conn);
+            clear_codex_replay_caches();
+            Ok(())
+        }
+        Err(error) => {
+            conn.execute("ROLLBACK TO reset_codex_usage_replay", [])
+                .ok();
+            conn.execute("RELEASE reset_codex_usage_replay", []).ok();
+            Err(error)
+        }
+    }
+}
+
+fn mark_codex_replay_complete(db: &Database) -> Result<(), AppError> {
+    let conn = lock_conn!(db.conn);
+    set_codex_replay_state_on_conn(&conn, CODEX_REPLAY_COMPLETE)
+}
+
+fn codex_replay_state(db: &Database) -> Result<String, AppError> {
+    let conn = lock_conn!(db.conn);
+    codex_replay_state_on_conn(&conn)
+}
+
+fn finish_codex_replay_if_ready(db: &Database, result: &SessionSyncResult) -> Result<(), AppError> {
+    if result.files_scanned > 0 && result.errors.is_empty() && result.deferred_files == 0 {
+        mark_codex_replay_complete(db)?;
+    }
+    Ok(())
+}
+
+/// Sync Codex usage and perform a guarded one-time canonical replay when the
+/// schema migration requested it.
+pub fn sync_codex_usage_with_replay(db: &Database) -> Result<SessionSyncResult, AppError> {
+    let state = codex_replay_state(db)?;
+    if state == CODEX_REPLAY_PENDING {
+        let codex_dir = get_codex_config_dir();
+        readable_codex_files(&codex_dir)?;
+        db.backup_database_file()?;
+        reset_codex_usage_and_mark_replaying(db)?;
+    }
+
+    let result = sync_codex_usage(db)?;
+    if state == CODEX_REPLAY_PENDING || state == CODEX_REPLAYING {
+        finish_codex_replay_if_ready(db, &result)?;
+    }
+    Ok(result)
+}
+
+/// Explicit manual rebuild shares the automatic replay state machine.
+pub fn rebuild_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
+    let codex_dir = get_codex_config_dir();
+    readable_codex_files(&codex_dir)?;
+    db.backup_database_file()?;
+    reset_codex_usage_and_mark_replaying(db)?;
+    let result = sync_codex_usage(db)?;
+    finish_codex_replay_if_ready(db, &result)?;
+    Ok(result)
 }
 
 impl Database {
@@ -2973,6 +3111,99 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn replay_source_missing_keeps_pending_data_intact() -> Result<(), AppError> {
+        let temp = tempdir().unwrap();
+        let previous_home = std::env::var_os("CC_SWITCH_TEST_HOME");
+        std::env::set_var("CC_SWITCH_TEST_HOME", temp.path());
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, input_tokens,
+                    output_tokens, cache_read_tokens, latency_ms, status_code,
+                    created_at, data_source
+                 ) VALUES ('pending-row', '_codex_session', 'codex', 'gpt-5.6-sol',
+                           10, 2, 0, 0, 200, 1, 'codex_session')",
+                [],
+            )?;
+            set_codex_replay_state_on_conn(&conn, CODEX_REPLAY_PENDING)?;
+        }
+
+        let error = sync_codex_usage_with_replay(&db).expect_err("missing source must block reset");
+        assert!(error.to_string().contains("没有找到可用于 Codex 用量重放"));
+        let conn = lock_conn!(db.conn);
+        let row_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM proxy_request_logs WHERE request_id = 'pending-row'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(row_count, 1);
+        assert_eq!(codex_replay_state_on_conn(&conn)?, CODEX_REPLAY_PENDING);
+        drop(conn);
+
+        match previous_home {
+            Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+            None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn replay_state_transitions_are_idempotent_and_partial_safe() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, input_tokens,
+                    output_tokens, cache_read_tokens, latency_ms, status_code,
+                    created_at, data_source
+                 ) VALUES ('replay-row', '_codex_session', 'codex', 'gpt-5.6-sol',
+                           10, 2, 0, 0, 200, 1, 'codex_session')",
+                [],
+            )?;
+            set_codex_replay_state_on_conn(&conn, CODEX_REPLAY_PENDING)?;
+        }
+
+        reset_codex_usage_and_mark_replaying(&db)?;
+        {
+            let conn = lock_conn!(db.conn);
+            let row_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'codex_session'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(row_count, 0);
+            assert_eq!(codex_replay_state_on_conn(&conn)?, CODEX_REPLAYING);
+        }
+
+        finish_codex_replay_if_ready(
+            &db,
+            &SessionSyncResult {
+                files_scanned: 1,
+                deferred_files: 1,
+                ..Default::default()
+            },
+        )?;
+        {
+            let conn = lock_conn!(db.conn);
+            assert_eq!(codex_replay_state_on_conn(&conn)?, CODEX_REPLAYING);
+        }
+        finish_codex_replay_if_ready(
+            &db,
+            &SessionSyncResult {
+                files_scanned: 1,
+                ..Default::default()
+            },
+        )?;
+        let conn = lock_conn!(db.conn);
+        assert_eq!(codex_replay_state_on_conn(&conn)?, CODEX_REPLAY_COMPLETE);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_thread_spawn_parent_strips_replay_and_keeps_live_usage() -> Result<(), AppError> {
         clear_codex_replay_caches();
         let db = Database::memory()?;
@@ -3036,7 +3267,7 @@ mod tests {
             &child,
             &[
                 session_meta_at(CHILD_A_ID, Some(PARENT_ID), None, "2026-07-10T03:00:05Z"),
-                token_count_at(100, 50, 10, "2026-07-10T03:00:06Z"),
+                token_count_at(200, 100, 20, "2026-07-10T03:00:06Z"),
                 token_count_at(300, 150, 30, "2026-07-10T03:00:07Z"),
                 token_count_at(450, 220, 45, "2026-07-10T03:00:08Z"),
             ],
@@ -3299,6 +3530,42 @@ mod tests {
             (result.imported, result.skipped, result.deferred),
             (1, 0, false)
         );
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_closed_parent_before_fork_can_align_child_prefix() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let parent = rollout_path(temp.path(), PARENT_ID);
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(CHILD_A_ID, Some(PARENT_ID), None, "2026-07-10T03:00:05Z"),
+                token_count_at(200, 100, 20, "2026-07-10T03:00:06Z"),
+            ],
+        );
+        let parent_file = fs::OpenOptions::new().write(true).open(&parent).unwrap();
+        let cutoff = "2026-07-10T03:00:05Z".parse::<DateTime<Utc>>().unwrap();
+        parent_file
+            .set_times(fs::FileTimes::new().set_modified(
+                SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs((cutoff.timestamp() - 1) as u64),
+            ))
+            .unwrap();
+
+        let result = sync_test_file(&db, &child, &[&parent, &child])?;
+        assert_eq!((result.imported, result.deferred), (1, false));
         Ok(())
     }
 

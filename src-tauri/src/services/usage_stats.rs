@@ -2120,6 +2120,28 @@ pub(crate) fn find_model_pricing(conn: &Connection, model_id: &str) -> Option<Mo
         })
 }
 
+/// Resolve a model using only the normalized candidate keys that are present
+/// verbatim in `model_pricing`.  Unlike `find_model_pricing`, this deliberately
+/// does not use prefix matching because query-time cost estimates must not
+/// silently apply one model's price to another model.
+pub(crate) fn find_exact_model_pricing(
+    conn: &Connection,
+    model_id: &str,
+) -> Option<(String, ModelPricing)> {
+    model_pricing_candidates(model_id)
+        .into_iter()
+        .find_map(|candidate| {
+            query_model_pricing_exact(conn, &candidate)
+                .ok()
+                .flatten()
+                .and_then(|(input, output, cache_read, cache_creation)| {
+                    ModelPricing::from_strings(&input, &output, &cache_read, &cache_creation)
+                        .ok()
+                        .map(|pricing| (candidate, pricing))
+                })
+        })
+}
+
 pub(crate) fn find_model_pricing_row(
     conn: &Connection,
     model_id: &str,

@@ -13,6 +13,8 @@ pub(crate) use crate::database::{
     AgentSessionUsageSnapshot,
 };
 use crate::error::AppError;
+use crate::services::sql_helpers::fresh_input_sql;
+use crate::services::usage_stats::find_exact_model_pricing;
 use chrono::{Local, TimeZone};
 use rusqlite::{params, Connection, OptionalExtension, ToSql};
 use rust_decimal::Decimal;
@@ -237,6 +239,30 @@ impl CapabilityStatus {
             Self::Supported => "supported",
             Self::Partial => "partial",
             Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Why a root with known descendants does not currently expose a descendant
+/// measure.  A bounded task query can distinguish an empty range from a
+/// source that failed to provide any usage, while the unbounded session query
+/// preserves the latter as unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DescendantUsageStatus {
+    Available,
+    NoActivityInRange,
+    Unavailable,
+    NotApplicable,
+}
+
+impl DescendantUsageStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::NoActivityInRange => "no_activity_in_range",
+            Self::Unavailable => "unavailable",
+            Self::NotApplicable => "not_applicable",
         }
     }
 }
@@ -1806,6 +1832,7 @@ pub struct AgentSessionUsageSummary {
     pub supports_descendants: bool,
     pub self_usage: Option<UsageMeasure>,
     pub descendant_usage: Option<UsageMeasure>,
+    pub descendant_usage_status: DescendantUsageStatus,
     pub total_usage: Option<UsageMeasure>,
     pub descendant_session_count: u32,
     pub precision: UsagePrecision,
@@ -1823,6 +1850,7 @@ pub struct AgentTaskUsageRow {
     pub root: Option<AgentSessionNodeView>,
     pub self_usage: Option<UsageMeasure>,
     pub descendant_usage: Option<UsageMeasure>,
+    pub descendant_usage_status: DescendantUsageStatus,
     pub total_usage: Option<UsageMeasure>,
     pub descendant_session_count: u32,
     pub precision: UsagePrecision,
@@ -2176,6 +2204,7 @@ fn summary_for_root(
     requested_session_id: &str,
     groups: Vec<UsageGroup>,
     supports_descendants: bool,
+    range: Option<&AgentUsageRange>,
 ) -> AgentSessionUsageSummary {
     let (self_usage, mut source_dimensions) =
         combine_measures(groups.iter().filter(|group| !group.is_descendant).cloned());
@@ -2203,6 +2232,15 @@ fn summary_for_root(
     } else {
         None
     };
+    let descendant_usage_status = if !supports_descendants || root.descendant_session_count == 0 {
+        DescendantUsageStatus::NotApplicable
+    } else if visible_descendant_usage.is_some() {
+        DescendantUsageStatus::Available
+    } else if range.is_some() {
+        DescendantUsageStatus::NoActivityInRange
+    } else {
+        DescendantUsageStatus::Unavailable
+    };
     let mut total_usage = match (&self_usage, visible_descendant_usage) {
         (Some(self_usage), Some(descendant_usage)) => Some(self_usage.combine(descendant_usage)),
         (Some(self_usage), None) => Some(self_usage.clone()),
@@ -2220,6 +2258,15 @@ fn summary_for_root(
             );
         }
     }
+    if descendant_usage_status == DescendantUsageStatus::Unavailable {
+        if let Some(total_usage) = total_usage.as_mut() {
+            total_usage.partial = true;
+            total_usage.total_cost_usd = None;
+            total_usage
+                .warnings
+                .push("descendant usage is unavailable; total is a known lower bound".into());
+        }
+    }
     let mut warnings = Vec::new();
     let root_resolved = requested_session_id != root.root_session_id;
     if root_resolved {
@@ -2230,6 +2277,9 @@ fn summary_for_root(
     }
     if !supports_descendants && root.descendant_session_count > 0 {
         warnings.push("source capability is self-only; descendants are not included".into());
+    }
+    if descendant_usage_status == DescendantUsageStatus::Unavailable {
+        warnings.push("descendant usage is unavailable in the selected range".into());
     }
     if total_usage.is_none() {
         warnings.push("usage is unavailable for this session in the selected range".into());
@@ -2264,6 +2314,7 @@ fn summary_for_root(
         } else {
             None
         },
+        descendant_usage_status,
         total_usage,
         descendant_session_count: if supports_descendants {
             root.descendant_session_count
@@ -2344,6 +2395,8 @@ fn query_usage_groups(
     } else {
         "0"
     };
+    let rollup_input_sql = fresh_input_sql("r");
+    let raw_input_sql = fresh_input_sql("l");
     let sql = format!(
         "WITH node_map AS (
              SELECT app_type, session_id,
@@ -2361,7 +2414,7 @@ fn query_usage_groups(
                     r.source_identity, r.profile_id, r.database_identity,
                     r.base_url_digest, r.billing_mode, r.task, r.source_version,
                     r.sync_window_start, r.sync_window_end,
-                    r.request_count, r.api_call_count, r.input_tokens,
+                    r.request_count, r.api_call_count, {rollup_input_sql} AS input_tokens,
                     r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens,
                     r.cache_write_tokens, r.reasoning_tokens, r.total_cost_usd,
                     r.cost_status, r.cost_source, r.cost_delta_kind, r.correction_state,
@@ -2386,8 +2439,8 @@ fn query_usage_groups(
                     1, NULL,
                     CASE WHEN COALESCE(l.data_source, 'proxy') IN
                                    ('session_log', 'codex_session', 'gemini_session')
-                                   AND l.input_tokens = 0
-                         THEN NULL ELSE l.input_tokens END,
+                         AND l.input_tokens = 0
+                         THEN NULL ELSE ({raw_input_sql}) END,
                     CASE WHEN COALESCE(l.data_source, 'proxy') IN
                                    ('session_log', 'codex_session', 'gemini_session')
                                    AND l.output_tokens = 0
@@ -2451,7 +2504,91 @@ fn query_usage_groups(
     let refs: Vec<&dyn ToSql> = params_vec.iter().map(|value| value.as_ref()).collect();
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(refs.as_slice(), usage_measure_from_group_row)?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+    let mut groups = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AppError::from)?;
+    let codex_replay_in_progress = app_type == "codex"
+        && crate::services::session_usage_codex::codex_replay_in_progress_on_conn(conn);
+    if codex_replay_in_progress {
+        for group in &mut groups {
+            group.measure.partial = true;
+            group
+                .measure
+                .warnings
+                .push("Codex 历史用量正在重放，当前结果尚未完成".into());
+            group.measure.total_cost_usd = None;
+            group.source_dimension.cost_status = Some("unavailable".into());
+            group.source_dimension.cost_source = Some("codex_replay".into());
+        }
+    } else {
+        enrich_codex_session_costs(conn, app_type, &mut groups);
+    }
+    Ok(groups)
+}
+
+/// Fill a query-time API-equivalent estimate for Codex session facts when the
+/// source did not report a billable dollar amount.  This intentionally does
+/// not write back to durable usage rows: changing the model-pricing table must
+/// affect the next read without a migration or a stale historical cache.
+fn enrich_codex_session_costs(conn: &Connection, app_type: &str, groups: &mut [UsageGroup]) {
+    if app_type != "codex" {
+        return;
+    }
+
+    for group in groups {
+        if group.measure.total_cost_usd.is_some()
+            || group.source_dimension.data_source != "codex_session"
+        {
+            continue;
+        }
+
+        let candidates = [
+            group.source_dimension.pricing_model.trim(),
+            group.source_dimension.model.trim(),
+            group.source_dimension.request_model.trim(),
+        ];
+        let pricing = candidates
+            .into_iter()
+            .filter(|model| !model.is_empty() && *model != "unknown")
+            .find_map(|model| find_exact_model_pricing(conn, model));
+
+        let Some((pricing_model, pricing)) = pricing else {
+            group.source_dimension.cost_status = Some("unavailable".into());
+            group.source_dimension.cost_source = Some("model_pricing".into());
+            continue;
+        };
+
+        let (Some(input), Some(output), Some(cache_read)) = (
+            group.measure.input_tokens,
+            group.measure.output_tokens,
+            group.measure.cache_read_tokens,
+        ) else {
+            group.source_dimension.cost_status = Some("unavailable".into());
+            group.source_dimension.cost_source = Some("model_pricing".into());
+            continue;
+        };
+
+        // Legacy and total Codex facts normalize input as source input minus
+        // cache reads, so the remainder is priced as regular input exactly
+        // once. Cache creation is an independent optional source component;
+        // when present it is priced separately without changing normalized
+        // input, and when absent it remains unknown rather than becoming zero.
+        let cache_creation = group.measure.cache_creation_tokens;
+
+        let million = Decimal::from(1_000_000i64);
+        let mut total = Decimal::from(input) * pricing.input_cost_per_million / million
+            + Decimal::from(output) * pricing.output_cost_per_million / million
+            + Decimal::from(cache_read) * pricing.cache_read_cost_per_million / million;
+        if let Some(cache_creation) = cache_creation {
+            total +=
+                Decimal::from(cache_creation) * pricing.cache_creation_cost_per_million / million;
+        }
+
+        group.measure.total_cost_usd = Some(total.to_string());
+        group.source_dimension.pricing_model = pricing_model.to_string();
+        group.source_dimension.cost_status = Some("estimated".into());
+        group.source_dimension.cost_source = Some("model_pricing".into());
+    }
 }
 
 fn append_root_metadata_filter(
@@ -2869,6 +3006,7 @@ pub fn get_agent_session_usage(
         request.session_id.trim(),
         groups,
         supports_descendants,
+        request.range.as_ref(),
     ))
 }
 
@@ -2936,6 +3074,7 @@ pub fn list_agent_task_usage(
                 .remove(&(root.app_type.clone(), root.root_session_id.clone()))
                 .unwrap_or_default(),
             supports_descendants,
+            filter.range.as_ref(),
         );
         items.push(AgentTaskUsageRow {
             app_type: summary.app_type,
@@ -2944,6 +3083,7 @@ pub fn list_agent_task_usage(
             root: summary.root,
             self_usage: summary.self_usage,
             descendant_usage: summary.descendant_usage,
+            descendant_usage_status: summary.descendant_usage_status,
             total_usage: summary.total_usage,
             descendant_session_count: summary.descendant_session_count,
             precision: summary.precision,
@@ -3014,6 +3154,62 @@ mod tests {
             first_event_at: Some(101),
             last_event_at: Some(199),
         }
+    }
+
+    fn codex_fact_fixture(
+        session_id: &str,
+        input_tokens: i64,
+        cache_read_tokens: i64,
+        output_tokens: i64,
+    ) -> NormalizedUsageRollupFact {
+        let mut fact = hermes_fact_fixture();
+        fact.app_type = "codex".into();
+        fact.session_id = session_id.into();
+        fact.provider_id = "_codex_session".into();
+        fact.model = "fixture-codex-model".into();
+        fact.request_model = fact.model.clone();
+        fact.pricing_model.clear();
+        fact.data_source = "codex_session".into();
+        fact.precision = UsagePrecision::SessionExact;
+        fact.time_semantics = TimeSemantics::EventTime;
+        fact.request_count_semantics = RequestCountSemantics::AgentCall;
+        fact.input_token_semantics = 0;
+        fact.source_identity.clear();
+        fact.profile_id.clear();
+        fact.database_identity.clear();
+        fact.base_url_digest.clear();
+        fact.billing_mode.clear();
+        fact.task.clear();
+        fact.source_version.clear();
+        fact.sync_window_start = 0;
+        fact.sync_window_end = 0;
+        fact.request_count = Some(1);
+        fact.api_call_count = None;
+        fact.input_tokens = Some(input_tokens);
+        fact.output_tokens = Some(output_tokens);
+        fact.cache_read_tokens = Some(cache_read_tokens);
+        fact.cache_creation_tokens = None;
+        fact.cache_write_tokens = None;
+        fact.reasoning_tokens = None;
+        fact.total_cost_usd = None;
+        fact.cost_status = None;
+        fact.cost_source = None;
+        fact.cost_delta_kind = None;
+        fact.correction_state = None;
+        fact
+    }
+
+    fn insert_fixture_pricing(db: &Database, model_id: &str) -> Result<(), AppError> {
+        let conn = crate::database::lock_conn!(db.conn);
+        conn.execute(
+            "INSERT OR REPLACE INTO model_pricing
+                (model_id, display_name, input_cost_per_million,
+                 output_cost_per_million, cache_read_cost_per_million,
+                 cache_creation_cost_per_million)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![model_id, "Fixture Codex", "2", "4", "0.5", "3"],
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -3693,6 +3889,212 @@ mod tests {
     }
 
     #[test]
+    fn query_codex_normalizes_legacy_input_and_estimates_missing_cost_once() -> Result<(), AppError>
+    {
+        let db = Database::memory()?;
+        write_agent_session_node(
+            &db,
+            &query_node("codex", "codex-root", "codex-root", SessionNodeKind::Root),
+        )?;
+        write_agent_session_node(
+            &db,
+            &query_node("codex", "codex-child", "codex-root", SessionNodeKind::Child),
+        )?;
+        write_agent_session_usage_rollup_fact(&db, &codex_fact_fixture("codex-root", 100, 40, 10))?;
+        write_agent_session_usage_rollup_fact(&db, &codex_fact_fixture("codex-child", 50, 10, 5))?;
+        insert_fixture_pricing(&db, "fixture-codex-model")?;
+
+        let summary = get_agent_session_usage(
+            &db,
+            &AgentSessionUsageRequest {
+                app_type: "codex".into(),
+                session_id: "codex-root".into(),
+                range: None,
+            },
+        )?;
+        let self_usage = summary.self_usage.as_ref().unwrap();
+        let descendant_usage = summary.descendant_usage.as_ref().unwrap();
+        let total_usage = summary.total_usage.as_ref().unwrap();
+        assert_eq!(self_usage.input_tokens, Some(60));
+        assert_eq!(descendant_usage.input_tokens, Some(40));
+        assert_eq!(total_usage.input_tokens, Some(100));
+        assert_eq!(total_usage.output_tokens, Some(15));
+        assert_eq!(total_usage.cache_read_tokens, Some(50));
+        assert_eq!(total_usage.cache_creation_tokens, None);
+        assert_eq!(total_usage.total_cost_usd.as_deref(), Some("0.000285"));
+        assert_eq!(
+            summary.source_dimensions[0].pricing_model,
+            "fixture-codex-model"
+        );
+        assert!(summary
+            .source_dimensions
+            .iter()
+            .all(|dimension| dimension.cost_status.as_deref() == Some("estimated")));
+        assert!(summary
+            .source_dimensions
+            .iter()
+            .all(|dimension| dimension.cost_source.as_deref() == Some("model_pricing")));
+        Ok(())
+    }
+
+    #[test]
+    fn descendant_usage_status_distinguishes_empty_range_from_unavailable() -> Result<(), AppError>
+    {
+        let db = Database::memory()?;
+        write_agent_session_node(
+            &db,
+            &query_node("codex", "status-root", "status-root", SessionNodeKind::Root),
+        )?;
+        write_agent_session_node(
+            &db,
+            &query_node(
+                "codex",
+                "status-child",
+                "status-root",
+                SessionNodeKind::Child,
+            ),
+        )?;
+        write_agent_session_usage_rollup_fact(
+            &db,
+            &codex_fact_fixture("status-root", 100, 20, 10),
+        )?;
+
+        let bounded = get_agent_session_usage(
+            &db,
+            &AgentSessionUsageRequest {
+                app_type: "codex".into(),
+                session_id: "status-root".into(),
+                range: Some(AgentUsageRange {
+                    start_at: Some(1),
+                    end_at: Some(2),
+                }),
+            },
+        )?;
+        assert_eq!(
+            bounded.descendant_usage_status,
+            DescendantUsageStatus::NoActivityInRange
+        );
+        assert!(bounded.descendant_usage.is_none());
+
+        let unbounded = get_agent_session_usage(
+            &db,
+            &AgentSessionUsageRequest {
+                app_type: "codex".into(),
+                session_id: "status-root".into(),
+                range: None,
+            },
+        )?;
+        assert_eq!(
+            unbounded.descendant_usage_status,
+            DescendantUsageStatus::Unavailable
+        );
+        let total = unbounded.total_usage.expect("self usage remains visible");
+        assert!(total.partial);
+        assert_eq!(total.total_cost_usd, None);
+        Ok(())
+    }
+
+    #[test]
+    fn query_codex_cost_estimate_stays_unavailable_for_missing_inputs_or_prices(
+    ) -> Result<(), AppError> {
+        let db = Database::memory()?;
+        insert_fixture_pricing(&db, "fixture-codex-model")?;
+
+        write_agent_session_node(
+            &db,
+            &query_node(
+                "codex",
+                "codex-no-price",
+                "codex-no-price",
+                SessionNodeKind::Root,
+            ),
+        )?;
+        let mut no_price = codex_fact_fixture("codex-no-price", 100, 20, 10);
+        no_price.model = "model-without-pricing".into();
+        no_price.request_model = no_price.model.clone();
+        write_agent_session_usage_rollup_fact(&db, &no_price)?;
+        let no_price_summary = get_agent_session_usage(
+            &db,
+            &AgentSessionUsageRequest {
+                app_type: "codex".into(),
+                session_id: "codex-no-price".into(),
+                range: None,
+            },
+        )?;
+        assert_eq!(no_price_summary.total_usage.unwrap().total_cost_usd, None);
+        assert_eq!(
+            no_price_summary.source_dimensions[0].cost_status.as_deref(),
+            Some("unavailable")
+        );
+
+        write_agent_session_node(
+            &db,
+            &query_node(
+                "codex",
+                "codex-missing-field",
+                "codex-missing-field",
+                SessionNodeKind::Root,
+            ),
+        )?;
+        let mut missing_field = codex_fact_fixture("codex-missing-field", 100, 20, 10);
+        missing_field.cache_read_tokens = None;
+        write_agent_session_usage_rollup_fact(&db, &missing_field)?;
+        let missing_summary = get_agent_session_usage(
+            &db,
+            &AgentSessionUsageRequest {
+                app_type: "codex".into(),
+                session_id: "codex-missing-field".into(),
+                range: None,
+            },
+        )?;
+        assert_eq!(missing_summary.total_usage.unwrap().total_cost_usd, None);
+        assert_eq!(
+            missing_summary.source_dimensions[0].cost_status.as_deref(),
+            Some("unavailable")
+        );
+
+        write_agent_session_node(
+            &db,
+            &query_node("codex", "codex-mixed", "codex-mixed", SessionNodeKind::Root),
+        )?;
+        write_agent_session_node(
+            &db,
+            &query_node(
+                "codex",
+                "codex-mixed-child",
+                "codex-mixed",
+                SessionNodeKind::Child,
+            ),
+        )?;
+        write_agent_session_usage_rollup_fact(
+            &db,
+            &codex_fact_fixture("codex-mixed", 100, 20, 10),
+        )?;
+        let mut unpriced_child = codex_fact_fixture("codex-mixed-child", 50, 10, 5);
+        unpriced_child.model = "another-unpriced-model".into();
+        unpriced_child.request_model = unpriced_child.model.clone();
+        write_agent_session_usage_rollup_fact(&db, &unpriced_child)?;
+        let mixed_summary = get_agent_session_usage(
+            &db,
+            &AgentSessionUsageRequest {
+                app_type: "codex".into(),
+                session_id: "codex-mixed".into(),
+                range: None,
+            },
+        )?;
+        assert_eq!(mixed_summary.total_usage.unwrap().total_cost_usd, None);
+        assert!(mixed_summary
+            .source_dimensions
+            .iter()
+            .any(|dimension| dimension.cost_status.as_deref() == Some("estimated")));
+        assert!(mixed_summary
+            .source_dimensions
+            .iter()
+            .any(|dimension| dimension.cost_status.as_deref() == Some("unavailable")));
+        Ok(())
+    }
+
+    #[test]
     fn query_100_descendants_returns_one_aggregate_not_child_rows() -> Result<(), AppError> {
         let db = Database::memory()?;
         write_agent_session_node(
@@ -4344,7 +4746,11 @@ mod tests {
             },
         )?;
         let usage = summary.total_usage.unwrap();
-        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(
+            usage.input_tokens,
+            Some(8),
+            "Gemini input is normalized to cache-miss input"
+        );
         assert_eq!(usage.output_tokens, Some(5));
         assert_eq!(usage.cache_read_tokens, Some(2));
         assert_eq!(usage.cache_creation_tokens, None);
@@ -4517,7 +4923,11 @@ mod tests {
         assert!(codex.partial);
 
         let gemini = query_usage("gemini", "raw-presence-gemini")?;
-        assert_eq!(gemini.input_tokens, Some(9));
+        assert_eq!(
+            gemini.input_tokens,
+            Some(7),
+            "Gemini input is normalized to cache-miss input"
+        );
         assert_eq!(gemini.output_tokens, None);
         assert_eq!(gemini.cache_read_tokens, Some(2));
         assert_eq!(gemini.cache_creation_tokens, None);
@@ -4582,4 +4992,5 @@ mod tests {
             .any(|warning| warning.contains("request_count semantics differ")));
         Ok(())
     }
+
 }

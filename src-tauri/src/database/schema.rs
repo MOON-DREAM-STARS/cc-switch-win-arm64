@@ -705,6 +705,11 @@ impl Database {
                         Self::migrate_v19_to_v20(conn)?;
                         Self::set_user_version(conn, 20)?;
                     }
+                    20 => {
+                        log::info!("迁移数据库从 v20 到 v21（标记 Codex 会话用量规范化重放）");
+                        Self::migrate_v20_to_v21(conn)?;
+                        Self::set_user_version(conn, 21)?;
+                    }
                     _ => {
                         return Err(AppError::Database(format!(
                             "未知的数据库版本 {version}，无法迁移到 {SCHEMA_VERSION}"
@@ -2021,6 +2026,64 @@ impl Database {
             [],
         )
         .map_err(|e| AppError::Database(format!("v19 -> v20 创建会话日期索引失败: {e}")))?;
+        Ok(())
+    }
+
+    /// v20 -> v21：旧版本可能已经把 Codex rollout cursor 推进到文件末尾，
+    /// 但没有写入长期会话规范化事实。只设置一次性重放标记，实际备份、清理
+    /// 和导入由启动同步在 session-sync mutex 下执行，避免迁移阶段留下空数据。
+    fn migrate_v20_to_v21(conn: &Connection) -> Result<(), AppError> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("补齐 settings 表失败: {e}")))?;
+        let has_codex_rows: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM proxy_request_logs WHERE data_source = 'codex_session'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        let has_codex_rollups: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM agent_session_usage_rollups
+                    WHERE app_type = 'codex'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        let has_codex_cursor: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM session_log_sync
+                    WHERE file_path LIKE '%/sessions/%/rollout-%'
+                       OR file_path LIKE '%\\sessions\\%\\rollout-%'
+                       OR file_path LIKE '%/archived_sessions/rollout-%'
+                       OR file_path LIKE '%\\archived_sessions\\rollout-%'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        let state = if has_codex_rows || has_codex_rollups || has_codex_cursor {
+            "pending"
+        } else {
+            "complete"
+        };
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value)
+             VALUES ('codex_usage_canonical_replay_v1', ?1)",
+            [state],
+        )
+        .map_err(|e| AppError::Database(format!("写入 Codex 重放状态失败: {e}")))?;
         Ok(())
     }
 
@@ -4255,6 +4318,63 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(legacy_cache_creation, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v20_to_v21_marks_codex_replay_only_when_history_exists() -> Result<(), AppError> {
+        let fresh = Connection::open_in_memory()?;
+        Database::create_tables_on_conn(&fresh)?;
+        Database::set_user_version(&fresh, 20)?;
+        Database::apply_schema_migrations_on_conn(&fresh)?;
+        assert_eq!(
+            fresh.query_row(
+                "SELECT value FROM settings WHERE key = 'codex_usage_canonical_replay_v1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "complete"
+        );
+
+        let legacy = Connection::open_in_memory()?;
+        Database::create_tables_on_conn(&legacy)?;
+        legacy.execute(
+            "INSERT INTO proxy_request_logs
+                (request_id, provider_id, app_type, model, latency_ms,
+                 status_code, created_at, data_source)
+             VALUES ('codex-legacy-row', '_codex_session', 'codex', 'gpt-5.6-sol',
+                     0, 200, 1, 'codex_session')",
+            [],
+        )?;
+        Database::set_user_version(&legacy, 20)?;
+        Database::apply_schema_migrations_on_conn(&legacy)?;
+        assert_eq!(
+            legacy.query_row(
+                "SELECT value FROM settings WHERE key = 'codex_usage_canonical_replay_v1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "pending"
+        );
+
+        let cursor_only = Connection::open_in_memory()?;
+        Database::create_tables_on_conn(&cursor_only)?;
+        cursor_only.execute(
+            "INSERT INTO session_log_sync
+                (file_path, last_modified, last_line_offset, last_synced_at)
+             VALUES (?1, 1, 1, 1)",
+            [r"C:\Users\admin\.codex\sessions\2026\08\rollout-2026-08-15T00-00-00-00000000-0000-4000-8000-000000000001.jsonl"],
+        )?;
+        Database::set_user_version(&cursor_only, 20)?;
+        Database::apply_schema_migrations_on_conn(&cursor_only)?;
+        assert_eq!(
+            cursor_only.query_row(
+                "SELECT value FROM settings WHERE key = 'codex_usage_canonical_replay_v1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "pending"
+        );
         Ok(())
     }
 }
