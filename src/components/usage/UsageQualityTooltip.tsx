@@ -99,7 +99,7 @@ export function UsageQualityTooltip(props: UsageQualityTooltipProps) {
           side="bottom"
           align="end"
           collisionPadding={12}
-          className="max-w-[320px] whitespace-normal text-left"
+          className="w-max max-w-[min(320px,calc(100vw-2rem))] whitespace-normal break-words text-left"
         >
           <div className="space-y-1">
             {messages.map((message) => (
