@@ -11,6 +11,7 @@ import { SessionUsageSummary } from "@/components/sessions/SessionUsageSummary";
 import type {
   AgentSessionUsageSummary,
   AgentUsageMeasure,
+  AgentUsageSourceDimension,
 } from "@/types/usage";
 
 const useAgentSessionUsageMock = vi.hoisted(() => vi.fn());
@@ -77,6 +78,35 @@ const measure = (
   ...overrides,
 });
 
+const sourceDimension = (
+  overrides: Partial<AgentUsageSourceDimension> = {},
+): AgentUsageSourceDimension => ({
+  providerId: "_codex_session",
+  model: "fixture-codex-model",
+  requestModel: "fixture-codex-model",
+  pricingModel: "fixture-codex-model",
+  dataSource: "codex_session",
+  inputTokenSemantics: 0,
+  sourceIdentity: "",
+  profileId: "",
+  databaseIdentity: "",
+  baseUrlDigest: "",
+  billingMode: "",
+  task: "",
+  sourceVersion: "",
+  syncWindowStart: 0,
+  syncWindowEnd: 0,
+  apiCallCount: null,
+  cacheWriteTokens: null,
+  reasoningTokens: null,
+  costStatus: "estimated",
+  costSource: "model_pricing",
+  costDeltaKind: null,
+  correctionState: null,
+  rangePartial: false,
+  ...overrides,
+});
+
 const summary = (
   overrides: Partial<AgentSessionUsageSummary> = {},
 ): AgentSessionUsageSummary => {
@@ -91,6 +121,7 @@ const summary = (
     supportsDescendants: false,
     selfUsage,
     descendantUsage: null,
+    descendantUsageStatus: "not_applicable",
     totalUsage: selfUsage,
     descendantSessionCount: 0,
     precision: selfUsage.precision,
@@ -198,6 +229,98 @@ describe("SessionUsageSummary", () => {
     expect(screen.queryByText("All descendants")).not.toBeInTheDocument();
   });
 
+  it("explains a descendant range with no activity without fabricating zero usage", () => {
+    const selfUsage = measure({ inputTokens: 12, outputTokens: 4 });
+    useAgentSessionUsageMock.mockReturnValue({
+      data: summary({
+        supportsDescendants: true,
+        selfUsage,
+        totalUsage: selfUsage,
+        descendantUsage: null,
+        descendantUsageStatus: "no_activity_in_range",
+        descendantSessionCount: 147,
+      }),
+      isLoading: false,
+      isError: false,
+    });
+
+    renderSummary("range-empty-session");
+
+    expect(screen.getByText("All descendants (147)")).toBeInTheDocument();
+    expect(
+      screen.getByText("No descendant activity in the selected time range"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Usage unavailable")).not.toBeInTheDocument();
+    expect(screen.queryByText("0")).not.toBeInTheDocument();
+  });
+
+  it("marks estimated session costs with the same API-equivalent tooltip", async () => {
+    const totalUsage = measure({ totalCostUsd: "0.01" });
+    useAgentSessionUsageMock.mockReturnValue({
+      data: summary({
+        selfUsage: totalUsage,
+        totalUsage,
+        sourceDimensions: [sourceDimension()],
+      }),
+      isLoading: false,
+      isError: false,
+    });
+
+    renderSummary();
+
+    expect(screen.getAllByText("≈$0.0100").length).toBeGreaterThan(0);
+    const costTrigger = screen.getAllByLabelText(
+      /API-equivalent estimate from current model pricing/,
+    )[0];
+    fireEvent.focus(costTrigger);
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(
+          "API-equivalent estimate from current model pricing; not a Codex subscription bill.",
+        ).length,
+      ).toBeGreaterThan(0),
+    );
+  });
+
+  it("explains that Codex costs are withheld while canonical replay is running", async () => {
+    const replaying = measure({ totalCostUsd: null, partial: true });
+    useAgentSessionUsageMock.mockReturnValue({
+      data: summary({
+        selfUsage: replaying,
+        totalUsage: replaying,
+        partial: true,
+        sourceDimensions: [
+          sourceDimension({
+            costStatus: "unavailable",
+            costSource: "codex_replay",
+          }),
+        ],
+      }),
+      isLoading: false,
+      isError: false,
+    });
+
+    renderSummary("replaying-session");
+
+    expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0);
+    expect(
+      screen.queryByText(
+        "Codex history is still being replayed; cost will appear when replay completes.",
+      ),
+    ).not.toBeInTheDocument();
+    const warning = screen.getByRole("img", {
+      name: /Codex history is still being replayed/,
+    });
+    fireEvent.focus(warning);
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(
+          "Codex history is still being replayed; cost will appear when replay completes.",
+        ).length,
+      ).toBeGreaterThan(0),
+    );
+  });
+
   it("collapses usage details in a compact detail card and expands them on demand", async () => {
     const detailContainer = createDetailContainerRef(800, 700);
     const selfUsage = measure({ inputTokens: 10, outputTokens: 5 });
@@ -283,7 +406,7 @@ describe("SessionUsageSummary", () => {
     expect(screen.queryByText("This task")).not.toBeInTheDocument();
   });
 
-  it("keeps unavailable and partial values distinct from explicit zero and marks sync windows", () => {
+  it("keeps unavailable and partial values distinct from explicit zero and marks sync windows", async () => {
     const partialSyncMeasure = measure({
       requestCount: null,
       inputTokens: 12,
@@ -314,15 +437,25 @@ describe("SessionUsageSummary", () => {
     expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0);
     expect(screen.queryByText("Partial")).not.toBeInTheDocument();
     expect(screen.queryByText("Sync-window delta")).not.toBeInTheDocument();
-    const detailsButton = screen.getByRole("button", { name: "Data details" });
-    expect(detailsButton).toBeInTheDocument();
-    fireEvent.click(detailsButton);
     expect(
-      screen.getByText("Some usage fields are partial or unavailable."),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: "Data details" }),
+    ).not.toBeInTheDocument();
     expect(
-      screen.getByText("Sync-window increment; not per-request."),
-    ).toBeInTheDocument();
+      screen.queryByText("Some usage fields are partial or unavailable."),
+    ).not.toBeInTheDocument();
+    const warning = screen.getByRole("img", {
+      name: /Some usage fields are partial or unavailable\./,
+    });
+    fireEvent.focus(warning);
+    await waitFor(() =>
+      expect(
+        screen.getAllByText("Some usage fields are partial or unavailable.")
+          .length,
+      ).toBeGreaterThan(0),
+    );
+    expect(
+      screen.getAllByText("Sync-window increment; not per-request.").length,
+    ).toBeGreaterThan(0);
     expect(screen.queryByText(/HTTP requests/)).not.toBeInTheDocument();
 
     const zero = measure({
@@ -345,7 +478,7 @@ describe("SessionUsageSummary", () => {
     expect(screen.getAllByText("0").length).toBeGreaterThan(0);
   });
 
-  it("keeps the total unavailable when every token component is unknown", () => {
+  it("keeps the total unavailable when every token component is unknown", async () => {
     const unknown = measure({
       inputTokens: null,
       outputTokens: null,
@@ -365,11 +498,23 @@ describe("SessionUsageSummary", () => {
     expect(screen.getByTestId("session-usage-total-tokens")).toHaveTextContent(
       "Unavailable",
     );
-    const detailsButton = screen.getByRole("button", { name: "Data details" });
-    fireEvent.click(detailsButton);
     expect(
-      screen.getByText("Some usage fields are partial or unavailable."),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: "Data details" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Some usage fields are partial or unavailable."),
+    ).not.toBeInTheDocument();
+    fireEvent.focus(
+      screen.getByRole("img", {
+        name: /Some usage fields are partial or unavailable\./,
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getAllByText("Some usage fields are partial or unavailable.")
+          .length,
+      ).toBeGreaterThan(0),
+    );
   });
 
   it("does not retain the previous selection while the next query loads", () => {

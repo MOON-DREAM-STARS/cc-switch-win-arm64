@@ -12,6 +12,7 @@ import type {
   AgentTaskUsageRow,
   AgentUsageCapability,
   AgentUsageMeasure,
+  AgentUsageSourceDimension,
 } from "@/types/usage";
 
 const useAgentTaskUsageMock = vi.hoisted(() => vi.fn());
@@ -58,6 +59,35 @@ const measure = (
   ...overrides,
 });
 
+const sourceDimension = (
+  overrides: Partial<AgentUsageSourceDimension> = {},
+): AgentUsageSourceDimension => ({
+  providerId: "_codex_session",
+  model: "fixture-codex-model",
+  requestModel: "fixture-codex-model",
+  pricingModel: "fixture-codex-model",
+  dataSource: "codex_session",
+  inputTokenSemantics: 0,
+  sourceIdentity: "",
+  profileId: "",
+  databaseIdentity: "",
+  baseUrlDigest: "",
+  billingMode: "",
+  task: "",
+  sourceVersion: "",
+  syncWindowStart: 0,
+  syncWindowEnd: 0,
+  apiCallCount: null,
+  cacheWriteTokens: null,
+  reasoningTokens: null,
+  costStatus: "estimated",
+  costSource: "model_pricing",
+  costDeltaKind: null,
+  correctionState: null,
+  rangePartial: false,
+  ...overrides,
+});
+
 const row = (
   overrides: Partial<AgentTaskUsageRow> = {},
 ): AgentTaskUsageRow => ({
@@ -80,6 +110,7 @@ const row = (
   },
   selfUsage: measure(),
   descendantUsage: null,
+  descendantUsageStatus: "not_applicable",
   totalUsage: measure(),
   descendantSessionCount: 0,
   precision: "request_exact",
@@ -209,7 +240,7 @@ describe("TaskUsageTable", () => {
     fireEvent.click(screen.getByRole("combobox", { name: "Task title" }));
     fireEvent.click(screen.getByText("Build title"));
     fireEvent.click(screen.getByRole("combobox", { name: "Project" }));
-    fireEvent.click(screen.getByText("/workspace/cc-switch", { exact: true }));
+    fireEvent.click(screen.getByText("cc-switch", { exact: true }));
 
     await waitFor(() =>
       expect(lastFilter()).toMatchObject({
@@ -254,7 +285,9 @@ describe("TaskUsageTable", () => {
       <TaskUsageTable range={{ preset: "today" }} refreshIntervalMs={0} />,
     );
 
-    expect(screen.getByText("Task title not provided · missing-")).toBeInTheDocument();
+    expect(
+      screen.getByText("Task title not provided · missing-"),
+    ).toBeInTheDocument();
     expect(
       screen.queryByText("missing-title-session", { exact: true }),
     ).not.toBeInTheDocument();
@@ -272,7 +305,7 @@ describe("TaskUsageTable", () => {
     fireEvent.click(screen.getByRole("combobox", { name: "Task title" }));
     fireEvent.click(screen.getByText("Build title"));
     fireEvent.click(screen.getByRole("combobox", { name: "Project" }));
-    fireEvent.click(screen.getByText("/workspace/cc-switch", { exact: true }));
+    fireEvent.click(screen.getByText("cc-switch", { exact: true }));
 
     fireEvent.change(screen.getByLabelText("Agent"), {
       target: { value: "codex" },
@@ -287,9 +320,9 @@ describe("TaskUsageTable", () => {
     expect(
       screen.getByRole("combobox", { name: "Task title" }),
     ).toHaveTextContent("Select task title");
-    expect(
-      screen.getByRole("combobox", { name: "Project" }),
-    ).toHaveTextContent("Select project");
+    expect(screen.getByRole("combobox", { name: "Project" })).toHaveTextContent(
+      "Select project",
+    );
 
     view.rerender(
       <TaskUsageTable
@@ -329,12 +362,17 @@ describe("TaskUsageTable", () => {
       expect(screen.getByTestId("task-usage-cards")).toBeInTheDocument(),
     );
     expect(screen.getByTitle(longTitle)).toBeInTheDocument();
-    expect(screen.getByText("path", { exact: true })).toBeInTheDocument();
-    expect(screen.getByTitle(longProject)).toBeInTheDocument();
+    expect(
+      screen.getByText("Claude Code - path", { exact: true }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(longProject, { exact: true }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByTitle(longProject)).not.toBeInTheDocument();
     expect(screen.getAllByTestId(/^task-row-/)).toHaveLength(1);
   });
 
-  it("uses the four-column table only when the container is wide enough", async () => {
+  it("uses the compressed three-column table only when the container is wide enough", async () => {
     const restoreWidth = setContainerWidth(1400);
     const view = render(
       <TaskUsageTable range={{ preset: "today" }} refreshIntervalMs={0} />,
@@ -346,13 +384,41 @@ describe("TaskUsageTable", () => {
     expect(screen.queryByTestId("task-usage-cards")).not.toBeInTheDocument();
     const table = within(screen.getByTestId("task-usage-table"));
     expect(table.getByText("Task")).toBeInTheDocument();
-    expect(table.getByText("Project")).toBeInTheDocument();
+    expect(table.queryByText("Project")).not.toBeInTheDocument();
     expect(table.getByText("Derived total")).toBeInTheDocument();
     expect(table.getByText("Count")).toBeInTheDocument();
+    expect(table.getAllByRole("columnheader")).toHaveLength(3);
     expect(screen.queryByText("Data status")).not.toBeInTheDocument();
     expect(screen.queryByText("Request-exact")).not.toBeInTheDocument();
     view.unmount();
     restoreWidth();
+  });
+
+  it("marks estimated task costs with an approximation sign and tooltip", async () => {
+    installQueryResult([
+      row({
+        appType: "codex",
+        sourceDimensions: [sourceDimension()],
+        totalUsage: measure({ totalCostUsd: "0.0023" }),
+      }),
+    ]);
+
+    render(
+      <TaskUsageTable range={{ preset: "today" }} refreshIntervalMs={0} />,
+    );
+
+    expect(screen.getByText("≈$0.0023")).toBeInTheDocument();
+    const costTrigger = screen.getAllByLabelText(
+      /API-equivalent estimate from current model pricing/,
+    )[0];
+    fireEvent.focus(costTrigger);
+    await waitFor(() =>
+      expect(
+        screen.getAllByText(
+          "API-equivalent estimate from current model pricing; not a Codex subscription bill.",
+        ).length,
+      ).toBeGreaterThan(0),
+    );
   });
 
   it("keeps one root row for a 100-child aggregate and expands only the compact breakdown", () => {
@@ -391,7 +457,29 @@ describe("TaskUsageTable", () => {
     expect(screen.queryByText("Request-exact")).not.toBeInTheDocument();
   });
 
-  it("keeps partial, sync-window and unavailable semantics truthful", () => {
+  it("explains descendants with no activity in the selected range", () => {
+    installQueryResult([
+      row({
+        descendantSessionCount: 147,
+        descendantUsageStatus: "no_activity_in_range",
+        descendantUsage: null,
+      }),
+    ]);
+
+    render(
+      <TaskUsageTable range={{ preset: "today" }} refreshIntervalMs={0} />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Self \/ descendants/ }),
+    );
+    expect(
+      screen.getByText("No descendant activity in the selected time range"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Usage unavailable")).not.toBeInTheDocument();
+  });
+
+  it("keeps partial, sync-window and unavailable semantics truthful", async () => {
     const partial = row({
       sessionId: "partial",
       rootSessionId: "partial",
@@ -483,18 +571,29 @@ describe("TaskUsageTable", () => {
     expect(screen.queryByText(/Sync-window delta/)).not.toBeInTheDocument();
     expect(screen.queryByText("Partial")).not.toBeInTheDocument();
     expect(screen.queryByText("Request-exact")).not.toBeInTheDocument();
-    const detailsButtons = screen.getAllByRole("button", {
-      name: "Data details",
+    const partialWarning = screen.getAllByRole("img", {
+      name: /Some usage fields are partial or unavailable\./,
     });
-    expect(detailsButtons).toHaveLength(3);
-    detailsButtons.forEach((button) => fireEvent.click(button));
+    expect(partialWarning).toHaveLength(3);
     expect(
-      screen.getAllByText("Some usage fields are partial or unavailable.")
-        .length,
-    ).toBeGreaterThan(0);
-    expect(
-      screen.getByText("Sync-window increment; not per-request."),
-    ).toBeInTheDocument();
+      screen.queryByText("Some usage fields are partial or unavailable."),
+    ).not.toBeInTheDocument();
+    fireEvent.focus(partialWarning[0]);
+    await waitFor(() =>
+      expect(
+        screen.getAllByText("Some usage fields are partial or unavailable.")
+          .length,
+      ).toBeGreaterThan(0),
+    );
+    const syncWarning = screen.getByRole("img", {
+      name: /Sync-window increment; not per-request\./,
+    });
+    fireEvent.focus(syncWarning);
+    await waitFor(() =>
+      expect(
+        screen.getAllByText("Sync-window increment; not per-request.").length,
+      ).toBeGreaterThan(0),
+    );
     expect(screen.getAllByText(/Count unavailable/).length).toBeGreaterThan(0);
     expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0);
     expect(screen.queryByText("HTTP requests")).not.toBeInTheDocument();

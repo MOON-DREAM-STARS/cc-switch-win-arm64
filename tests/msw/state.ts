@@ -315,6 +315,10 @@ const fixtureSummary = (
   supportsDescendants: options.supportsDescendants ?? false,
   selfUsage: measure,
   descendantUsage: null,
+  descendantUsageStatus:
+    options.descendantSessionCount && options.descendantSessionCount > 0
+      ? "unavailable"
+      : "not_applicable",
   totalUsage: measure,
   descendantSessionCount: options.descendantSessionCount ?? 0,
   precision: measure?.precision ?? "unavailable",
@@ -470,6 +474,7 @@ const createDefaultAgentUsageFixtures = (): AgentUsageFixtureState => {
     root: summary.root,
     selfUsage: summary.selfUsage,
     descendantUsage: summary.descendantUsage,
+    descendantUsageStatus: summary.descendantUsageStatus,
     totalUsage: summary.totalUsage,
     descendantSessionCount: summary.descendantSessionCount,
     precision: summary.precision,
@@ -791,6 +796,7 @@ export const getAgentSessionUsageFixture = (
     supportsDescendants: false,
     selfUsage: null,
     descendantUsage: null,
+    descendantUsageStatus: "not_applicable",
     totalUsage: null,
     descendantSessionCount: 0,
     precision: "unavailable",
