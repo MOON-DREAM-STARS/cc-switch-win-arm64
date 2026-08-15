@@ -1867,6 +1867,10 @@ pub struct AgentTaskUsagePage {
     pub limit: u32,
     pub offset: u32,
     pub has_more: bool,
+    /// Codex proxy requests which are not covered by a verifiable native
+    /// session event. This is a summary, not an additional task row.
+    #[serde(default)]
+    pub unattributed_usage: Option<UsageMeasure>,
 }
 
 #[derive(Debug, Clone)]
@@ -2817,6 +2821,113 @@ fn query_task_roots(
     Ok((roots, total_count.max(0) as u64))
 }
 
+fn query_unattributed_codex_usage(
+    conn: &Connection,
+    filter: &AgentTaskUsageFilter,
+) -> Result<Option<UsageMeasure>, AppError> {
+    let app_filter = filter
+        .app_type
+        .as_deref()
+        .map(canonical_query_app_type)
+        .transpose()?;
+    if app_filter.as_deref().is_some_and(|app| app != "codex") {
+        return Ok(None);
+    }
+    let has_text_filter = [
+        filter.title.as_deref(),
+        filter.project.as_deref(),
+        filter.project_dir.as_deref(),
+        filter.title_exact.as_deref(),
+        filter.project_dir_exact.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| !value.trim().is_empty());
+    if has_text_filter {
+        return Ok(None);
+    }
+
+    let range = filter.range.clone().unwrap_or_default();
+    range.validate()?;
+    let mut conditions = vec![
+        "COALESCE(l.data_source, 'proxy') = 'proxy'".to_string(),
+        "l.app_type = 'codex'".to_string(),
+        "NOT EXISTS (
+            SELECT 1 FROM agent_session_canonical_coverage coverage
+            WHERE coverage.app_type = 'codex'
+              AND coverage.data_source = 'proxy'
+              AND coverage.request_id = l.request_id
+        )".to_string(),
+    ];
+    let mut params_vec: Vec<Box<dyn ToSql>> = Vec::new();
+    if let Some(start_at) = range.start_at {
+        conditions.push("l.created_at >= ?".into());
+        params_vec.push(Box::new(start_at));
+    }
+    if let Some(end_at) = range.end_at {
+        conditions.push("l.created_at <= ?".into());
+        params_vec.push(Box::new(end_at));
+    }
+    let fresh_input = fresh_input_sql("l");
+    let sql = format!(
+        "SELECT COUNT(*) AS request_count,
+                CASE WHEN COUNT(l.input_tokens) = COUNT(*) THEN SUM({fresh_input}) END,
+                CASE WHEN COUNT(l.output_tokens) = COUNT(*) THEN SUM(l.output_tokens) END,
+                CASE WHEN COUNT(l.cache_read_tokens) = COUNT(*) THEN SUM(l.cache_read_tokens) END,
+                CASE WHEN COUNT(l.cache_creation_tokens) = COUNT(*)
+                     THEN SUM(l.cache_creation_tokens) END,
+                CASE WHEN COUNT(l.total_cost_usd) = COUNT(*)
+                     THEN CAST(SUM(CAST(l.total_cost_usd AS REAL)) AS TEXT) END
+         FROM proxy_request_logs l
+         WHERE {}",
+        conditions.join(" AND ")
+    );
+    let refs: Vec<&dyn ToSql> = params_vec.iter().map(|value| value.as_ref()).collect();
+    let (request_count, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost): (
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+    ) = conn.query_row(&sql, refs.as_slice(), |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+        ))
+    })?;
+    if request_count == 0 {
+        return Ok(None);
+    }
+    let mut warnings = Vec::new();
+    let partial = input_tokens.is_none()
+        || output_tokens.is_none()
+        || cache_read_tokens.is_none()
+        || cache_creation_tokens.is_none()
+        || cost.is_none();
+    if partial {
+        warnings.push("unattributed Codex proxy usage has missing fields".to_string());
+    }
+    Ok(Some(UsageMeasure {
+        data_source: Some("proxy".to_string()),
+        request_count: Some(request_count),
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        total_cost_usd: cost,
+        precision: UsagePrecision::RequestExact,
+        time_semantics: TimeSemantics::EventTime,
+        request_count_semantics: RequestCountSemantics::HttpRequest,
+        partial,
+        warnings,
+    }))
+}
+
 /// Query every root/standalone task in the selected Agent/date scope and
 /// return the native metadata dimensions used by the task-statistics
 /// comboboxes. This deliberately has no pagination: deriving options from a
@@ -3024,6 +3135,7 @@ pub fn list_agent_task_usage(
     let (limit, offset) = filter.normalized_page();
     let conn = crate::database::lock_conn!(db.conn);
     let (roots, total) = query_task_roots(&conn, filter)?;
+    let unattributed_usage = query_unattributed_codex_usage(&conn, filter)?;
     let root_ids: Vec<String> = roots
         .iter()
         .map(|root| root.root_session_id.clone())
@@ -3100,6 +3212,7 @@ pub fn list_agent_task_usage(
         limit,
         offset,
         has_more: (offset as u64).saturating_add(limit as u64) < total,
+        unattributed_usage,
     })
 }
 
@@ -5073,6 +5186,73 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("request_count semantics differ")));
+        Ok(())
+    }
+
+    #[test]
+    fn task_page_reports_only_uncovered_codex_proxy_usage_as_unattributed() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, request_model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    input_token_semantics, total_cost_usd, latency_ms, status_code,
+                    created_at, data_source
+                 ) VALUES ('unclaimed-proxy', 'openai', 'codex', 'gpt-5.6-sol',
+                           'gpt-5.6-sol', 100, 20, 30, 0, 1, '1.50', 0, 200, 150, 'proxy')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, request_model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    input_token_semantics, total_cost_usd, latency_ms, status_code,
+                    created_at, data_source
+                 ) VALUES ('claimed-proxy', 'openai', 'codex', 'gpt-5.6-sol',
+                           'gpt-5.6-sol', 50, 10, 5, 0, 1, '0.50', 0, 200, 160, 'proxy')",
+                [],
+            )?;
+            Database::upsert_agent_session_canonical_coverage_on_conn(
+                &conn,
+                &crate::database::AgentSessionCanonicalCoverageMarker {
+                    app_type: "codex".into(),
+                    data_source: "proxy".into(),
+                    request_id: "claimed-proxy".into(),
+                    canonical_session_id: Some("native-session".into()),
+                    marked_at: 160,
+                },
+            )?;
+        }
+        let filter = AgentTaskUsageFilter {
+            app_type: Some("codex".into()),
+            range: Some(AgentUsageRange {
+                start_at: Some(100),
+                end_at: Some(200),
+            }),
+            ..Default::default()
+        };
+        let page = list_agent_task_usage(&db, &filter)?;
+        assert!(page.items.is_empty());
+        let usage = page.unattributed_usage.expect("unclaimed proxy summary");
+        assert_eq!(usage.request_count, Some(1));
+        assert_eq!(usage.input_tokens, Some(70));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.cache_read_tokens, Some(30));
+        assert_eq!(usage.cache_creation_tokens, Some(0));
+        assert_eq!(usage.total_tokens(), Some(120));
+        assert_eq!(usage.total_cost_usd.as_deref(), Some("1.5"));
+        assert!(!usage.partial);
+
+        let filtered_page = list_agent_task_usage(
+            &db,
+            &AgentTaskUsageFilter {
+                title_exact: Some("a native task".into()),
+                ..filter
+            },
+        )?;
+        assert!(filtered_page.unattributed_usage.is_none());
         Ok(())
     }
 

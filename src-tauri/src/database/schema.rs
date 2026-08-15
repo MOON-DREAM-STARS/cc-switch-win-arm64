@@ -2078,7 +2078,22 @@ impl Database {
                 |row| row.get(0),
             )
             .unwrap_or(false);
-        let state = if has_codex_rows || has_codex_rollups || has_codex_cursor {
+        let legacy_replay_incomplete: bool = conn
+            .query_row(
+                "SELECT COALESCE(
+                    (SELECT value <> 'complete'
+                     FROM settings
+                     WHERE key = 'codex_usage_canonical_replay_v1'), 0
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        let state = if has_codex_rows
+            || has_codex_rollups
+            || has_codex_cursor
+            || legacy_replay_incomplete
+        {
             "pending"
         } else {
             "complete"

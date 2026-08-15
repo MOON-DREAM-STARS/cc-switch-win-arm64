@@ -1603,6 +1603,8 @@
       "task": "任務",
       "title": "任務標題",
       "titleUnavailable": "未提供任務標題",
+      "unattributed": "未歸屬工作階段",
+      "unattributedHint": "這些 Codex 代理請求已計入頂部總成本，但沒有可驗證的原生工作階段事件，因此未分配給特定任務。",
       "total": "派生總量",
       "totalRecords": "共 {{total}} 個根任務",
       "unavailable": "用量不可用",

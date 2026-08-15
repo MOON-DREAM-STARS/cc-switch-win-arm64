@@ -7,6 +7,7 @@ import {
   ChevronRight,
   ChevronUp,
   ChevronsUpDown,
+  TriangleAlert,
 } from "lucide-react";
 import {
   useAgentTaskUsage,
@@ -32,6 +33,12 @@ import {
   resolveUsageCostStatusForMeasure,
 } from "./format";
 import { UsageCostTooltip, UsageQualityTooltip } from "./UsageQualityTooltip";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import {
   Command,
@@ -190,6 +197,63 @@ function taskTokenTotal(
     measure,
     undefined,
     t("usage.task.unavailable", { defaultValue: "Unavailable" }),
+  );
+}
+
+function UnattributedUsageSummary({
+  measure,
+  t,
+}: {
+  measure: AgentUsageMeasure;
+  t: (key: string, options?: Record<string, unknown>) => string;
+}) {
+  const tokenTotal = formatKnownTokenTotal(measure, undefined, "—");
+  const cost = formatUsageCostWithStatus(
+    measure,
+    measure.totalCostUsd == null ? "unavailable" : "reported",
+  );
+  const requestCount =
+    measure.requestCount == null ? "—" : fmtInt(measure.requestCount);
+  const hint = t("usage.task.unattributedHint", {
+    defaultValue:
+      "These Codex proxy requests are included in the top cost total but have no verifiable native session event, so they are not assigned to a specific task.",
+  });
+  return (
+    <TooltipProvider delayDuration={220}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <div
+            className="flex min-w-0 cursor-help items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300"
+            data-testid="unattributed-usage-summary"
+            role="status"
+            tabIndex={0}
+            aria-label={hint}
+          >
+            <TriangleAlert className="size-4 shrink-0" aria-hidden="true" />
+            <span className="shrink-0 font-medium">
+              {t("usage.task.unattributed", {
+                defaultValue: "Unattributed sessions",
+              })}
+            </span>
+            <span className="min-w-0 truncate text-xs text-amber-800/80 dark:text-amber-200/80">
+              {requestCount} {t("usage.task.count.httpRequest", { defaultValue: "HTTP requests" })}
+              <span className="mx-1">·</span>
+              {tokenTotal} {t("usage.tokens", { defaultValue: "tokens" })}
+              <span className="mx-1">·</span>
+              {t("usage.cost", { defaultValue: "Cost" })} {cost}
+            </span>
+          </div>
+        </TooltipTrigger>
+        <TooltipContent
+          side="bottom"
+          align="start"
+          collisionPadding={12}
+          className="max-w-[420px] whitespace-normal text-left"
+        >
+          {hint}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 
@@ -908,6 +972,9 @@ export function TaskUsageTable({
         </div>
       ) : (
         <>
+          {data?.unattributedUsage ? (
+            <UnattributedUsageSummary measure={data.unattributedUsage} t={t} />
+          ) : null}
           {isWideLayout ? (
             <div
               data-testid="task-usage-table"

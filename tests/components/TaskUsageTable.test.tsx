@@ -140,6 +140,7 @@ const capability = (
 const installQueryResult = (
   items: AgentTaskUsageRow[],
   total = items.length,
+  unattributedUsage: AgentUsageMeasure | null = null,
 ) => {
   useAgentTaskUsageMock.mockReturnValue({
     data: {
@@ -148,6 +149,7 @@ const installQueryResult = (
       limit: 20,
       offset: 0,
       hasMore: total > items.length,
+      unattributedUsage,
     },
     isLoading: false,
     isError: false,
@@ -421,6 +423,50 @@ describe("TaskUsageTable", () => {
     );
   });
 
+  it("shows unattributed Codex usage outside task rows and hides it after metadata filters", async () => {
+    const unattributedUsage = measure({
+      dataSource: "proxy",
+      requestCount: 3,
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheReadTokens: 20,
+      totalCostUsd: "1.25",
+      requestCountSemantics: "http_request",
+    });
+    useAgentTaskUsageMock.mockImplementation((currentFilter: AgentTaskUsageFilter) => ({
+      data: {
+        items: [],
+        total: 0,
+        limit: 20,
+        offset: currentFilter.offset ?? 0,
+        hasMore: false,
+        unattributedUsage: currentFilter.titleExact ? null : unattributedUsage,
+      },
+      isLoading: false,
+      isError: false,
+      isFetching: false,
+    }));
+
+    render(
+      <TaskUsageTable range={{ preset: "today" }} refreshIntervalMs={0} />,
+    );
+
+    const summary = screen.getByTestId("unattributed-usage-summary");
+    expect(summary).toHaveTextContent("Unattributed sessions");
+    expect(summary).toHaveTextContent("3 HTTP requests");
+    expect(summary).toHaveTextContent("35 tokens");
+    expect(summary).toHaveTextContent("$1.2500");
+    expect(summary).toHaveAttribute(
+      "aria-label",
+      "These Codex proxy requests are included in the top cost total but have no verifiable native session event, so they are not assigned to a specific task.",
+    );
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Task title" }));
+    fireEvent.click(screen.getByText("Build title"));
+    await waitFor(() => expect(lastFilter()).toMatchObject({ titleExact: "Build title" }));
+    expect(screen.queryByTestId("unattributed-usage-summary")).not.toBeInTheDocument();
+  });
+
   it("keeps one root row for a 100-child aggregate and expands only the compact breakdown", () => {
     const root = row({
       descendantSessionCount: 100,
@@ -624,7 +670,14 @@ describe("TaskUsageTable", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Unable to load tasks");
 
     useAgentTaskUsageMock.mockReturnValue({
-      data: { items: [], total: 0, limit: 20, offset: 0, hasMore: false },
+      data: {
+        items: [],
+        total: 0,
+        limit: 20,
+        offset: 0,
+        hasMore: false,
+        unattributedUsage: null,
+      },
       isLoading: false,
       isError: false,
       isFetching: false,

@@ -518,6 +518,8 @@ export interface AgentTaskUsagePage {
   limit: number;
   offset: number;
   hasMore: boolean;
+  /** Codex proxy requests without verifiable native session attribution. */
+  unattributedUsage: AgentUsageMeasure | null;
 }
 
 /** Backend default used whenever callers omit pagination values. */

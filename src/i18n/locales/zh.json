@@ -1602,6 +1602,8 @@
       "task": "任务",
       "title": "任务标题",
       "titleUnavailable": "未提供任务标题",
+      "unattributed": "未归属会话",
+      "unattributedHint": "这些 Codex 代理请求已计入顶部总成本，但没有可验证的原生会话事件，因此未分配给具体任务。",
       "total": "派生总量",
       "totalRecords": "{{total}} 个根任务",
       "unavailable": "用量不可用",

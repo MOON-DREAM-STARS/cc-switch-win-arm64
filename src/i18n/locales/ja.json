@@ -1602,6 +1602,8 @@
       "task": "タスク",
       "title": "タスクタイトル",
       "titleUnavailable": "タスクタイトル未提供",
+      "unattributed": "未帰属セッション",
+      "unattributedHint": "これらの Codex プロキシリクエストは上部の合計コストに含まれていますが、検証可能なネイティブセッションイベントがないため、特定のタスクには割り当てられていません。",
       "total": "派生合計",
       "totalRecords": "ルートタスク {{total}} 件",
       "unavailable": "使用量を取得できません",

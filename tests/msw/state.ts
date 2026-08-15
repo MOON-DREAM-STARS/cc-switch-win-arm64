@@ -837,6 +837,7 @@ export const getAgentTaskUsageFixture = (
     limit,
     offset,
     hasMore: offset + limit < filtered.length,
+    unattributedUsage: null,
   };
 };
 

@@ -1602,6 +1602,8 @@
       "task": "Task",
       "title": "Task title",
       "titleUnavailable": "Task title not provided",
+      "unattributed": "Unattributed sessions",
+      "unattributedHint": "These Codex proxy requests are included in the top cost total but have no verifiable native session event, so they are not assigned to a specific task.",
       "total": "Derived total",
       "totalRecords": "{{total}} root tasks",
       "unavailable": "Usage unavailable",
