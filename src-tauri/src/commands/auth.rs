@@ -380,10 +380,20 @@ pub(crate) async fn remove_codex_oauth_account_with_switch_lock(
         .proxy_service
         .lock_switch_for_app(AppType::Codex.as_str())
         .await;
+    let _activation_guard = crate::services::codex_quota_activation::lock_account(account_id).await;
     app_state
         .codex_oauth_manager
         .remove_account(account_id)
         .await
+        .map_err(|error| error.to_string())?;
+    app_state
+        .db
+        .set_codex_quota_activation_enabled(
+            account_id,
+            false,
+            None,
+            chrono::Utc::now().timestamp_millis(),
+        )
         .map_err(|error| error.to_string())?;
     app_state
         .db

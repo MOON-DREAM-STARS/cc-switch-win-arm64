@@ -8,7 +8,7 @@ use crate::error::AppError;
 use chrono::{Local, Utc};
 use rusqlite::backup::{Backup, StepResult};
 use rusqlite::types::ValueRef;
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -91,6 +91,7 @@ const SYNC_SKIP_TABLES: &[&str] = &[
     "usage_daily_rollups",
     "session_log_sync",
     "session_usage_dedup",
+    "codex_quota_activation_state",
 ];
 
 /// Tables whose local data is preserved from the live database during WebDAV import.
@@ -102,6 +103,7 @@ const SYNC_PRESERVE_TABLES: &[&str] = &[
     "usage_daily_rollups",
     "session_log_sync",
     "session_usage_dedup",
+    "codex_quota_activation_state",
 ];
 
 /// A database backup entry for the UI
@@ -244,6 +246,11 @@ impl Database {
         let backup_id = backup_path
             .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
             .unwrap_or_default();
+
+        // A full import must never restore a prior opt-in or spent/bootstrap
+        // state into an active sender. Sync imports use the separate path that
+        // preserves the current device-local table above.
+        self.pause_codex_quota_activation_after_restore(chrono::Utc::now().timestamp_millis())?;
 
         Ok(backup_id)
     }
@@ -1077,6 +1084,14 @@ impl Database {
             let backup = Backup::new(&staging_conn, &mut main_conn)
                 .map_err(|e| AppError::Database(e.to_string()))?;
             Self::complete_backup(&backup, "恢复主数据库")?;
+            drop(backup);
+            main_conn
+                .execute(
+                    "UPDATE codex_quota_activation_state
+                     SET enabled = 0, state_json = '{\"kind\":\"awaiting_baseline\"}', updated_at = ?1",
+                    params![chrono::Utc::now().timestamp_millis()],
+                )
+                .map_err(|e| AppError::Database(format!("暂停恢复的 Codex 自动激活失败: {e}")))?;
             safety_backup
         };
         let safety_id = safety_backup

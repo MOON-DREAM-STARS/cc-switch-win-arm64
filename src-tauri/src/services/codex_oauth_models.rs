@@ -38,6 +38,78 @@ pub async fn fetch_models_with_token(
     Ok(parse_models(value))
 }
 
+/// Account-scoped activation preflight. A model id alone is not evidence that
+/// the OAuth account supports the required Low reasoning effort.
+pub(crate) async fn activation_model_supports_low_with_token(
+    token: &str,
+    account_id: &str,
+) -> Result<bool, String> {
+    let client = crate::proxy::http_client::get();
+    let response = build_models_request(&client, token, account_id)
+        .timeout(Duration::from_secs(CODEX_OAUTH_FETCH_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|_| "account model capability query failed".to_string())?;
+    if !response.status().is_success() {
+        return Err("account model capability query failed".to_string());
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| "account model capability response could not be read".to_string())?;
+    if bytes.len() > 2 * 1024 * 1024 {
+        return Err("account model capability response exceeded the size limit".to_string());
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "account model capability response was invalid".to_string())?;
+    Ok(parse_activation_model_supports_low(&value))
+}
+
+fn parse_activation_model_supports_low(value: &Value) -> bool {
+    let entries = value
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| value.get("models").and_then(Value::as_array))
+        .or_else(|| value.get("items").and_then(Value::as_array))
+        .or_else(|| value.as_array());
+    let matching = if let Some(entries) = entries {
+        entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .get("slug")
+                    .or_else(|| entry.get("id"))
+                    .or_else(|| entry.get("model"))
+                    .or_else(|| entry.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id == "gpt-6-luna")
+            })
+            .collect::<Vec<_>>()
+    } else if let Some(models) = value.get("models").and_then(Value::as_object) {
+        models.get("gpt-6-luna").into_iter().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if matching.len() != 1 {
+        return false;
+    }
+    [
+        "reasoning_levels",
+        "reasoningLevels",
+        "supported_reasoning_levels",
+        "supportedReasoningLevels",
+    ]
+    .iter()
+    .filter_map(|key| matching[0].get(*key).and_then(Value::as_array))
+    .any(|levels| {
+        levels.iter().any(|level| {
+            level
+                .as_str()
+                .is_some_and(|level| level.eq_ignore_ascii_case("low"))
+        })
+    })
+}
+
 fn build_models_request(
     client: &reqwest::Client,
     token: &str,
@@ -230,5 +302,28 @@ mod tests {
             models.into_iter().map(|model| model.id).collect::<Vec<_>>(),
             vec!["gpt-5.4".to_string(), "gpt-5.5".to_string()]
         );
+    }
+
+    #[test]
+    fn activation_model_preflight_requires_account_model_and_low_capability() {
+        assert!(parse_activation_model_supports_low(&json!({"data":[
+            {"slug":"gpt-6-luna","reasoning_levels":["low","high"]}
+        ]})));
+        assert!(!parse_activation_model_supports_low(&json!({"data":[
+            {"slug":"gpt-6-luna","reasoning_levels":["medium","high"]}
+        ]})));
+        assert!(!parse_activation_model_supports_low(&json!({"data":[
+            {"slug":"gpt-6-luna"}
+        ]})));
+        assert!(!parse_activation_model_supports_low(&json!({"data":[
+            "gpt-6-luna"
+        ]})));
+        assert!(!parse_activation_model_supports_low(&json!({"data":[
+            {"slug":"gpt-6-luna","reasoning_levels":["low"]},
+            {"slug":"gpt-6-luna","reasoning_levels":["high"]}
+        ]})));
+        assert!(parse_activation_model_supports_low(&json!({"models": {
+            "gpt-6-luna": {"reasoningLevels":["low"]}
+        }})));
     }
 }
