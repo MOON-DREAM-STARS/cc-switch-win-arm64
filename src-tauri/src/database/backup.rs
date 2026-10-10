@@ -8,7 +8,7 @@ use crate::error::AppError;
 use chrono::{Local, Utc};
 use rusqlite::backup::{Backup, StepResult};
 use rusqlite::types::ValueRef;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -226,6 +226,23 @@ impl Database {
         Self::apply_schema_migrations_on_conn(&temp_conn)?;
         on_staging_ready()?;
 
+        // Full restore disables activation before the staged database becomes
+        // visible. Sync keeps the local authorization and dedup state, but
+        // advances its revision so an in-flight pre-sync tick cannot finish
+        // against the replaced database.
+        let restore_now = chrono::Utc::now().timestamp_millis();
+        if preserve_tables.is_empty() {
+            crate::database::Database::pause_codex_quota_activation_after_restore_on_conn(
+                &temp_conn,
+                restore_now,
+            )?;
+        } else {
+            crate::database::Database::bump_codex_quota_activation_revisions_on_conn(
+                &temp_conn,
+                restore_now,
+            )?;
+        }
+
         let backup_file_guard = lock_backup_file_operations()?;
         // Keep one main-DB guard across the safety snapshot, local-table read,
         // and final replacement so neither the rollback point nor preserved
@@ -246,11 +263,6 @@ impl Database {
         let backup_id = backup_path
             .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
             .unwrap_or_default();
-
-        // A full import must never restore a prior opt-in or spent/bootstrap
-        // state into an active sender. Sync imports use the separate path that
-        // preserves the current device-local table above.
-        self.pause_codex_quota_activation_after_restore(chrono::Utc::now().timestamp_millis())?;
 
         Ok(backup_id)
     }
@@ -1069,6 +1081,10 @@ impl Database {
         Self::create_tables_on_conn(&staging_conn)?;
         Self::apply_schema_migrations_on_conn(&staging_conn)?;
         Self::ensure_model_pricing_seeded_on_conn(&staging_conn)?;
+        crate::database::Database::pause_codex_quota_activation_after_restore_on_conn(
+            &staging_conn,
+            chrono::Utc::now().timestamp_millis(),
+        )?;
         Self::validate_sqlite_integrity(&staging_conn)?;
 
         // Keep one main-DB guard across the safety snapshot and final apply so
@@ -1085,13 +1101,6 @@ impl Database {
                 .map_err(|e| AppError::Database(e.to_string()))?;
             Self::complete_backup(&backup, "恢复主数据库")?;
             drop(backup);
-            main_conn
-                .execute(
-                    "UPDATE codex_quota_activation_state
-                     SET enabled = 0, state_json = '{\"kind\":\"awaiting_baseline\"}', updated_at = ?1",
-                    params![chrono::Utc::now().timestamp_millis()],
-                )
-                .map_err(|e| AppError::Database(format!("暂停恢复的 Codex 自动激活失败: {e}")))?;
             safety_backup
         };
         let safety_id = safety_backup
@@ -2358,6 +2367,49 @@ mod tests {
             provider_health_count, 0,
             "同步导入应清除可重建的本地 provider_health 状态"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn activation_sync_preserves_local_state_but_full_restore_pauses_it() -> Result<(), AppError> {
+        let _test_home = TestHomeGuard::new();
+        let remote_db = Database::memory()?;
+        remote_db.set_codex_quota_activation_enabled("remote", true, Some(5), 1)?;
+        let remote_sync = remote_db.export_sql_string_for_sync()?;
+        let remote_full = remote_db.export_sql_string()?;
+
+        let local_db = Database::memory()?;
+        local_db.set_codex_quota_activation_enabled("local", true, Some(3), 1)?;
+        local_db.save_codex_quota_activation_state(
+            "local",
+            &crate::services::codex_quota_activation::ActivationState::Spent {
+                target: crate::services::codex_quota_activation::WindowKind::FiveHour,
+                event_key: "five_hour:event".to_string(),
+                attempt_id: "attempt-local".to_string(),
+                attempted_at_ms: 2,
+            },
+            2,
+        )?;
+        local_db.import_sql_string_for_sync(&remote_sync)?;
+        let after_sync = local_db
+            .get_codex_quota_activation_state("local")?
+            .expect("sync keeps local activation row");
+        assert!(after_sync.enabled);
+        assert!(matches!(
+            after_sync.state,
+            crate::services::codex_quota_activation::ActivationState::Spent { .. }
+        ));
+
+        local_db.import_sql_string(&remote_full)?;
+        let after_full = local_db
+            .get_codex_quota_activation_state("remote")?
+            .expect("full restore imports remote row");
+        assert!(!after_full.enabled);
+        assert!(matches!(
+            after_full.state,
+            crate::services::codex_quota_activation::ActivationState::AwaitingBaseline
+        ));
         Ok(())
     }
 

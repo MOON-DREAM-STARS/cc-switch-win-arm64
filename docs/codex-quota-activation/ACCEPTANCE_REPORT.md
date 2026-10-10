@@ -1,49 +1,68 @@
-# Codex 额度自动预激活：本地实施验收报告
+# Codex 额度自动预激活：本地修复验收报告
 
-日期：2026-10-10（Asia/Singapore）
-基线：`main` / `5667b287c6e1a8cc54e527bafc3c72d59f312b99`
-范围：本地源代码、临时内存数据库、合成额度向量和 loopback fake server。
+日期：2026-10-11（Asia/Singapore）
 
-## 1. 已实现的行为
+审计包：`C:\Users\admin\Downloads\ccswitch-quota-activation-audit-c7a4daf.zip`
 
-- 额度读取在保留 `SubscriptionQuota` 显示 DTO 的同时，保留同一次 `/wham/usage` GET 的私有原始快照；手动额度命令没有进入激活发送路径。
-- 选择器严格按窗口秒数识别 5h（18000）和 weekly（604800）。存在有效 5h 时只选择 5h；只有确认没有 5h 时才选择 weekly。损坏的 5h、缺失 weekly、未知窗口和权限字段不明均 fail closed。
-- weekly 已用达到 100% 时只返回阻断，不 claim、不做模型准备、不发 POST。候选值严格为原始 `used_percent == 0.0`，`0.001` 和 `0.1` 保留为非零观察。
-- 自动请求固定为 `gpt-6-luna`、`reasoning.effort=low`、`hello`，无工具、无历史、`store=false`、`stream=true`，并使用账号对应的 Bearer/workspace header。响应只有明确 `response.completed` 才算完成；EOF、断流、5xx、超时、矛盾终态和重定向均不会重发。
-- 新增本地账号状态表和有限状态 JSON。状态在 claim 前写入，按账号 try-lock 和 SQLite 条件更新实现 at-most-once；成功、失败和未知都保留 attempt。进程启动会把遗留 reserved 标为 unknown，恢复/全量导入会关闭授权并要求重新建立基线；同步导出排除该表并在同步导入时保留本机行。
-- 根级 React hook 为启用账号建立独立 timer，使用后端重新派生的最短正间隔；间隔为 0、无绑定或全部 usage 关闭时暂停。授权中心显示账号级开关和红色说明，四种语言均有文案。
+审计 HEAD / 本轮起点：`c7a4daf14795a13d07ca297f2a40b6933d202b9d`
 
-## 2. 实际验证
+功能基线：`5667b287c6e1a8cc54e527bafc3c72d59f312b99`
+本轮结束：同一 HEAD，工作树有未提交本地修改；未创建新分支。
 
-| 命令 | 结果 |
-|---|---|
-| `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` | PASS |
-| `cargo check --manifest-path src-tauri/Cargo.toml` | PASS |
-| `cargo test --manifest-path src-tauri/Cargo.toml codex_quota_activation --lib` | PASS，16 tests |
-| `cargo test --manifest-path src-tauri/Cargo.toml migrate_v20_to_v21 --lib` | PASS，1 migration test |
-| `cargo test --manifest-path src-tauri/Cargo.toml codex_oauth_models --lib` | PASS，6 tests |
-| `pnpm typecheck` | PASS |
-| `pnpm format:check` | PASS |
-| `pnpm test:unit -- --run tests/components/CodexOAuthSection.test.tsx` | PASS，21 tests |
-| `git diff --check` | PASS |
+## P1 复核结果
 
-Rust 测试实际覆盖合成 `decision_cases.json` 的 27 个选择向量、精度、5h/weekly 结构、weekly 阻断、损坏窗口、重复零值、重新武装、SQLite claim、间隔为零、启动后未知状态、v20→v21 migration、固定请求体、SSE 终态、错误脱敏，以及 loopback server 的重定向/5xx 单 POST 计数。
+| 项目 | 状态 | 证据 |
+|---|---|---|
+| F01 Provider 间隔读取 | fixed | `derive_codex_quota_activation_interval` 使用真实 `ProviderMeta`/`UsageScript` serde 和 `save_provider`；显式账号、disabled、0、10、模板、多 Provider、多账号测试通过。缺失 `accountId` 不再回退默认账号。 |
+| F02 官方模型对象能力 | fixed | 支持 `{effort:"low"}`、字符串兼容、重复/冲突/缺失 effort 原因；模型目录使用流式 2 MiB 上限，loopback 超限测试通过。 |
+| F03 关闭与派发边界 | fixed | 自动 tick 保留账号长 guard，开关关闭走短事务；新增 `authorization_revision`（schema v22），每次 await 后、条件 save/claim/finish 和派发前复核；FullRestore/Sync 使旧工作失效；fake barrier/并发 DAO 测试通过。 |
+| F04 快照新鲜度 | fixed | freshness 使用观测完成时间和派发前当前时间，检查网络耗时、回退、Date 矛盾；模型等待超过 30 秒、回退和 Date 冲突测试通过。 |
+| F05 不可信观察污染状态 | fixed | selector 与 observe 共用可信门；坏 timing、权限冲突、旧边界不能推进 Tracking/Spent；审计 trace 从 TrackingUsage/Spent 和 weekly 阻断专门情况均通过。 |
 
-## 3. 未运行与证据边界
+本轮没有仍确认存在的 P1。命令级完整依赖注入仍较小，实际 fake barrier 主要在 revision/DAO gate 层验证；没有把它扩大成 Coordinator 或测试专用生产路径。
 
-- 本轮真实 OAuth、真实 token 刷新、真实额度查询、真实模型列表和真实生成请求：**NOT RUN**。
-- 生产 endpoint 只作为产品常量存在；fake-server 测试使用 `127.0.0.1`、假 token、假 workspace 和临时内存数据库。
-- 服务端实际 Luna 权限、真实 reset 生命周期、真实消耗后的百分比量化和服务端 exactly-once：**UNVERIFIED**。
-- Windows WebView 多分辨率视觉验收、系统休眠/唤醒和签名安装：**NOT RUN**。
+## P2 复核结果
 
-## 4. 偏离与限制
+| 项目 | 状态 | 证据 / 限制 |
+|---|---|---|
+| F06 首次资格 | fixed | weekly 阻断的零值保持 `BootstrapPending`；下一正常 tick 才可成为 Candidate，重复 claim 受限。 |
+| F07 权限与额外 bucket | fixed | 顶层/嵌套冲突不再被 `or_else` 遮蔽；未知 additional bucket 保守停止；纯 parser/selector 测试通过。 |
+| F08 one-shot HTTP policy | fixed | 锁定 reqwest 0.12.28 的 `retry::never` + no redirect；工厂返回 `Result`，失败不回退默认 client；loopback 重定向/5xx/工厂失败测试通过。普通 GET 未使用该 client。 |
+| F09 SSE 与脱敏 | fixed | completed/failed/status 矛盾不算成功；嵌套 error message 提取；HTTP 200 SSE error 在 send→classify 路径脱敏；fake server 测试通过。 |
+| F10 Sync / FullRestore | fixed | Sync 保留本机授权/去重并推进 revision；FullRestore 在 staging 可见前暂停并清除旧 attempt 派发资格；SQL/二进制路径和迟到 finish 已覆盖。 |
+| F11 单账号 timer / 缓存排序 | fixed / 局部 | 根 hook 为每账号唯一 timer；接管账号的旧 footer 周期查询停止，手动查询保留；`queriedAt` 与 Rust cache 拒绝旧结果。已测缓存排序和现有组件回归；系统休眠、真实 WebView timer 与多分辨率视觉验收未运行。 |
+| F12 可见状态 / 单一 cache | fixed / 局部 | 设置区与根 hook 共用 activation query key；保存失败、读取失败、model/quota/poll reason 可见；成功 mutation 立即写 cache。真实 WebView 状态展示未运行。 |
+| F13 坏账号隔离 | fixed | 坏 `state_json` 返回 paused/error 行，不阻断其他账号列表；关闭不解码、不重置 Bootstrap；坏账号隔离测试通过。 |
 
-- 当前实现把最后一次状态摘要放在同一账号状态表中，没有增加历史页面、费用账本、Provider owner 或独立后台 daemon。
-- 轮询 hook 使用正常间隔建立 `setInterval`，不回放错过的周期；后端每次仍重新核对绑定和间隔，前端传入的 interval 不作为授权依据。
-- 完整的生产服务端兼容性仍需在未来获得单独授权后验证；本轮不得用旧 PR 或旧 live probe 代替该证据。
+## 实际测试与检查
 
-## 5. 回滚
+已执行：
 
-关闭账号开关即可停止自动入口；保留的本地 claim 不应删除。代码回滚时保留数据库表和状态数据，现有只读额度查询继续可用。未执行 commit、push、PR、部署或生产数据操作。
+- `cargo test --manifest-path src-tauri/Cargo.toml codex_quota_activation --lib -- --nocapture`：40 passed。
+- `cargo test --manifest-path src-tauri/Cargo.toml codex_oauth_models --lib -- --nocapture`：10 passed。
+- `cargo test --manifest-path src-tauri/Cargo.toml activation_sync_preserves_local_state_but_full_restore_pauses_it --lib -- --nocapture`：1 passed。
+- `cargo test --manifest-path src-tauri/Cargo.toml migrate_v20_to_v21_adds_local_codex_activation_state --lib -- --nocapture`：1 passed（现 schema v22 迁移链）。
+- `cargo test --manifest-path src-tauri/Cargo.toml codex_oauth_cache_rejects_late_older_observation --lib -- --nocapture`：1 passed。
+- `pnpm test:unit -- --run tests/hooks/useCodexQuotaAutoPolling.test.ts tests/components/CodexOAuthSection.test.tsx`：23 passed。
+- `pnpm typecheck`：PASS。
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`、`pnpm format:check`、`git diff --check`：PASS。
+
+新增/关键测试包含真实 Provider 类型保存→派生 interval→state/claim/fake sender、27 条 `decision_cases.json` 原始解析器/选择器向量、F03 barrier、F04 时钟、F05 boundary rollback、对象模型能力、有界读取、生产 one-shot 工厂、SSE 脱敏、Sync/FullRestore 和坏状态隔离。旧实现失败证据已在本地测试先行阶段记录：F01/F02/F04/F05 与迟到 finish 测试均曾红灯，修复后通过。
+
+## 产品差异、未运行和协议边界
+
+- UI 仍位于认证中心区域，未迁回官方订阅卡片；账号级开关、共享状态和红色警示保持在现有轻量区域。
+- 固定请求仍为 `gpt-6-luna` / `reasoning.effort=low` / `hello`。请求构造依据和 fixture 已固定；Luna 线上权限、标准 Responses 兼容性、真实消耗量化、reset 生命周期和 exactly-once：`UNVERIFIED`。
+- 本轮真实 OAuth、token 刷新、额度、模型目录、生成请求：`NOT RUN`。测试只使用临时 SQLite、假 token/workspace 和 `127.0.0.1` loopback fake server；未读取或修改生产 token、auth.json、CODEX_HOME、Provider 或生产数据库。
+- Windows WebView 截图、系统休眠/唤醒、签名安装和部署：`NOT RUN`。
+
+## 变更职责与回滚
+
+- Rust 状态/解析：`src-tauri/src/services/codex_quota_activation.rs`、`codex_oauth_models.rs`、`codex_quota_activation_http.rs`。
+- OAuth 自动入口、revision gate 和账号锁：`src-tauri/src/commands/codex_oauth.rs`、`commands/auth.rs`、`database/dao/codex_quota_activation.rs`、schema v22。
+- 备份/同步、缓存和额度时间语义：`database/backup.rs`、`services/subscription.rs`、`services/usage_cache.rs`、`proxy/http_client.rs`。
+- 根轮询、单一状态 cache、footer 接管和 UI 文案：`src/hooks/useCodexQuotaAutoPolling.ts`、`CodexOauthQuotaFooter.tsx`、`CodexOAuthSection.tsx`、四语言 locale。
+
+回滚方式：关闭账号开关即可停止自动入口；不要删除本地 claim/state。代码回滚时保留 schema v22 表和行，普通只读额度查询仍可用。没有 commit、push、PR、Issue、部署或生产操作。
 
 最终验收句：**有 5h 只看 5h 触发，只有 weekly 才看 weekly；周额度剩余为零不发送；复用同一次新鲜只读额度查询；由单独授权自动入口按账号持久化去重后发送一次 Luna/Low/hello。**

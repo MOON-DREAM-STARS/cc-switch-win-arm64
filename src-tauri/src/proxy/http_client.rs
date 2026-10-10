@@ -222,15 +222,16 @@ pub fn get() -> Client {
 }
 
 /// Get the proxy-configured client reserved for the one-shot activation POST.
-pub(crate) fn get_for_single_post() -> Client {
-    ACTIVATION_CLIENT
+pub(crate) fn get_for_single_post() -> Result<Client, String> {
+    if let Some(client) = ACTIVATION_CLIENT
         .get()
         .and_then(|lock| lock.read().ok())
         .map(|client| client.clone())
-        .unwrap_or_else(|| {
-            let proxy = get_current_proxy_url();
-            build_client_with_redirect_policy(proxy.as_deref(), true).unwrap_or_default()
-        })
+    {
+        return Ok(client);
+    }
+    let proxy = get_current_proxy_url();
+    build_client_with_redirect_policy(proxy.as_deref(), true)
 }
 
 /// 获取当前代理 URL
@@ -254,7 +255,7 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
     build_client_with_redirect_policy(proxy_url, false)
 }
 
-fn build_client_with_redirect_policy(
+pub(crate) fn build_client_with_redirect_policy(
     proxy_url: Option<&str>,
     disable_redirects: bool,
 ) -> Result<Client, String> {
@@ -271,7 +272,9 @@ fn build_client_with_redirect_policy(
         .no_zstd();
 
     if disable_redirects {
-        builder = builder.redirect(reqwest::redirect::Policy::none());
+        builder = builder
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never());
     }
 
     // 有代理地址则使用代理，否则跟随系统代理

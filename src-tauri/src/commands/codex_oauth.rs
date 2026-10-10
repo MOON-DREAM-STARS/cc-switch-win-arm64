@@ -162,15 +162,10 @@ pub async fn list_codex_quota_activation_states(
         .db
         .list_codex_quota_activation_states()
         .map_err(|error| error.to_string())?;
-    let now = chrono::Utc::now().timestamp_millis();
     let mut refreshed = Vec::with_capacity(states.len());
     for mut state in states {
         let interval =
             derive_activation_interval(&app_state.db, &oauth_state.0, &state.account_id).await?;
-        app_state
-            .db
-            .refresh_codex_quota_activation_interval(&state.account_id, interval, now)
-            .map_err(|error| error.to_string())?;
         state.effective_interval_minutes = interval;
         refreshed.push(state);
     }
@@ -189,9 +184,6 @@ pub async fn set_codex_quota_activation_enabled(
     if account_id.is_empty() {
         return Err("A specific ChatGPT account is required".to_string());
     }
-    let Some(_account_guard) = try_lock_account(account_id) else {
-        return Err("This account is busy with an automatic quota check".to_string());
-    };
     let _frontend_interval_is_untrusted = effective_interval_minutes;
     let effective_interval_minutes =
         derive_activation_interval(&app_state.db, &oauth_state.0, account_id).await?;
@@ -256,6 +248,32 @@ pub async fn poll_codex_oauth_quota_for_activation(
             quota: None,
         });
     }
+    let Some((enabled, authorization_revision)) = app_state
+        .db
+        .codex_quota_activation_revision(&account_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(CodexQuotaActivationPollResult {
+            account_id,
+            polled: false,
+            attempted: false,
+            target: None,
+            status: "disabled".to_string(),
+            reason: Some("activation_not_enabled".to_string()),
+            quota: None,
+        });
+    };
+    if !enabled {
+        return Ok(CodexQuotaActivationPollResult {
+            account_id,
+            polled: false,
+            attempted: false,
+            target: None,
+            status: "disabled".to_string(),
+            reason: Some("activation_not_enabled".to_string()),
+            quota: None,
+        });
+    }
 
     let token = match state.0.get_valid_token_for_account(&account_id).await {
         Ok(token) => token,
@@ -267,6 +285,9 @@ pub async fn poll_codex_oauth_quota_for_activation(
             ));
         }
     };
+    if !activation_revision_is_current(&app_state.db, &account_id, authorization_revision)? {
+        return Ok(disabled_poll(account_id, "authorization_changed"));
+    }
     let workspace = match state.0.chatgpt_account_id_for_account(&account_id).await {
         Ok(workspace) => workspace,
         Err(_) => {
@@ -277,6 +298,9 @@ pub async fn poll_codex_oauth_quota_for_activation(
             ))
         }
     };
+    if !activation_revision_is_current(&app_state.db, &account_id, authorization_revision)? {
+        return Ok(disabled_poll(account_id, "authorization_changed"));
+    }
     let (quota, snapshot) = crate::services::subscription::query_codex_quota_with_snapshot(
         &token,
         Some(&workspace),
@@ -288,6 +312,9 @@ pub async fn poll_codex_oauth_quota_for_activation(
         .usage_cache
         .put_codex_oauth(account_id.clone(), quota.clone());
     crate::tray::schedule_tray_refresh(&app);
+    if !activation_revision_is_current(&app_state.db, &account_id, authorization_revision)? {
+        return Ok(disabled_poll(account_id, "authorization_changed"));
+    }
     let Some(snapshot) = snapshot else {
         return Ok(CodexQuotaActivationPollResult {
             account_id,
@@ -299,8 +326,8 @@ pub async fn poll_codex_oauth_quota_for_activation(
             quota: Some(quota),
         });
     };
-    if snapshot.cache_age_seconds.is_some_and(|age| age > 0)
-        || now.saturating_sub(snapshot.request_started_at_ms) > 30_000
+    if let Some(reason) =
+        crate::services::codex_quota_activation::snapshot_freshness_reason(&snapshot, now_millis())
     {
         return Ok(CodexQuotaActivationPollResult {
             account_id,
@@ -308,7 +335,7 @@ pub async fn poll_codex_oauth_quota_for_activation(
             attempted: false,
             target: None,
             status: "stale_snapshot".to_string(),
-            reason: Some("quota_snapshot_is_stale".to_string()),
+            reason: Some(reason.to_string()),
             quota: Some(quota),
         });
     }
@@ -327,7 +354,7 @@ pub async fn poll_codex_oauth_quota_for_activation(
             quota: Some(quota),
         });
     };
-    if !record.enabled {
+    if !record.enabled || record.authorization_revision != authorization_revision {
         return Ok(CodexQuotaActivationPollResult {
             account_id,
             polled: true,
@@ -339,12 +366,20 @@ pub async fn poll_codex_oauth_quota_for_activation(
         });
     }
     let prior_state = record.state.clone();
-    let decision = record.state.observe(&snapshot, now);
+    let decision = record.state.observe(&snapshot, now_millis());
     if record.state != prior_state {
-        app_state
+        if !app_state
             .db
-            .save_codex_quota_activation_state(&account_id, &record.state, now)
-            .map_err(|error| error.to_string())?;
+            .save_codex_quota_activation_state_if_revision(
+                &account_id,
+                authorization_revision,
+                &record.state,
+                now_millis(),
+            )
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(disabled_poll(account_id, "authorization_changed"));
+        }
     }
     let decision_for_result = decision.clone();
     let ActivationDecision::Candidate(target) = decision else {
@@ -369,24 +404,51 @@ pub async fn poll_codex_oauth_quota_for_activation(
             quota: Some(quota),
         });
     };
-    let model_ready =
-        crate::services::codex_oauth_models::activation_model_supports_low_with_token(
+    let model_capability =
+        crate::services::codex_oauth_models::activation_model_capability_with_token(
             &token, &workspace,
         )
-        .await
-        .unwrap_or(false);
-    if !model_ready {
+        .await;
+    if !activation_revision_is_current(&app_state.db, &account_id, authorization_revision)? {
+        return Ok(disabled_poll(account_id, "authorization_changed"));
+    }
+    let model_reason: Option<(&str, String)> = match model_capability {
+        Ok(crate::services::codex_oauth_models::ActivationModelCapability::Supported) => None,
+        Ok(crate::services::codex_oauth_models::ActivationModelCapability::ModelUnavailable) => {
+            Some(("model_unavailable", "gpt-6-luna_not_in_catalog".to_string()))
+        }
+        Ok(crate::services::codex_oauth_models::ActivationModelCapability::LowUnavailable) => {
+            Some((
+                "model_unavailable",
+                "gpt-6-luna_low_unavailable".to_string(),
+            ))
+        }
+        Ok(crate::services::codex_oauth_models::ActivationModelCapability::CatalogInvalid) => {
+            Some((
+                "protocol_unknown",
+                "model_catalog_capability_invalid".to_string(),
+            ))
+        }
+        Err(reason) => Some(("model_preflight_failed", reason)),
+    };
+    if let Some((status, reason)) = model_reason {
         return Ok(CodexQuotaActivationPollResult {
             account_id,
             polled: true,
             attempted: false,
             target: Some(target.as_str().to_string()),
-            status: "model_unavailable".to_string(),
-            reason: Some("gpt-6-luna_low_unavailable".to_string()),
+            status: status.to_string(),
+            reason: Some(reason),
             quota: Some(quota),
         });
     }
-    if now.saturating_sub(snapshot.request_started_at_ms) > 30_000 {
+    let now_after_model = now_millis();
+    if crate::services::codex_quota_activation::snapshot_freshness_reason(
+        &snapshot,
+        now_after_model,
+    )
+    .is_some()
+    {
         return Ok(CodexQuotaActivationPollResult {
             account_id,
             polled: true,
@@ -397,13 +459,16 @@ pub async fn poll_codex_oauth_quota_for_activation(
             quota: Some(quota),
         });
     }
+    if !activation_revision_is_current(&app_state.db, &account_id, authorization_revision)? {
+        return Ok(disabled_poll(account_id, "authorization_changed"));
+    }
     let current_interval = derive_activation_interval(&app_state.db, &state.0, &account_id).await?;
     if current_interval != effective_interval_minutes
         || !current_interval.is_some_and(|interval| interval > 0)
     {
         app_state
             .db
-            .refresh_codex_quota_activation_interval(&account_id, current_interval, now)
+            .refresh_codex_quota_activation_interval(&account_id, current_interval, now_millis())
             .map_err(|error| error.to_string())?;
         return Ok(CodexQuotaActivationPollResult {
             account_id,
@@ -416,9 +481,15 @@ pub async fn poll_codex_oauth_quota_for_activation(
         });
     }
     let attempt_id = Uuid::new_v4().to_string();
+    let claim_time = now_millis();
     if app_state
         .db
-        .claim_codex_quota_activation(&account_id, &attempt_id, now)
+        .claim_codex_quota_activation_if_revision(
+            &account_id,
+            authorization_revision,
+            &attempt_id,
+            claim_time,
+        )
         .map_err(|error| error.to_string())?
         .is_none()
     {
@@ -432,13 +503,26 @@ pub async fn poll_codex_oauth_quota_for_activation(
             quota: Some(quota),
         });
     }
-    let result = send_activation_once(
-        &crate::proxy::http_client::get_for_single_post(),
-        ACTIVATION_ENDPOINT,
-        &token,
-        &workspace,
-    )
-    .await;
+    if !activation_revision_is_current(&app_state.db, &account_id, authorization_revision)? {
+        return Ok(disabled_poll(account_id, "authorization_changed"));
+    }
+    let client = match crate::proxy::http_client::get_for_single_post() {
+        Ok(client) => client,
+        Err(error) => {
+            let _ = app_state
+                .db
+                .finish_codex_quota_activation_attempt_if_revision(
+                    &account_id,
+                    authorization_revision,
+                    &attempt_id,
+                    "unknown",
+                    Some(&error),
+                    now_millis(),
+                );
+            return Ok(failed_poll(account_id, "transport_unavailable", error));
+        }
+    };
+    let result = send_activation_once(&client, ACTIVATION_ENDPOINT, &token, &workspace).await;
     let status = match result.status {
         ActivationHttpStatus::Completed => "completed",
         ActivationHttpStatus::Failed => "failed",
@@ -446,8 +530,9 @@ pub async fn poll_codex_oauth_quota_for_activation(
     };
     app_state
         .db
-        .finish_codex_quota_activation_attempt(
+        .finish_codex_quota_activation_attempt_if_revision(
             &account_id,
+            authorization_revision,
             &attempt_id,
             status,
             result.error.as_deref(),
@@ -477,12 +562,39 @@ fn failed_poll(account_id: String, status: &str, reason: String) -> CodexQuotaAc
     }
 }
 
+fn disabled_poll(account_id: String, reason: &str) -> CodexQuotaActivationPollResult {
+    CodexQuotaActivationPollResult {
+        account_id,
+        polled: true,
+        attempted: false,
+        target: None,
+        status: "disabled".to_string(),
+        reason: Some(reason.to_string()),
+        quota: None,
+    }
+}
+
+fn activation_revision_is_current(
+    db: &crate::database::Database,
+    account_id: &str,
+    expected_revision: i64,
+) -> Result<bool, String> {
+    Ok(db
+        .codex_quota_activation_revision(account_id)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|(enabled, revision)| enabled && revision == expected_revision))
+}
+
+fn now_millis() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
 async fn derive_activation_interval(
     db: &crate::database::Database,
     manager: &CodexOAuthManager,
     account_id: &str,
 ) -> Result<Option<u64>, String> {
-    let default_account_id = manager.default_account_id().await;
-    db.derive_codex_quota_activation_interval(account_id, default_account_id.as_deref())
+    let _ = manager;
+    db.derive_codex_quota_activation_interval(account_id, None)
         .map_err(|error| error.to_string())
 }

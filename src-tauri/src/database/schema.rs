@@ -140,6 +140,7 @@ impl Database {
                 last_attempt_status TEXT,
                 last_reason TEXT,
                 state_json TEXT NOT NULL,
+                 authorization_revision INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL
             )",
             [],
@@ -612,12 +613,25 @@ impl Database {
                                 last_attempt_status TEXT,
                                 last_reason TEXT,
                                 state_json TEXT NOT NULL,
+                                 authorization_revision INTEGER NOT NULL DEFAULT 0,
                                 updated_at INTEGER NOT NULL
                             )",
                             [],
                         )
                         .map_err(|e| AppError::Database(e.to_string()))?;
                         Self::set_user_version(conn, 21)?;
+                    }
+                    21 => {
+                        log::info!("迁移数据库从 v21 到 v22（Codex 额度自动激活授权修订）");
+                        if Self::table_exists(conn, "codex_quota_activation_state")? {
+                            Self::add_column_if_missing(
+                                conn,
+                                "codex_quota_activation_state",
+                                "authorization_revision",
+                                "INTEGER NOT NULL DEFAULT 0",
+                            )?;
+                        }
+                        Self::set_user_version(conn, 22)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -3898,6 +3912,12 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(enabled_default, 1);
+        let revision_default: i64 = conn.query_row(
+            "SELECT dflt_value = '0' FROM pragma_table_info('codex_quota_activation_state') WHERE name = 'authorization_revision'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(revision_default, 1);
         Ok(())
     }
 

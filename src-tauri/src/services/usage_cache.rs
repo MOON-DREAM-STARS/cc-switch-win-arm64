@@ -28,10 +28,22 @@ impl UsageCache {
         }
     }
 
-    pub fn put_codex_oauth(&self, account_id: String, quota: SubscriptionQuota) {
+    pub fn put_codex_oauth(&self, account_id: String, quota: SubscriptionQuota) -> bool {
         if let Ok(mut w) = self.codex_oauth.write() {
+            if let Some(previous) = w.get(&account_id) {
+                let is_older = match (previous.queried_at, quota.queried_at) {
+                    (Some(previous), Some(incoming)) => incoming < previous,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if is_older {
+                    return false;
+                }
+            }
             w.insert(account_id, quota);
+            return true;
         }
+        false
     }
 
     /// Managed accounts must never share the CLI's app-wide subscription snapshot.
@@ -206,5 +218,20 @@ mod tests {
         assert!(cache
             .with_codex_oauth("account-1", |quota| quota.success)
             .is_none());
+    }
+
+    #[test]
+    fn codex_oauth_cache_rejects_late_older_observation() {
+        let cache = UsageCache::new();
+        let mut newer = fake_quota();
+        newer.queried_at = Some(20);
+        let mut older = fake_quota();
+        older.queried_at = Some(0);
+        assert!(cache.put_codex_oauth("account".to_string(), newer.clone()));
+        assert!(!cache.put_codex_oauth("account".to_string(), older));
+        assert_eq!(
+            cache.with_codex_oauth("account", |quota| quota.queried_at),
+            Some(Some(20))
+        );
     }
 }

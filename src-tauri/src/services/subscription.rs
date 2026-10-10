@@ -1034,26 +1034,24 @@ async fn query_codex_usage_with_snapshot(
         .and_then(|value| value.parse::<u64>().ok());
 
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Ok((
-            SubscriptionQuota::error(
-                tool_label,
-                CredentialStatus::Expired,
-                format!("{expired_message} (HTTP {status})"),
-            ),
-            None,
-        ));
+        let mut quota = SubscriptionQuota::error(
+            tool_label,
+            CredentialStatus::Expired,
+            format!("{expired_message} (HTTP {status})"),
+        );
+        quota.queried_at = Some(request_started_at_ms);
+        return Ok((quota, None));
     }
 
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Ok((
-            SubscriptionQuota::error(
-                tool_label,
-                CredentialStatus::Valid,
-                format!("API error (HTTP {status}): {body}"),
-            ),
-            None,
-        ));
+        let mut quota = SubscriptionQuota::error(
+            tool_label,
+            CredentialStatus::Valid,
+            format!("API error (HTTP {status}): {body}"),
+        );
+        quota.queried_at = Some(request_started_at_ms);
+        return Ok((quota, None));
     }
 
     let raw = match resp.bytes().await {
@@ -1063,14 +1061,13 @@ async fn query_codex_usage_with_snapshot(
     let value: serde_json::Value = match serde_json::from_slice(&raw) {
         Ok(v) => v,
         Err(e) => {
-            return Ok((
-                SubscriptionQuota::error(
-                    tool_label,
-                    CredentialStatus::Valid,
-                    format!("Failed to parse API response: {e}"),
-                ),
-                None,
-            ));
+            let mut quota = SubscriptionQuota::error(
+                tool_label,
+                CredentialStatus::Valid,
+                format!("Failed to parse API response: {e}"),
+            );
+            quota.queried_at = Some(request_started_at_ms);
+            return Ok((quota, None));
         }
     };
     let mut snapshot = crate::services::codex_quota_activation::snapshot_from_value(
@@ -1085,14 +1082,13 @@ async fn query_codex_usage_with_snapshot(
     let body: CodexUsageResponse = match serde_json::from_value(value) {
         Ok(v) => v,
         Err(e) => {
-            return Ok((
-                SubscriptionQuota::error(
-                    tool_label,
-                    CredentialStatus::Valid,
-                    format!("Failed to parse API response: {e}"),
-                ),
-                None,
-            ));
+            let mut quota = SubscriptionQuota::error(
+                tool_label,
+                CredentialStatus::Valid,
+                format!("Failed to parse API response: {e}"),
+            );
+            quota.queried_at = Some(request_started_at_ms);
+            return Ok((quota, None));
         }
     };
 
@@ -1129,7 +1125,7 @@ async fn query_codex_usage_with_snapshot(
             reset_credits: None,
             credits_balance: body.credits.as_ref().and_then(parse_codex_credits_balance),
             error: None,
-            queried_at: Some(now_millis()),
+            queried_at: Some(request_started_at_ms),
         },
         snapshot,
     ))

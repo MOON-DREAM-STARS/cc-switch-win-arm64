@@ -1778,7 +1778,7 @@
     "quotaActivationInterval": "every {{minutes}} min",
     "quotaActivationPaused": "paused",
     "quotaActivationLastAttempt": "{{status}} · {{time}}",
-    "quotaActivationWarning": "Automatic activation uses a small amount of subscription quota and may run overnight. It prefers 5h and uses weekly only when 5h is absent; zero weekly remaining blocks activation. The first cycle may process an existing full window, and server timing is authoritative."
+    "quotaActivationWarning": "Automatic activation sends one small gpt-6-luna / Low / hello request and may run overnight. It prefers 5h and uses weekly only when 5h is absent; zero weekly remaining blocks activation. The first cycle may process an existing full window, and server timing is authoritative."
   },
   "xaiOauth": {
     "authStatus": "xAI OAuth authentication",

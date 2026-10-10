@@ -1778,7 +1778,7 @@
     "quotaActivationInterval": "每 {{minutes}} 分钟",
     "quotaActivationPaused": "已暂停",
     "quotaActivationLastAttempt": "{{status}} · {{time}}",
-    "quotaActivationWarning": "自动激活会少量消耗订阅额度，可能在夜间执行；优先使用 5h，只有 weekly 时才使用 weekly。weekly 剩余为零会阻断；首次自动周期可能处理已有满额，实际计时以服务端为准。"
+    "quotaActivationWarning": "自动激活会发送一次固定的 gpt-6-luna / Low / hello 请求并少量消耗订阅额度，可能在夜间执行；优先使用 5h，只有 weekly 时才使用 weekly。weekly 剩余为零会阻断；首次自动周期可能处理已有满额，实际计时以服务端为准。"
   },
   "xaiOauth": {
     "authStatus": "xAI OAuth 认证",

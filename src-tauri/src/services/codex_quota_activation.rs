@@ -137,26 +137,13 @@ pub(crate) fn snapshot_from_value(
         .get("rate_limit")
         .or_else(|| value.get("rateLimit"))?
         .as_object()?;
-    let allowed = value
-        .get("allowed")
-        .and_then(Value::as_bool)
-        .or_else(|| rate_limit.get("allowed").and_then(Value::as_bool));
-    let limit_reached = value
-        .get("limit_reached")
-        .or_else(|| value.get("limitReached"))
-        .and_then(Value::as_bool)
-        .or_else(|| {
-            rate_limit
-                .get("limit_reached")
-                .or_else(|| rate_limit.get("limitReached"))
-                .and_then(Value::as_bool)
-        });
-    let rate_limit_reached_type = value
-        .get("rate_limit_reached_type")
-        .or_else(|| value.get("rateLimitReachedType"))
-        .or_else(|| rate_limit.get("rate_limit_reached_type"))
-        .or_else(|| rate_limit.get("rateLimitReachedType"))
-        .and_then(parse_reached_type);
+    let allowed = merge_bool_fields(value, rate_limit, &["allowed"]);
+    let limit_reached = merge_bool_fields(value, rate_limit, &["limit_reached", "limitReached"]);
+    let rate_limit_reached_type = merge_reached_type_fields(
+        value,
+        rate_limit,
+        &["rate_limit_reached_type", "rateLimitReachedType"],
+    );
 
     let mut windows = Vec::new();
     for (key, additional) in [("primary_window", false), ("secondary_window", false)] {
@@ -210,6 +197,58 @@ fn parse_reached_type(value: &Value) -> Option<String> {
             .map(str::to_owned)
             .or_else(|| Some("unknown".to_string())),
         _ => Some("unknown".to_string()),
+    }
+}
+
+fn parse_bool_field(value: &Value, keys: &[&str]) -> Result<Option<bool>, ()> {
+    let Some(raw) = keys.iter().find_map(|key| value.get(*key)) else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    raw.as_bool().ok_or(()).map(Some)
+}
+
+fn merge_bool_fields(
+    outer: &Value,
+    nested: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<bool> {
+    let outer = parse_bool_field(outer, keys);
+    let nested = parse_bool_field(&Value::Object(nested.clone()), keys);
+    match (outer, nested) {
+        (Err(()), _) | (_, Err(())) => None,
+        (Ok(outer), Ok(nested)) => match (outer, nested) {
+            (Some(a), Some(b)) if a != b => None,
+            (Some(value), _) | (_, Some(value)) => Some(value),
+            _ => None,
+        },
+    }
+}
+
+fn parse_reached_type_field(
+    value: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key))
+        .and_then(parse_reached_type)
+}
+
+fn merge_reached_type_fields(
+    outer: &Value,
+    nested: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<String> {
+    let outer = outer
+        .as_object()
+        .and_then(|map| parse_reached_type_field(map, keys));
+    let nested = parse_reached_type_field(nested, keys);
+    match (outer, nested) {
+        (Some(a), Some(b)) if !a.eq_ignore_ascii_case(&b) => Some("unknown".to_string()),
+        (Some(value), _) | (_, Some(value)) => Some(value),
+        _ => None,
     }
 }
 
@@ -299,13 +338,12 @@ fn blocking_type(value: Option<&str>) -> bool {
 /// Select the unique target before lifecycle/claim checks. This is deliberately
 /// fail-closed for malformed or incomplete window structures.
 pub(crate) fn select_target(snapshot: &CodexQuotaSnapshot) -> ActivationDecision {
-    if snapshot.cache_age_seconds.is_some_and(|age| age > 0)
-        || snapshot
-            .observed_at_ms
-            .saturating_sub(snapshot.request_started_at_ms)
-            > 30_000
-    {
-        return ActivationDecision::Blocked("stale_snapshot");
+    select_target_at(snapshot, snapshot.observed_at_ms)
+}
+
+pub(crate) fn select_target_at(snapshot: &CodexQuotaSnapshot, now_ms: i64) -> ActivationDecision {
+    if let Some(reason) = snapshot_freshness_reason(snapshot, now_ms) {
+        return ActivationDecision::Blocked(reason);
     }
     let five = snapshot
         .windows
@@ -319,17 +357,15 @@ pub(crate) fn select_target(snapshot: &CodexQuotaSnapshot) -> ActivationDecision
         .collect::<Vec<_>>();
 
     if snapshot.windows.iter().any(|window| {
-        !window.is_additional
-            && !matches!(
+        window.is_additional
+            || !matches!(
                 window.limit_window_seconds,
                 Some(FIVE_HOUR_SECONDS | WEEKLY_SECONDS)
             )
     }) || five.len() > 1
         || weekly.len() > 1
-        || five.iter().any(|w| w.is_additional)
-        || weekly.iter().any(|w| w.is_additional)
     {
-        return ActivationDecision::Unsupported("ambiguous_window");
+        return ActivationDecision::Unsupported("ambiguous_or_additional_window");
     }
     let five = five.first().copied();
     let weekly = weekly.first().copied();
@@ -393,6 +429,37 @@ pub(crate) fn select_target(snapshot: &CodexQuotaSnapshot) -> ActivationDecision
     }
 }
 
+pub(crate) fn snapshot_freshness_reason(
+    snapshot: &CodexQuotaSnapshot,
+    now_ms: i64,
+) -> Option<&'static str> {
+    if snapshot.cache_age_seconds.is_some_and(|age| age > 0) {
+        return Some("stale_snapshot");
+    }
+    if snapshot.observed_at_ms < snapshot.request_started_at_ms {
+        return Some("invalid_snapshot_time");
+    }
+    if snapshot
+        .observed_at_ms
+        .saturating_sub(snapshot.request_started_at_ms)
+        > 30_000
+    {
+        return Some("stale_snapshot");
+    }
+    if now_ms < snapshot.observed_at_ms {
+        return Some("clock_rollback");
+    }
+    if now_ms.saturating_sub(snapshot.observed_at_ms) > 30_000 {
+        return Some("stale_snapshot");
+    }
+    if let Some(server_date_at_ms) = snapshot.server_date_at_ms {
+        if (server_date_at_ms - snapshot.observed_at_ms).abs() > 5 * 60_000 {
+            return Some("server_date_conflict");
+        }
+    }
+    None
+}
+
 fn valid_timing(window: &QuotaWindowSnapshot, kind: WindowKind) -> bool {
     let Some(reset_at) = window.reset_at else {
         return false;
@@ -424,13 +491,19 @@ impl ActivationState {
     pub(crate) fn observe(
         &mut self,
         snapshot: &CodexQuotaSnapshot,
-        _now_ms: i64,
+        now_ms: i64,
     ) -> ActivationDecision {
-        let decision = select_target(snapshot);
-        let Some(target) = structurally_selected_target(snapshot) else {
-            if matches!(self, Self::BootstrapPending) {
-                *self = Self::AwaitingBaseline;
+        let decision = select_target_at(snapshot, now_ms);
+        let target = match decision {
+            ActivationDecision::Candidate(_) | ActivationDecision::Observe => {
+                structurally_selected_target(snapshot)
             }
+            ActivationDecision::Blocked("weekly_exhausted") => {
+                structurally_selected_target(snapshot)
+            }
+            ActivationDecision::Blocked(_) | ActivationDecision::Unsupported(_) => None,
+        };
+        let Some(target) = target else {
             return decision;
         };
         let Some(window) = find_window(snapshot, target) else {
@@ -448,6 +521,19 @@ impl ActivationState {
         if !valid_used(window.used_percent) {
             return ActivationDecision::Unsupported("invalid_target");
         }
+        let trusted_observation = match decision {
+            ActivationDecision::Candidate(_) | ActivationDecision::Observe => true,
+            ActivationDecision::Blocked("weekly_exhausted") => {
+                valid_timing(window, target)
+                    && (target != WindowKind::FiveHour
+                        || find_window(snapshot, WindowKind::Weekly)
+                            .is_some_and(|weekly| valid_timing(weekly, WindowKind::Weekly)))
+            }
+            ActivationDecision::Blocked(_) | ActivationDecision::Unsupported(_) => false,
+        };
+        if !trusted_observation {
+            return decision;
+        }
         let can_qualify = matches!(decision, ActivationDecision::Candidate(_));
         let event_key = format!(
             "{}:{}",
@@ -459,15 +545,20 @@ impl ActivationState {
                 if window.used_percent == Some(0.0) && can_qualify {
                     *self = Self::Eligible { target, event_key };
                     decision
-                } else if let Some(boundary_reset_at) = window.reset_at {
+                } else if window.used_percent.is_some_and(|value| value > 0.0) {
+                    let Some(boundary_reset_at) = window.reset_at else {
+                        *self = Self::AwaitingBaseline;
+                        return ActivationDecision::Unsupported("missing_window_boundary");
+                    };
                     *self = Self::TrackingUsage {
                         target,
                         boundary_reset_at,
                     };
                     decision
                 } else {
-                    *self = Self::AwaitingBaseline;
-                    ActivationDecision::Unsupported("missing_window_boundary")
+                    // A blocked zero observation does not consume the first-use
+                    // qualification. It may become eligible on the next normal tick.
+                    decision
                 }
             }
             Self::TrackingUsage {
@@ -475,7 +566,9 @@ impl ActivationState {
                 boundary_reset_at,
             } => {
                 if window.used_percent.is_some_and(|value| value > 0.0) {
-                    if let Some(reset_at) = window.reset_at {
+                    if let Some(reset_at) =
+                        window.reset_at.filter(|reset| *reset >= *boundary_reset_at)
+                    {
                         *boundary_reset_at = reset_at;
                     }
                     decision
@@ -514,6 +607,7 @@ impl ActivationState {
             }
             Self::Spent {
                 target: previous,
+                event_key,
                 attempted_at_ms,
                 ..
             } => {
@@ -524,9 +618,10 @@ impl ActivationState {
                 if *previous == target
                     && window.used_percent.is_some_and(|value| value > 0.0)
                     && snapshot.request_started_at_ms > *attempted_at_ms
-                    && window
-                        .reset_at
-                        .is_some_and(|reset| reset * 1000 > *attempted_at_ms)
+                    && window.reset_at.is_some_and(|reset| {
+                        reset * 1000 > *attempted_at_ms
+                            && event_boundary(event_key).is_none_or(|boundary| reset >= boundary)
+                    })
                 {
                     *self = Self::TrackingUsage {
                         target,
@@ -543,8 +638,12 @@ impl ActivationState {
                             boundary_reset_at: reset_at,
                         };
                     }
+                    decision
+                } else {
+                    // AwaitingBaseline deliberately cannot return Candidate: a
+                    // lifecycle reset must first observe a trustworthy nonzero use.
+                    ActivationDecision::Observe
                 }
-                decision
             }
         }
     }
@@ -567,6 +666,10 @@ impl ActivationState {
         };
         Some(ClaimedAttempt { attempt_id, target })
     }
+}
+
+fn event_boundary(event_key: &str) -> Option<i64> {
+    event_key.rsplit_once(':')?.1.parse().ok()
 }
 
 fn structurally_selected_target(snapshot: &CodexQuotaSnapshot) -> Option<WindowKind> {
@@ -618,12 +721,22 @@ mod tests {
     }
 
     fn snapshot(five: Option<f64>, weekly: Option<f64>) -> CodexQuotaSnapshot {
-        snapshot_from_value(
-            &response(five, weekly),
-            1_799_999_999_000,
-            1_800_000_000_000,
-        )
-        .unwrap()
+        snapshot_from_value(&response(five, weekly), 0, 1).unwrap()
+    }
+
+    fn snapshot_at(
+        five: Option<f64>,
+        weekly: Option<f64>,
+        request_started_at_ms: i64,
+        reset_at: i64,
+    ) -> CodexQuotaSnapshot {
+        let mut snapshot = snapshot(five, weekly);
+        snapshot.request_started_at_ms = request_started_at_ms;
+        snapshot.observed_at_ms = request_started_at_ms;
+        for window in &mut snapshot.windows {
+            window.reset_at = Some(reset_at);
+        }
+        snapshot
     }
 
     #[test]
@@ -722,6 +835,187 @@ mod tests {
     }
 
     #[test]
+    fn f04_stale_snapshot_after_model_preflight_clock_advance_is_rejected() {
+        let mut state = ActivationState::default();
+        let snapshot = snapshot_at(Some(0.0), Some(50.0), 1_000, 300);
+
+        assert_eq!(
+            state.observe(&snapshot, 1_000),
+            ActivationDecision::Candidate(WindowKind::FiveHour)
+        );
+        let trusted_state = state.clone();
+
+        assert_eq!(
+            state.observe(&snapshot, 31_001),
+            ActivationDecision::Blocked("stale_snapshot")
+        );
+        assert_eq!(state, trusted_state);
+    }
+
+    #[test]
+    fn f04_time_rollback_and_server_date_conflict_fail_closed() {
+        let mut snapshot = snapshot_at(Some(0.0), Some(50.0), 1_000, 300);
+        assert_eq!(
+            snapshot_freshness_reason(&snapshot, 999),
+            Some("clock_rollback")
+        );
+        snapshot.server_date_at_ms = Some(1_000_000);
+        assert_eq!(
+            snapshot_freshness_reason(&snapshot, 1_000),
+            Some("server_date_conflict")
+        );
+    }
+
+    #[test]
+    fn f05_tracking_usage_boundary_does_not_rollback_after_later_observation() {
+        let mut state = ActivationState::default();
+        let initial = snapshot_at(Some(20.0), Some(50.0), 1_000, 300);
+        assert_eq!(state.observe(&initial, 1_000), ActivationDecision::Observe);
+        assert_eq!(
+            state,
+            ActivationState::TrackingUsage {
+                target: WindowKind::FiveHour,
+                boundary_reset_at: 300,
+            }
+        );
+
+        let advanced = snapshot_at(Some(20.0), Some(50.0), 2_000, 400);
+        assert_eq!(state.observe(&advanced, 2_000), ActivationDecision::Observe);
+        let trusted_state = state.clone();
+
+        let rollback = snapshot_at(Some(20.0), Some(50.0), 3_000, 350);
+        assert_eq!(state.observe(&rollback, 3_000), ActivationDecision::Observe);
+        assert_eq!(state, trusted_state);
+
+        let zero_before_trusted_boundary = snapshot_at(Some(0.0), Some(50.0), 401_000, 390);
+        assert_eq!(
+            state.observe(&zero_before_trusted_boundary, 401_000),
+            ActivationDecision::Observe
+        );
+        assert_eq!(state, trusted_state);
+    }
+
+    #[test]
+    fn f05_spent_rearm_does_not_accept_boundary_rollback() {
+        let mut state = ActivationState::default();
+        let zero = snapshot_at(Some(0.0), Some(50.0), 1_000, 300);
+        assert_eq!(
+            state.observe(&zero, 1_000),
+            ActivationDecision::Candidate(WindowKind::FiveHour)
+        );
+        assert!(state.claim("attempt", 2_000).is_some());
+
+        let used_after_attempt = snapshot_at(Some(20.0), Some(50.0), 3_000, 400);
+        assert_eq!(
+            state.observe(&used_after_attempt, 3_000),
+            ActivationDecision::Observe
+        );
+        let trusted_state = state.clone();
+
+        let rollback = snapshot_at(Some(20.0), Some(50.0), 4_000, 350);
+        assert_eq!(state.observe(&rollback, 4_000), ActivationDecision::Observe);
+        assert_eq!(state, trusted_state);
+
+        let zero_before_trusted_boundary = snapshot_at(Some(0.0), Some(50.0), 401_000, 390);
+        assert_eq!(
+            state.observe(&zero_before_trusted_boundary, 401_000),
+            ActivationDecision::Observe
+        );
+        assert_eq!(state, trusted_state);
+    }
+
+    #[test]
+    fn f05_invalid_observation_does_not_change_trusted_state() {
+        let mut state = ActivationState::TrackingUsage {
+            target: WindowKind::FiveHour,
+            boundary_reset_at: 400,
+        };
+        let mut invalid = snapshot_at(Some(20.0), Some(50.0), 5_000, 500);
+        invalid.allowed = Some(false);
+        let trusted_state = state.clone();
+
+        assert_eq!(
+            state.observe(&invalid, 5_000),
+            ActivationDecision::Blocked("permission_or_limit")
+        );
+        assert_eq!(state, trusted_state);
+    }
+
+    #[test]
+    fn f05_weekly_exhausted_valid_five_hour_nonzero_still_records_baseline() {
+        let mut state = ActivationState::default();
+        let exhausted_weekly = snapshot_at(Some(20.0), Some(100.0), 6_000, 600);
+
+        assert_eq!(
+            state.observe(&exhausted_weekly, 6_000),
+            ActivationDecision::Blocked("weekly_exhausted")
+        );
+        assert_eq!(
+            state,
+            ActivationState::TrackingUsage {
+                target: WindowKind::FiveHour,
+                boundary_reset_at: 600,
+            }
+        );
+    }
+
+    #[test]
+    fn f05_audit_bad_timing_never_rolls_back_tracking_boundary() {
+        let mut state = ActivationState::TrackingUsage {
+            target: WindowKind::FiveHour,
+            boundary_reset_at: 1_800_001_000,
+        };
+        let mut invalid = snapshot_at(Some(20.0), Some(50.0), 1_800_000_000_000, 1_799_999_990);
+        for window in &mut invalid.windows {
+            if window.limit_window_seconds == Some(FIVE_HOUR_SECONDS) {
+                window.reset_after_seconds = Some(-1);
+            }
+        }
+        let trusted = state.clone();
+        assert_eq!(
+            state.observe(&invalid, invalid.observed_at_ms),
+            ActivationDecision::Unsupported("invalid_window_timing")
+        );
+        assert_eq!(state, trusted);
+
+        let zero = snapshot_at(Some(0.0), Some(50.0), 1_800_000_300_000, 1_800_001_000);
+        assert_eq!(
+            state.observe(&zero, zero.observed_at_ms),
+            ActivationDecision::Observe
+        );
+        assert_eq!(state, trusted);
+    }
+
+    #[test]
+    fn f05_audit_bad_timing_never_rearms_spent_state() {
+        let mut state = ActivationState::Spent {
+            target: WindowKind::FiveHour,
+            event_key: "five_hour:1800001000".to_string(),
+            attempt_id: "fake-prior-attempt".to_string(),
+            attempted_at_ms: 1_799_999_400_000,
+        };
+        let mut invalid = snapshot_at(Some(20.0), Some(50.0), 1_800_000_000_000, 1_799_999_990);
+        for window in &mut invalid.windows {
+            if window.limit_window_seconds == Some(FIVE_HOUR_SECONDS) {
+                window.reset_after_seconds = Some(-1);
+            }
+        }
+        let trusted = state.clone();
+        assert_eq!(
+            state.observe(&invalid, invalid.observed_at_ms),
+            ActivationDecision::Unsupported("invalid_window_timing")
+        );
+        assert_eq!(state, trusted);
+        let zero = snapshot_at(Some(0.0), Some(50.0), 1_800_000_300_000, 1_800_001_000);
+        assert_eq!(
+            state.observe(&zero, zero.observed_at_ms),
+            ActivationDecision::Observe
+        );
+        assert_eq!(state, trusted);
+        assert!(state.claim("second-attempt", zero.observed_at_ms).is_none());
+    }
+
+    #[test]
     fn unknown_permission_fails_closed() {
         let value = json!({"rate_limit": {"primary_window": {"used_percent": 0, "limit_window_seconds": FIVE_HOUR_SECONDS}, "secondary_window": {"used_percent": 0, "limit_window_seconds": WEEKLY_SECONDS}}});
         assert_eq!(
@@ -731,14 +1025,88 @@ mod tests {
     }
 
     #[test]
+    fn permission_conflicts_and_nested_rate_limit_are_retained() {
+        let conflict = json!({
+            "allowed": true,
+            "limit_reached": false,
+            "rate_limit": {
+                "allowed": false,
+                "limit_reached": true,
+                "primary_window": {"used_percent": 0, "limit_window_seconds": FIVE_HOUR_SECONDS, "reset_at": 1_800_018_000, "reset_after_seconds": FIVE_HOUR_SECONDS},
+                "secondary_window": {"used_percent": 50, "limit_window_seconds": WEEKLY_SECONDS, "reset_at": 1_800_604_800, "reset_after_seconds": WEEKLY_SECONDS}
+            }
+        });
+        let parsed = snapshot_from_value(&conflict, 1, 1).unwrap();
+        assert_eq!(
+            select_target(&parsed),
+            ActivationDecision::Blocked("permission_or_limit")
+        );
+
+        let nested_type = json!({
+            "allowed": true,
+            "limit_reached": false,
+            "rate_limit_reached_type": null,
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "rate_limit_reached_type": "unknown-server-block",
+                "primary_window": {"used_percent": 0, "limit_window_seconds": FIVE_HOUR_SECONDS, "reset_at": 1_800_018_000, "reset_after_seconds": FIVE_HOUR_SECONDS},
+                "secondary_window": {"used_percent": 50, "limit_window_seconds": WEEKLY_SECONDS, "reset_at": 1_800_604_800, "reset_after_seconds": WEEKLY_SECONDS}
+            }
+        });
+        let parsed = snapshot_from_value(&nested_type, 1, 1).unwrap();
+        assert_eq!(
+            select_target(&parsed),
+            ActivationDecision::Blocked("rate_limit_reached")
+        );
+    }
+
+    #[test]
+    fn additional_bucket_is_conservative_and_bootstrap_block_is_preserved() {
+        let additional = json!({
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {"used_percent": 0, "limit_window_seconds": FIVE_HOUR_SECONDS, "reset_at": 1_800_018_000, "reset_after_seconds": FIVE_HOUR_SECONDS},
+                "secondary_window": {"used_percent": 50, "limit_window_seconds": WEEKLY_SECONDS, "reset_at": 1_800_604_800, "reset_after_seconds": WEEKLY_SECONDS},
+                "additional_rate_limits": {"spend_control": {"used_percent": 0, "limit_window_seconds": 3600}}
+            }
+        });
+        let parsed = snapshot_from_value(&additional, 1, 1).unwrap();
+        assert!(matches!(
+            select_target(&parsed),
+            ActivationDecision::Unsupported(_)
+        ));
+
+        let mut state = ActivationState::default();
+        let blocked = snapshot_at(Some(0.0), Some(100.0), 7_000, 700);
+        assert_eq!(
+            state.observe(&blocked, 7_000),
+            ActivationDecision::Blocked("weekly_exhausted")
+        );
+        assert_eq!(state, ActivationState::BootstrapPending);
+        let allowed = snapshot_at(Some(0.0), Some(50.0), 8_000, 700);
+        assert_eq!(
+            state.observe(&allowed, 8_000),
+            ActivationDecision::Candidate(WindowKind::FiveHour)
+        );
+        assert!(state.claim("first", 8_001).is_some());
+        assert!(state.claim("second", 8_002).is_none());
+
+        let mut awaiting = ActivationState::AwaitingBaseline;
+        assert_eq!(
+            awaiting.observe(&allowed, 8_000),
+            ActivationDecision::Observe
+        );
+        assert!(awaiting.claim("awaiting", 8_001).is_none());
+    }
+
+    #[test]
     fn handoff_decision_vectors_run_through_the_real_parser_and_selector() {
         let fixture: Value =
             serde_json::from_str(include_str!("../../tests/decision_cases.json")).unwrap();
         let cases = fixture["cases"].as_array().unwrap();
-        assert!(
-            cases.len() >= 20,
-            "fixture case list should not silently shrink"
-        );
+        assert_eq!(cases.len(), 27, "fixture case list should remain complete");
         for case in cases {
             let id = case["id"].as_str().unwrap();
             let snapshot =
@@ -746,22 +1114,25 @@ mod tests {
             let expected_target = case["expected"]["target_by_structure"]
                 .as_str()
                 .unwrap_or("");
-            if expected_target.is_empty() {
-                assert!(
-                    snapshot.is_none()
-                        || structurally_selected_target(snapshot.as_ref().unwrap()).is_none(),
-                    "{id}"
+            let expected_decision = case["expected"]["decision"].as_str().unwrap();
+            let expected_max_posts = case["expected"]["max_posts_if_all_later_guards_pass"]
+                .as_u64()
+                .unwrap();
+            let Some(snapshot) = snapshot else {
+                assert_eq!(
+                    expected_target, "",
+                    "{id}: unparseable case must have no target"
                 );
+                assert_eq!(expected_max_posts, 0, "{id}");
                 continue;
-            }
-            let snapshot = snapshot.unwrap_or_else(|| panic!("{id}: expected parseable snapshot"));
+            };
             assert_eq!(
                 structurally_selected_target(&snapshot).map(WindowKind::as_str),
-                Some(expected_target),
+                (!expected_target.is_empty()).then_some(expected_target),
                 "{id}: target structure"
             );
             let decision = select_target(&snapshot);
-            match case["expected"]["decision"].as_str().unwrap() {
+            match expected_decision {
                 "candidate" => assert_eq!(
                     decision,
                     ActivationDecision::Candidate(structurally_selected_target(&snapshot).unwrap()),
@@ -776,6 +1147,25 @@ mod tests {
                     "{id}: {decision:?}"
                 ),
                 other => panic!("{id}: unexpected fixture outcome {other}"),
+            }
+            assert_eq!(
+                expected_max_posts,
+                if matches!(&decision, ActivationDecision::Candidate(_)) {
+                    1
+                } else {
+                    0
+                },
+                "{id}: post upper bound"
+            );
+            if matches!(&decision, ActivationDecision::Candidate(_)) {
+                let mut state = ActivationState::default();
+                assert!(matches!(
+                    state.observe(&snapshot, snapshot.observed_at_ms),
+                    ActivationDecision::Candidate(_)
+                ));
+                assert!(state
+                    .claim(format!("{id}-attempt"), snapshot.observed_at_ms)
+                    .is_some());
             }
         }
     }

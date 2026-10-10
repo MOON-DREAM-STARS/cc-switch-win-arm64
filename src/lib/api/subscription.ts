@@ -10,6 +10,8 @@ export interface CodexQuotaActivationState {
   lastAttemptAtMs?: number | null;
   lastAttemptStatus?: string | null;
   lastReason?: string | null;
+  stateError?: string | null;
+  authorizationRevision: number;
   state: { kind: string; target?: string; eventKey?: string };
   updatedAt: number;
 }
@@ -37,7 +39,6 @@ export const subscriptionApi = {
     }),
   pollCodexOauthQuotaForActivation: (
     accountId: string,
-    effectiveIntervalMinutes?: number,
   ): Promise<{
     accountId: string;
     polled: boolean;
@@ -49,7 +50,6 @@ export const subscriptionApi = {
   }> =>
     invoke("poll_codex_oauth_quota_for_activation", {
       accountId,
-      effectiveIntervalMinutes,
     }),
   getXaiOauthQuota: (accountId: string | null): Promise<SubscriptionQuota> =>
     invoke("get_xai_oauth_quota", { accountId }),

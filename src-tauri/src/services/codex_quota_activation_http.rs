@@ -114,7 +114,7 @@ async fn send_activation_inner(
         Ok(body) => body,
         Err(error) => return unknown(&error, &[token, workspace]),
     };
-    classify_sse(&body)
+    classify_sse_with_secrets(&body, &[token, workspace])
 }
 
 async fn read_bounded(response: reqwest::Response) -> Result<String, String> {
@@ -133,6 +133,10 @@ async fn read_bounded_stream(mut response: reqwest::Response) -> Result<String, 
 }
 
 pub(crate) fn classify_sse(body: &str) -> ActivationHttpResult {
+    classify_sse_with_secrets(body, &[])
+}
+
+fn classify_sse_with_secrets(body: &str, secrets: &[&str]) -> ActivationHttpResult {
     let mut completed: Option<String> = None;
     let mut failure: Option<String> = None;
     let normalized = body.replace("\r\n", "\n");
@@ -157,6 +161,26 @@ pub(crate) fn classify_sse(body: &str) -> ActivationHttpResult {
         });
         match event_name {
             Some("response.completed") => {
+                let payload_type = parsed
+                    .as_ref()
+                    .and_then(|value| value.get("type"))
+                    .and_then(Value::as_str);
+                let response_status = parsed
+                    .as_ref()
+                    .and_then(|value| value.pointer("/response/status"))
+                    .and_then(Value::as_str);
+                let response_error = parsed
+                    .as_ref()
+                    .and_then(|value| value.pointer("/response/error"));
+                if payload_type.is_some_and(|value| value != "response.completed")
+                    || response_status.is_some_and(|value| value != "completed")
+                    || response_error.is_some_and(|value| !value.is_null())
+                {
+                    failure = Some(parsed.as_ref().and_then(error_message).unwrap_or_else(|| {
+                        "activation completion payload was not successful".to_string()
+                    }));
+                    continue;
+                }
                 completed = parsed.as_ref().and_then(|value| {
                     value
                         .pointer("/response/model")
@@ -169,21 +193,19 @@ pub(crate) fn classify_sse(body: &str) -> ActivationHttpResult {
                 failure = Some(
                     parsed
                         .as_ref()
-                        .and_then(|value| value.get("error").or_else(|| value.get("message")))
-                        .and_then(Value::as_str)
-                        .unwrap_or("activation failed")
-                        .to_string(),
+                        .and_then(error_message)
+                        .unwrap_or_else(|| "activation failed".to_string()),
                 );
             }
             _ => {}
         }
     }
     if let (Some(_), Some(error)) = (completed.as_ref(), failure.as_ref()) {
-        return failed(&format!("conflicting terminal events: {error}"), &[]);
+        return failed(&format!("conflicting terminal events: {error}"), secrets);
     }
     if let Some(actual_model) = completed {
         if actual_model != ACTIVATION_MODEL {
-            return failed("server returned an unexpected model", &[]);
+            return failed("server returned an unexpected model", secrets);
         }
         return ActivationHttpResult {
             status: ActivationHttpStatus::Completed,
@@ -192,9 +214,25 @@ pub(crate) fn classify_sse(body: &str) -> ActivationHttpResult {
         };
     }
     if let Some(error) = failure {
-        return failed(&error, &[]);
+        return failed(&error, secrets);
     }
-    unknown("response ended without a terminal event", &[])
+    unknown("response ended without a terminal event", secrets)
+}
+
+fn error_message(value: &Value) -> Option<String> {
+    value
+        .pointer("/response/error/message")
+        .or_else(|| value.pointer("/error/message"))
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            value
+                .pointer("/response/error")
+                .or_else(|| value.get("error"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
 }
 
 fn failed(error: &str, secrets: &[&str]) -> ActivationHttpResult {
@@ -225,7 +263,6 @@ fn sanitize(error: &str, secrets: &[&str]) -> String {
 mod tests {
     use super::*;
     use axum::{extract::State, http::header, response::IntoResponse, routing::post, Router};
-    use reqwest::redirect::Policy;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -233,7 +270,8 @@ mod tests {
 
     #[test]
     fn request_is_fixed_to_luna_low_hello_and_stateless() {
-        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let client =
+            crate::proxy::http_client::build_client_with_redirect_policy(None, true).unwrap();
         let request = build_activation_request(
             &client,
             "http://127.0.0.1:1",
@@ -312,7 +350,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = Client::builder().redirect(Policy::none()).build().unwrap();
+        let client =
+            crate::proxy::http_client::build_client_with_redirect_policy(None, true).unwrap();
 
         let redirect_result = send_activation_once(
             &client,
@@ -341,6 +380,58 @@ mod tests {
             2,
             "5xx produced one POST and no retry"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn production_factory_rejects_invalid_proxy_without_a_fallback_client() {
+        assert!(crate::proxy::http_client::build_client_with_redirect_policy(
+            Some("not a proxy"),
+            true,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn completion_payload_with_failed_status_is_not_success() {
+        let result = classify_sse(
+            "event: response.completed\ndata: {\"type\":\"response.failed\",\"response\":{\"model\":\"gpt-6-luna\",\"status\":\"failed\",\"error\":{\"message\":\"synthetic failure\"}}}\n\n",
+        );
+        assert_eq!(result.status, ActivationHttpStatus::Failed);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("synthetic failure"));
+    }
+
+    #[tokio::test]
+    async fn successful_http_sse_error_redacts_token_and_workspace() {
+        async fn error_stream() -> axum::response::Response {
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                "event: error\ndata: {\"error\":\"rejected FAKE_TOKEN in FAKE_WORKSPACE\"}\n\n",
+            )
+                .into_response()
+        }
+        let app = Router::new().route("/error", post(error_stream));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            crate::proxy::http_client::build_client_with_redirect_policy(None, true).unwrap();
+        let result = send_activation_once(
+            &client,
+            &format!("http://{address}/error"),
+            "FAKE_TOKEN",
+            "FAKE_WORKSPACE",
+        )
+        .await;
+        let error = result.error.unwrap_or_default();
+        assert_eq!(result.status, ActivationHttpStatus::Failed);
+        assert!(!error.contains("FAKE_TOKEN"));
+        assert!(!error.contains("FAKE_WORKSPACE"));
         server.abort();
     }
 }
