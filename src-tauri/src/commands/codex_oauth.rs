@@ -664,6 +664,7 @@ async fn derive_activation_interval(
 mod tests {
     use super::*;
     use crate::database::Database;
+    use crate::error::AppError;
     use crate::services::codex_quota_activation::{ActivationState, WindowKind};
     use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Router};
     use std::sync::{
@@ -830,5 +831,88 @@ mod tests {
             )
             .unwrap());
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn r01_full_restore_missing_row_invalidates_barriered_tick_and_sender(
+    ) -> Result<(), AppError> {
+        let live = Arc::new(Database::memory().unwrap());
+        live.set_codex_quota_activation_enabled("account-a", true, Some(1), 1)
+            .unwrap();
+        live.save_codex_quota_activation_state(
+            "account-a",
+            &ActivationState::Eligible {
+                target: WindowKind::FiveHour,
+                event_key: "five_hour:18300".to_string(),
+            },
+            2,
+        )
+        .unwrap();
+        let old_revision = live
+            .codex_quota_activation_revision("account-a")
+            .unwrap()
+            .unwrap()
+            .1;
+        let old_attempt = "r01-old-attempt".to_string();
+        assert!(live
+            .claim_codex_quota_activation_if_revision("account-a", old_revision, &old_attempt, 3,)
+            .unwrap()
+            .is_some());
+
+        let backup = Database::memory().unwrap();
+        {
+            let conn = crate::database::lock_conn!(backup.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('account-provider', 'codex', 'Account Provider', '{}', '{}')",
+                [],
+            )
+            .unwrap();
+        }
+        let backup_sql = backup.export_sql_string().unwrap();
+        let ready = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let sender_calls = Arc::new(AtomicUsize::new(0));
+        let before_ready = ready.clone();
+        let before_release = release.clone();
+        let sender_calls_for_task = sender_calls.clone();
+        let client =
+            crate::proxy::http_client::build_client_with_redirect_policy(None, true).unwrap();
+        let dispatch_db = live.clone();
+        let old_attempt_for_task = old_attempt.clone();
+        let tick = tokio::spawn(async move {
+            dispatch_activation_with(
+                &dispatch_db,
+                "account-a",
+                old_revision,
+                &old_attempt_for_task,
+                move || async move {
+                    before_ready.notify_one();
+                    before_release.notified().await;
+                },
+                move || async move {
+                    sender_calls_for_task.fetch_add(1, Ordering::SeqCst);
+                    send_activation_once(
+                        &client,
+                        "http://127.0.0.1:1/should-not-be-called",
+                        "fake-token",
+                        "fake-workspace",
+                    )
+                    .await
+                },
+            )
+            .await
+            .unwrap()
+        });
+        ready.notified().await;
+        live.import_sql_string(&backup_sql).unwrap();
+        let reenabled = live
+            .set_codex_quota_activation_enabled("account-a", true, Some(1), 4)
+            .unwrap();
+        assert!(reenabled.authorization_revision > old_revision);
+        release.notify_one();
+        assert!(tick.await.unwrap().is_none());
+        assert_eq!(sender_calls.load(Ordering::SeqCst), 0);
+        Ok(())
     }
 }

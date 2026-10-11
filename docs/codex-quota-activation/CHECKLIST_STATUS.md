@@ -1,19 +1,17 @@
-# 第二轮审计修复清单
+# 第三轮审计修复清单
 
-审计对象：`85647d116cb10fcaabb0994d8185d521fbd54d60`
+审计对象：`77767e28ecccc6934960540e3001651f5920f633`
 
-当前工作树：未提交的局部修复；真实 OAuth/额度/模型/生成请求均 `NOT RUN`。
+当前工作树：未提交的局部修复；真实 OAuth、token、quota、models、generation 均 `NOT RUN`。
 
 | 项目 | 状态 | 核查依据 |
 |---|---|---|
-| N01 Sync revision / FullRestore ABA | FIXED | 真实 sync import + old save/claim/finish gate；低 revision restore 后重新开启不复用旧 revision。 |
-| N02 dispatch linearization | FIXED | 生产 dispatch helper + loopback sender；关闭先提交为 0 POST，派发点后允许 1 个在途且 finish stale。 |
-| N03 timing consistency | FIXED | 真实 epoch 矛盾 timing、Bootstrap、weekly exhausted、Tracking/Spent 回归。 |
-| N04 permission conflict | FIXED | parser/selector conflict marker、invalid alias、nested/top-level conflict。 |
-| N05 poll vs attempt | FIXED | QueryClient、自动 timer、invalidate/refetch 后 model_unavailable 可见；non-attempt 不覆盖 lastAttempt。 |
-| N06 late GET/finish | FIXED | UsageCache generation、superseded finish、FullRestore/close DAO 回归；真实服务端竞态 `NOT RUN`。 |
-| N07 all quota writers ordering | FIXED | 两个 deferred promise 的真实 QueryClient M<A/A<M。 |
-| N08 corrupt account disable | FIXED | `CodexOAuthSection` 实际 UI 点击坏账号开关调用 false；不重建 Bootstrap。 |
-| 真实 OAuth / token refresh / quota / model catalog / generation | NOT RUN | 用户明确禁止，只有 fake token 与 127.0.0.1 loopback。 |
-| Luna 线上协议、扣费与 exactly-once | UNVERIFIED | 源码/fixture 证据不足，未执行 live probe。 |
-| WebView、系统休眠、跨进程崩溃 | NOT RUN | 需要生产运行时，超出本轮隔离测试。 |
+| R01 FullRestore 缺行 ABA | FIXED | SQL/二进制真实临时 DB restore 写入 tombstone；旧 revision save/claim/submit/finish 拒绝，fake sender=0。 |
+| R02 cache invalidate 原子性 | FIXED | quota 与 generation 共用账号 entry lock；single/all 失效与旧 publisher 测试通过。 |
+| R03 时间一致性范围 | FIXED | 移除绝对时间量级豁免；T-301/T-100/T+30/T+18000 参数化回归通过。 |
+| R04 lastPoll UI 可见性 | FIXED | completed 历史 attempt 与新的 model preflight failure/reason 同时出现在真实组件 DOM。 |
+| R05 测试入口 cache/lifecycle | FIXED | UsageScriptModal 真实按钮、QueryClient、deferred test GET 与自动 quota 排序、revision 失效测试通过。 |
+| 上轮 N02 submitted 派发点 | 保留 | 未修改；关闭前后 barrier 和 superseded finish 仍通过。 |
+| 真实服务请求与生产状态 | NOT RUN | 用户明确禁止真实 OAuth、额度、模型、生成及生产数据库操作。 |
+| 服务端协议、扣费、周期与 exactly-once | UNVERIFIED | 没有 live probe 或真实服务验证。 |
+| WebView、系统休眠、跨进程崩溃 | NOT RUN | 超出本轮隔离测试边界。 |

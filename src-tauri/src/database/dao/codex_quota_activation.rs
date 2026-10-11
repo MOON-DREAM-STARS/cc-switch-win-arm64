@@ -645,6 +645,68 @@ impl Database {
         Ok(())
     }
 
+    /// Keep a disabled tombstone for every live account whose activation row
+    /// is absent from a full-restore staging database.  Without this row the
+    /// normal enable path starts at revision 1 again and an in-flight task
+    /// from the replaced database can become indistinguishable from the new
+    /// authorization generation.
+    pub(crate) fn ensure_codex_quota_activation_tombstones_on_conn(
+        live_conn: &Connection,
+        staging_conn: &Connection,
+        now_ms: i64,
+        minimum_revision: Option<i64>,
+    ) -> Result<(), AppError> {
+        let baseline_state = encode_state(&ActivationState::AwaitingBaseline)?;
+        let revision_floor = minimum_revision.unwrap_or(0).saturating_add(1);
+        let mut stmt = live_conn
+            .prepare(
+                "SELECT account_id, authorization_revision
+                 FROM codex_quota_activation_state",
+            )
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        for row in rows {
+            let (account_id, live_revision) =
+                row.map_err(|error| AppError::Database(error.to_string()))?;
+            let exists = staging_conn
+                .query_row(
+                    "SELECT 1 FROM codex_quota_activation_state WHERE account_id = ?1",
+                    params![account_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| AppError::Database(error.to_string()))?
+                .is_some();
+            if exists {
+                continue;
+            }
+            let revision = live_revision.saturating_add(1).max(revision_floor);
+            staging_conn
+                .execute(
+                    "INSERT INTO codex_quota_activation_state
+                        (account_id, enabled, effective_interval_minutes,
+                         enabled_at_ms, last_polled_at_ms, last_attempt_at_ms,
+                         last_attempt_id, last_attempt_status, last_reason,
+                         state_json, authorization_revision, updated_at)
+                     VALUES (?1, 0, NULL, NULL, NULL, NULL, NULL, 'unknown',
+                             ?2, ?3, ?4, ?5)",
+                    params![
+                        account_id,
+                        "activation invalidated by full restore",
+                        baseline_state.as_str(),
+                        revision,
+                        now_ms
+                    ],
+                )
+                .map_err(|error| AppError::Database(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn bump_codex_quota_activation_revisions_on_conn(
         conn: &Connection,
         now_ms: i64,
@@ -1001,8 +1063,8 @@ mod tests {
             "rate_limit": {
                 "allowed": true,
                 "limit_reached": false,
-                "primary_window": {"used_percent": 0, "limit_window_seconds": 18000, "reset_at": 1800018000, "reset_after_seconds": 18000},
-                "secondary_window": {"used_percent": 50, "limit_window_seconds": 604800, "reset_at": 1800604800, "reset_after_seconds": 604800}
+                "primary_window": {"used_percent": 0, "limit_window_seconds": 18000, "reset_at": 18300, "reset_after_seconds": 18000},
+                "secondary_window": {"used_percent": 50, "limit_window_seconds": 604800, "reset_at": 605100, "reset_after_seconds": 604800}
             }
         });
         let snapshot =

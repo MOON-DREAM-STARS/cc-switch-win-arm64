@@ -499,6 +499,7 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
           className="flex items-center gap-1.5"
           title={
             activationStates[account.id]?.stateError ??
+            activationStates[account.id]?.lastPollReason ??
             activationStates[account.id]?.lastReason ??
             undefined
           }
@@ -515,18 +516,15 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                 })}
           </span>
           {(activationState?.lastAttemptAtMs ||
-            activationState?.lastPolledAtMs ||
+            activationState?.lastAttemptStatus ||
             activationState?.lastReason ||
-            activationState?.lastPollReason ||
             activationStates[account.id]?.stateError) && (
             <span className="text-[10px] text-fg-3">
               {t("codexOauth.quotaActivationLastAttempt", {
                 defaultValue: "{{status}} · {{time}}",
                 status: activationState?.stateError
                   ? t("codexOauth.quotaActivationCorrupt", "corrupt / paused")
-                  : (activationState?.lastAttemptStatus ??
-                    activationState?.lastPollStatus ??
-                    "unknown"),
+                  : (activationState?.lastAttemptStatus ?? "unknown"),
                 time: activationState?.lastAttemptAtMs
                   ? new Date(
                       activationState.lastAttemptAtMs,
@@ -534,18 +532,22 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                       hour: "2-digit",
                       minute: "2-digit",
                     })
-                  : activationState?.lastPolledAtMs
-                    ? new Date(
-                        activationState.lastPolledAtMs,
-                      ).toLocaleTimeString([], {
-                        hour: "2-digit",
-                        minute: "2-digit",
-                      })
-                    : (activationState?.lastPollReason ??
-                      activationState?.lastReason ??
-                      activationState?.stateError ??
-                      ""),
+                  : (activationState?.lastReason ??
+                    activationState?.stateError ??
+                    ""),
               })}
+            </span>
+          )}
+          {activationState?.lastPollStatus && (
+            <span
+              className="text-[10px] text-fg-3"
+              title={activationState.lastPollReason ?? undefined}
+              data-testid={`codex-quota-last-poll-${account.id}`}
+            >
+              {`check: ${activationState.lastPollStatus}`}
+              {activationState.lastPollReason
+                ? ` · ${activationState.lastPollReason}`
+                : ""}
             </span>
           )}
           <Switch

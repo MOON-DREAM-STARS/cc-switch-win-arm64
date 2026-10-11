@@ -7,7 +7,11 @@ import {
 import { useContext } from "react";
 import { subscriptionApi } from "@/lib/api";
 import type { CodexQuotaActivationState } from "@/lib/api";
-import type { SubscriptionQuota } from "@/types/subscription";
+import {
+  codexQuotaActivationStatesKey,
+  mergeNewerCodexOauthQuota,
+  publishCodexOauthQuota,
+} from "@/lib/query/subscription";
 
 type LatestPollSummary = {
   authorizationRevision: number;
@@ -37,24 +41,10 @@ function mergeLatestPollSummary(
   };
 }
 
-export const CODEX_QUOTA_ACTIVATION_STATES_QUERY_KEY = [
-  "codex_oauth",
-  "quota_activation",
-  "states",
-] as const;
+export const CODEX_QUOTA_ACTIVATION_STATES_QUERY_KEY =
+  codexQuotaActivationStatesKey;
 
-export function mergeNewerCodexQuota(
-  current: SubscriptionQuota | undefined,
-  incoming: SubscriptionQuota,
-): SubscriptionQuota {
-  if (
-    current?.queriedAt != null &&
-    (incoming.queriedAt == null || incoming.queriedAt < current.queriedAt)
-  ) {
-    return current;
-  }
-  return incoming;
-}
+export const mergeNewerCodexQuota = mergeNewerCodexOauthQuota;
 
 export function useCodexQuotaActivationStates(
   options: { polling?: boolean } = {},
@@ -168,10 +158,7 @@ export function useCodexQuotaAutoPolling() {
                   result.status,
                 )
               ) {
-                queryClient.setQueryData<SubscriptionQuota>(
-                  ["codex_oauth", "quota", result.accountId],
-                  (current) => mergeNewerCodexQuota(current, quota),
-                );
+                publishCodexOauthQuota(queryClient, result.accountId, quota);
               }
             }
             queryClient.setQueryData<CodexQuotaActivationState[]>(

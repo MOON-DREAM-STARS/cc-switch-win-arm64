@@ -75,6 +75,11 @@ describe("Codex OAuth activation corrupt-account control", () => {
           authorizationRevision: 7,
           state: { kind: "awaiting_baseline" },
           stateError: "invalid Codex activation state",
+          lastAttemptAtMs: 1000,
+          lastAttemptStatus: "completed",
+          lastPollStatus: "model_preflight_failed",
+          lastPollReason: "model_catalog_http_503",
+          lastPolledAtMs: 2000,
           updatedAt: 1,
         },
       ],
@@ -106,5 +111,33 @@ describe("Codex OAuth activation corrupt-account control", () => {
       undefined,
     );
     setEnabled.mockRestore();
+  });
+
+  it("shows a new poll failure while keeping the historical attempt result", () => {
+    mocks.useCodexQuotaActivationStates.mockReturnValue({
+      data: [
+        {
+          accountId: "account-corrupt",
+          enabled: true,
+          effectiveIntervalMinutes: 5,
+          authorizationRevision: 7,
+          state: { kind: "spent" },
+          lastAttemptAtMs: 1000,
+          lastAttemptStatus: "completed",
+          lastPollStatus: "model_preflight_failed",
+          lastPollReason: "model_catalog_http_503",
+          lastPolledAtMs: 2000,
+          updatedAt: 1,
+        },
+      ],
+      isError: false,
+    });
+    render(<CodexOAuthSection />);
+    expect(screen.getByText(/completed/)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /check: model_preflight_failed · model_catalog_http_503/,
+      ),
+    ).toBeInTheDocument();
   });
 });

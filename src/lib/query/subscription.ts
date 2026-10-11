@@ -2,6 +2,7 @@ import { useRef } from "react";
 import {
   useQuery,
   useQueryClient,
+  type QueryClient,
   type UseQueryResult,
 } from "@tanstack/react-query";
 import { subscriptionApi } from "@/lib/api/subscription";
@@ -15,7 +16,10 @@ import { extractErrorMessage } from "@/utils/errorUtils";
 
 const REFETCH_INTERVAL = 5 * 60 * 1000; // 5 minutes
 
-function mergeNewerSubscriptionQuota(
+export const codexOauthQuotaKey = (accountId: string | null) =>
+  ["codex_oauth", "quota", accountId ?? "default"] as const;
+
+export function mergeNewerCodexOauthQuota(
   current: SubscriptionQuota | undefined,
   incoming: SubscriptionQuota,
 ): SubscriptionQuota {
@@ -28,10 +32,53 @@ function mergeNewerSubscriptionQuota(
   return incoming;
 }
 
+/** Shared write boundary for every managed-account quota producer. */
+export function publishCodexOauthQuota(
+  queryClient: QueryClient,
+  accountId: string | null,
+  incoming: SubscriptionQuota,
+) {
+  const key = codexOauthQuotaKey(accountId);
+  queryClient.setQueryData<SubscriptionQuota>(key, (current) =>
+    mergeNewerCodexOauthQuota(current, incoming),
+  );
+}
+
 export const subscriptionKeys = {
   all: ["subscription"] as const,
   quota: (appId: AppId) => [...subscriptionKeys.all, "quota", appId] as const,
 };
+
+export const codexQuotaActivationStatesKey = [
+  "codex_oauth",
+  "quota_activation",
+  "states",
+] as const;
+
+export interface CodexActivationStateRevision {
+  accountId: string;
+  authorizationRevision: number;
+}
+
+export function isCodexQuotaActivationRevisionCurrent(
+  queryClient: QueryClient,
+  accountId: string,
+  capturedRevision: number | undefined,
+): boolean {
+  const current = queryClient.getQueryData<CodexActivationStateRevision[]>(
+    codexQuotaActivationStatesKey,
+  );
+  if (capturedRevision == null) {
+    return !current?.some((state) => state.accountId === accountId);
+  }
+  return (
+    current?.some(
+      (state) =>
+        state.accountId === accountId &&
+        state.authorizationRevision === capturedRevision,
+    ) === true
+  );
+}
 
 /**
  * reject 且无可展示值时的失败占位：首次查询就失败（data 为 undefined），或
@@ -151,7 +198,7 @@ export function useCodexOauthQuotaByAccountId(
     autoQuery && autoQueryIntervalMinutes > 0
       ? Math.max(autoQueryIntervalMinutes, 1) * 60 * 1000
       : false;
-  const queryKey = ["codex_oauth", "quota", accountId ?? "default"] as const;
+  const queryKey = codexOauthQuotaKey(accountId);
   const query = useQuery({
     queryKey,
     // React Query writes the value returned by queryFn into the cache after
@@ -161,7 +208,7 @@ export function useCodexOauthQuotaByAccountId(
     queryFn: async () => {
       const incoming = await subscriptionApi.getCodexOauthQuota(accountId);
       const current = queryClient.getQueryData<SubscriptionQuota>(queryKey);
-      return mergeNewerSubscriptionQuota(current, incoming);
+      return mergeNewerCodexOauthQuota(current, incoming);
     },
     enabled,
     refetchInterval,

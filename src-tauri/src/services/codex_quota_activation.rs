@@ -516,21 +516,17 @@ fn valid_timing(window: &QuotaWindowSnapshot, kind: WindowKind, observed_at_ms: 
     {
         return false;
     }
-    // Epoch-based consistency is only meaningful for real wall-clock values;
-    // tiny synthetic timestamps remain useful in pure state-machine tests.
-    if observed_at_ms >= 1_000_000_000_000 {
-        if let Some(reset_after) = window.reset_after_seconds {
-            let expected_reset_at = observed_at_ms / 1000 + reset_after;
-            // A reset boundary that has just passed while advertising a full
-            // window-length countdown is an internally contradictory response.
-            // Older historical boundaries can legitimately be far behind the
-            // observation and are retained for lifecycle ordering.
-            if reset_at < observed_at_ms / 1000
-                && observed_at_ms / 1000 - reset_at <= 300
-                && (reset_at - expected_reset_at).abs() > 300
-            {
+    if let Some(reset_after) = window.reset_after_seconds {
+        let observed_at_seconds = observed_at_ms.div_euclid(1000);
+        if reset_after > 0 {
+            let expected_reset_at = observed_at_seconds.saturating_add(reset_after);
+            if reset_at.abs_diff(expected_reset_at) > 5 {
                 return false;
             }
+        } else if reset_at > observed_at_seconds.saturating_add(5) {
+            // A zero countdown may describe a boundary that has just passed,
+            // but it cannot point materially into the future.
+            return false;
         }
     }
     true
@@ -782,7 +778,13 @@ mod tests {
     }
 
     fn snapshot(five: Option<f64>, weekly: Option<f64>) -> CodexQuotaSnapshot {
-        snapshot_from_value(&response(five, weekly), 0, 1).unwrap()
+        let mut snapshot = snapshot_from_value(&response(five, weekly), 0, 1).unwrap();
+        for window in &mut snapshot.windows {
+            if let Some(reset_after) = window.reset_after_seconds {
+                window.reset_at = Some(snapshot.observed_at_ms / 1000 + reset_after);
+            }
+        }
+        snapshot
     }
 
     fn snapshot_at(
@@ -796,6 +798,11 @@ mod tests {
         snapshot.observed_at_ms = request_started_at_ms;
         for window in &mut snapshot.windows {
             window.reset_at = Some(reset_at);
+            window.reset_after_seconds = Some(
+                reset_at
+                    .saturating_sub(request_started_at_ms.div_euclid(1000))
+                    .max(0),
+            );
         }
         snapshot
     }
@@ -934,6 +941,9 @@ mod tests {
     fn n03_reset_boundary_and_countdown_conflict_cannot_create_candidate() {
         let now_ms = 1_800_000_000_000;
         let mut snapshot = snapshot_at(Some(0.0), Some(50.0), now_ms, 1_799_999_900);
+        for window in &mut snapshot.windows {
+            window.reset_after_seconds = Some(window.limit_window_seconds.unwrap_or(0));
+        }
         assert_eq!(
             select_target_at(&snapshot, now_ms),
             ActivationDecision::Unsupported("invalid_window_timing")
@@ -949,11 +959,46 @@ mod tests {
         // observation to establish its baseline; only the contradictory
         // timing is rejected.
         snapshot = snapshot_at(Some(20.0), Some(100.0), now_ms, 1_799_999_900);
+        for window in &mut snapshot.windows {
+            window.reset_after_seconds = Some(window.limit_window_seconds.unwrap_or(0));
+        }
         assert_eq!(
             state.observe(&snapshot, now_ms),
             ActivationDecision::Unsupported("invalid_window_timing")
         );
         assert_eq!(state, ActivationState::BootstrapPending);
+    }
+
+    #[test]
+    fn n03_all_epoch_offsets_use_the_same_timing_rule() {
+        let now_ms = 1_800_000_000_000;
+        for (offset, expected) in [
+            (
+                -301,
+                ActivationDecision::Unsupported("invalid_window_timing"),
+            ),
+            (
+                -100,
+                ActivationDecision::Unsupported("invalid_window_timing"),
+            ),
+            (30, ActivationDecision::Unsupported("invalid_window_timing")),
+            (18_000, ActivationDecision::Candidate(WindowKind::FiveHour)),
+        ] {
+            let mut snapshot = snapshot(Some(0.0), Some(50.0));
+            snapshot.request_started_at_ms = now_ms;
+            snapshot.observed_at_ms = now_ms;
+            for window in &mut snapshot.windows {
+                let duration = window.limit_window_seconds.unwrap_or(0);
+                let reset_in = if duration == FIVE_HOUR_SECONDS {
+                    offset
+                } else {
+                    duration
+                };
+                window.reset_at = Some(now_ms / 1000 + reset_in);
+                window.reset_after_seconds = Some(duration);
+            }
+            assert_eq!(select_target_at(&snapshot, now_ms), expected);
+        }
     }
 
     #[test]
@@ -1122,8 +1167,8 @@ mod tests {
             "rate_limit": {
                 "allowed": false,
                 "limit_reached": true,
-                "primary_window": {"used_percent": 0, "limit_window_seconds": FIVE_HOUR_SECONDS, "reset_at": 1_800_018_000, "reset_after_seconds": FIVE_HOUR_SECONDS},
-                "secondary_window": {"used_percent": 50, "limit_window_seconds": WEEKLY_SECONDS, "reset_at": 1_800_604_800, "reset_after_seconds": WEEKLY_SECONDS}
+                "primary_window": {"used_percent": 0, "limit_window_seconds": FIVE_HOUR_SECONDS, "reset_at": FIVE_HOUR_SECONDS, "reset_after_seconds": FIVE_HOUR_SECONDS},
+                "secondary_window": {"used_percent": 50, "limit_window_seconds": WEEKLY_SECONDS, "reset_at": WEEKLY_SECONDS, "reset_after_seconds": WEEKLY_SECONDS}
             }
         });
         let parsed = snapshot_from_value(&conflict, 1, 1).unwrap();
@@ -1140,8 +1185,8 @@ mod tests {
                 "allowed": true,
                 "limit_reached": false,
                 "rate_limit_reached_type": "unknown-server-block",
-                "primary_window": {"used_percent": 0, "limit_window_seconds": FIVE_HOUR_SECONDS, "reset_at": 1_800_018_000, "reset_after_seconds": FIVE_HOUR_SECONDS},
-                "secondary_window": {"used_percent": 50, "limit_window_seconds": WEEKLY_SECONDS, "reset_at": 1_800_604_800, "reset_after_seconds": WEEKLY_SECONDS}
+                "primary_window": {"used_percent": 0, "limit_window_seconds": FIVE_HOUR_SECONDS, "reset_at": FIVE_HOUR_SECONDS, "reset_after_seconds": FIVE_HOUR_SECONDS},
+                "secondary_window": {"used_percent": 50, "limit_window_seconds": WEEKLY_SECONDS, "reset_at": WEEKLY_SECONDS, "reset_after_seconds": WEEKLY_SECONDS}
             }
         });
         let parsed = snapshot_from_value(&nested_type, 1, 1).unwrap();

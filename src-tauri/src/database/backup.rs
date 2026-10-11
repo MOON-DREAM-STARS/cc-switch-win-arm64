@@ -258,6 +258,12 @@ impl Database {
                         |row| row.get(0),
                     )
                     .map_err(|e| AppError::Database(e.to_string()))?;
+                crate::database::Database::ensure_codex_quota_activation_tombstones_on_conn(
+                    &main_conn,
+                    &temp_conn,
+                    restore_now,
+                    live_max_revision,
+                )?;
                 crate::database::Database::pause_codex_quota_activation_after_restore_on_conn(
                     &temp_conn,
                     restore_now,
@@ -1111,6 +1117,12 @@ impl Database {
                     |row| row.get(0),
                 )
                 .map_err(|e| AppError::Database(e.to_string()))?;
+            crate::database::Database::ensure_codex_quota_activation_tombstones_on_conn(
+                &main_conn,
+                &staging_conn,
+                chrono::Utc::now().timestamp_millis(),
+                live_max_revision,
+            )?;
             crate::database::Database::pause_codex_quota_activation_after_restore_on_conn(
                 &staging_conn,
                 chrono::Utc::now().timestamp_millis(),
@@ -1333,6 +1345,45 @@ mod tests {
                 target.display()
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn binary_restore_tombstones_live_activation_accounts_missing_from_backup(
+    ) -> Result<(), AppError> {
+        let _test_home = TestHomeGuard::new();
+        let db = Database::init()?;
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('binary-provider', 'codex', 'Binary Provider', '{}', '{}')",
+                [],
+            )?;
+        }
+        let source_path = db
+            .backup_database_file()?
+            .expect("binary restore source should be created");
+        let source_filename = source_path
+            .file_name()
+            .expect("source backup filename")
+            .to_string_lossy()
+            .into_owned();
+
+        db.set_codex_quota_activation_enabled("account-a", true, Some(5), 1)?;
+        let old_revision = db.codex_quota_activation_revision("account-a")?.unwrap().1;
+        db.restore_from_backup(&source_filename)?;
+
+        let tombstone = db
+            .get_codex_quota_activation_state("account-a")?
+            .expect("binary restore must retain a live-only tombstone");
+        assert!(!tombstone.enabled);
+        assert!(matches!(
+            tombstone.state,
+            crate::services::codex_quota_activation::ActivationState::AwaitingBaseline
+        ));
+        assert!(tombstone.authorization_revision > old_revision);
         Ok(())
     }
 
@@ -2492,6 +2543,85 @@ mod tests {
             "local",
             5,
             &crate::services::codex_quota_activation::ActivationState::BootstrapPending,
+            5,
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn full_restore_tombstones_live_activation_accounts_missing_from_backup() -> Result<(), AppError>
+    {
+        let _test_home = TestHomeGuard::new();
+        let live = Database::memory()?;
+        live.set_codex_quota_activation_enabled("account-a", true, Some(5), 1)?;
+        live.save_codex_quota_activation_state(
+            "account-a",
+            &crate::services::codex_quota_activation::ActivationState::Eligible {
+                target: crate::services::codex_quota_activation::WindowKind::FiveHour,
+                event_key: "five_hour:18300".to_string(),
+            },
+            2,
+        )?;
+        let old_revision = live
+            .codex_quota_activation_revision("account-a")?
+            .unwrap()
+            .1;
+        let old_attempt = "restore-missing-row-attempt";
+        assert!(live
+            .claim_codex_quota_activation_if_revision("account-a", old_revision, old_attempt, 3,)?
+            .is_some());
+
+        let backup = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(backup.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('account-provider', 'codex', 'Account Provider', '{}', '{}')",
+                [],
+            )?;
+        }
+        let backup_sql = backup.export_sql_string()?;
+        live.import_sql_string(&backup_sql)?;
+
+        let tombstone = live
+            .get_codex_quota_activation_state("account-a")?
+            .expect("live-only account must retain a tombstone");
+        assert!(!tombstone.enabled);
+        assert!(matches!(
+            tombstone.state,
+            crate::services::codex_quota_activation::ActivationState::AwaitingBaseline
+        ));
+        assert!(tombstone.authorization_revision > old_revision);
+
+        let reenabled = live.set_codex_quota_activation_enabled("account-a", true, Some(5), 4)?;
+        assert!(reenabled.authorization_revision > old_revision);
+        assert!(!live.save_codex_quota_activation_state_if_revision(
+            "account-a",
+            old_revision,
+            &crate::services::codex_quota_activation::ActivationState::BootstrapPending,
+            5,
+        )?);
+        assert!(live
+            .claim_codex_quota_activation_if_revision(
+                "account-a",
+                old_revision,
+                "old-claim-after-restore",
+                5,
+            )?
+            .is_none());
+        assert!(!live.begin_codex_quota_activation_dispatch_if_revision(
+            "account-a",
+            old_revision,
+            old_attempt,
+            5,
+        )?);
+        assert!(!live.finish_codex_quota_activation_attempt_if_revision(
+            "account-a",
+            old_revision,
+            old_attempt,
+            "completed",
+            None,
             5,
         )?);
         Ok(())
