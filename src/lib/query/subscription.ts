@@ -32,12 +32,19 @@ export function mergeNewerCodexOauthQuota(
   return incoming;
 }
 
+export function isCodexOauthQuotaSuperseded(
+  quota: SubscriptionQuota | undefined,
+): boolean {
+  return quota?.lifecycle === "superseded";
+}
+
 /** Shared write boundary for every managed-account quota producer. */
 export function publishCodexOauthQuota(
   queryClient: QueryClient,
   accountId: string | null,
   incoming: SubscriptionQuota,
 ) {
+  if (isCodexOauthQuotaSuperseded(incoming)) return;
   const key = codexOauthQuotaKey(accountId);
   queryClient.setQueryData<SubscriptionQuota>(key, (current) =>
     mergeNewerCodexOauthQuota(current, incoming),
@@ -208,6 +215,10 @@ export function useCodexOauthQuotaByAccountId(
     queryFn: async () => {
       const incoming = await subscriptionApi.getCodexOauthQuota(accountId);
       const current = queryClient.getQueryData<SubscriptionQuota>(queryKey);
+      if (isCodexOauthQuotaSuperseded(incoming)) {
+        if (current) return current;
+        throw new Error("codex_quota_result_superseded");
+      }
       return mergeNewerCodexOauthQuota(current, incoming);
     },
     enabled,

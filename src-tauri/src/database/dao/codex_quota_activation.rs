@@ -50,6 +50,17 @@ impl Database {
         _default_account_id: Option<&str>,
     ) -> Result<Option<u64>, AppError> {
         let conn = lock_conn!(self.conn);
+        Self::derive_codex_quota_activation_interval_on_conn(&conn, account_id)
+    }
+
+    /// Derive the effective interval without acquiring the database mutex.
+    /// Callers that already hold a transaction use this helper so the
+    /// Provider binding, query switch, and interval are read in the same
+    /// SQLite critical section as their state transition.
+    pub(crate) fn derive_codex_quota_activation_interval_on_conn(
+        conn: &Connection,
+        account_id: &str,
+    ) -> Result<Option<u64>, AppError> {
         let mut stmt = conn
             .prepare(
                 "SELECT id, category, meta FROM providers
@@ -732,8 +743,17 @@ impl Database {
         attempt_id: &str,
         now_ms: i64,
     ) -> Result<bool, AppError> {
-        let conn = lock_conn!(self.conn);
-        let changed = conn
+        let mut conn = lock_conn!(self.conn);
+        let tx = conn
+            .transaction()
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        let interval = Self::derive_codex_quota_activation_interval_on_conn(&tx, account_id)?;
+        if !interval.is_some_and(|value| value > 0) {
+            tx.rollback()
+                .map_err(|error| AppError::Database(error.to_string()))?;
+            return Ok(false);
+        }
+        let changed = tx
             .execute(
                 "UPDATE codex_quota_activation_state
                  SET last_attempt_status = 'submitted', updated_at = ?1
@@ -742,6 +762,8 @@ impl Database {
                    AND last_attempt_status = 'reserved'",
                 params![now_ms, account_id, expected_revision, attempt_id],
             )
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        tx.commit()
             .map_err(|error| AppError::Database(error.to_string()))?;
         Ok(changed == 1)
     }
@@ -1067,9 +1089,10 @@ mod tests {
                 "secondary_window": {"used_percent": 50, "limit_window_seconds": 604800, "reset_at": 605100, "reset_after_seconds": 604800}
             }
         });
-        let snapshot =
+        let mut snapshot =
             crate::services::codex_quota_activation::snapshot_from_value(&raw, 300_001, 300_001)
                 .unwrap();
+        snapshot.server_date_at_ms = Some(snapshot.observed_at_ms);
         assert_eq!(
             crate::services::codex_oauth_models::parse_activation_model_capability(
                 &serde_json::json!({"models":[{"slug":"gpt-6-luna","supported_reasoning_levels":[{"effort":"low"}]}]})

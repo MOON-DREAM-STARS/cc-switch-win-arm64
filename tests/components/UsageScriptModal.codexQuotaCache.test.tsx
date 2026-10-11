@@ -166,4 +166,44 @@ describe("UsageScriptModal managed Codex quota cache boundary", () => {
       ]),
     ).toBeUndefined();
   });
+
+  it("does not publish an authoritative backend-superseded result", async () => {
+    const user = userEvent.setup();
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    client.setQueryData(codexQuotaActivationStatesKey, [
+      { accountId: "account-a", authorizationRevision: 8 },
+    ]);
+    client.setQueryData(
+      ["codex_oauth", "quota", "account-a"],
+      quota(200, 20),
+    );
+    vi.spyOn(subscriptionApi, "getCodexOauthQuota").mockResolvedValue({
+      ...quota(100, 90),
+      lifecycle: "superseded",
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <UsageScriptModal
+          provider={provider}
+          appId="codex"
+          isOpen
+          onClose={vi.fn()}
+          onSave={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+    await user.click(screen.getByRole("button", { name: /testScript|测试/ }));
+    await waitFor(() => {
+      expect(
+        client.getQueryData<SubscriptionQuota>([
+          "codex_oauth",
+          "quota",
+          "account-a",
+        ])?.queriedAt,
+      ).toBe(200);
+    });
+  });
 });

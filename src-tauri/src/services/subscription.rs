@@ -4,7 +4,7 @@
 //! 第一层：仅读取凭据，不实现登录/刷新。
 
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use std::collections::{HashMap, HashSet};
 
@@ -1003,6 +1003,7 @@ async fn query_codex_usage_with_snapshot(
 > {
     let client = crate::proxy::http_client::get();
     let request_started_at_ms = now_millis();
+    let request_started_monotonic = Instant::now();
 
     let mut req = client
         .get("https://chatgpt.com/backend-api/wham/usage")
@@ -1076,6 +1077,8 @@ async fn query_codex_usage_with_snapshot(
         now_millis(),
     );
     if let Some(snapshot) = &mut snapshot {
+        snapshot.request_started_monotonic = Some(request_started_monotonic);
+        snapshot.observed_monotonic = Some(Instant::now());
         snapshot.server_date_at_ms = server_date_at_ms;
         snapshot.cache_age_seconds = cache_age_seconds;
     }

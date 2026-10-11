@@ -35,6 +35,7 @@ import {
 import { formatUsageDataSummary } from "@/utils/usageDisplay";
 import {
   codexQuotaActivationStatesKey,
+  isCodexOauthQuotaSuperseded,
   isCodexQuotaActivationRevisionCurrent,
   publishCodexOauthQuota,
 } from "@/lib/query/subscription";
@@ -554,6 +555,9 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
         const quota = isBoundCodexOfficial
           ? await subscriptionApi.getCodexOauthQuota(accountId)
           : await subscriptionApi.getQuota(appId);
+        if (isBoundCodexOfficial && isCodexOauthQuotaSuperseded(quota)) {
+          return;
+        }
         if (quota.success && quota.tiers.length > 0) {
           if (
             isBoundCodexOfficial &&

@@ -13,6 +13,7 @@ use crate::services::codex_quota_activation_http::{
 };
 use crate::services::model_fetch::FetchedModel;
 use crate::services::subscription::{query_codex_quota, CredentialStatus, SubscriptionQuota};
+use serde::Serialize;
 use std::sync::Arc;
 use tauri::State;
 use uuid::Uuid;
@@ -23,6 +24,26 @@ use uuid::Uuid;
 /// 直接持有 `Arc`，不再包一层 `RwLock`——避免任一命令持有粗粒度锁跨网络刷新
 /// 时阻塞其他命令（切换 / 认证中心操作 / token 读取）。
 pub struct CodexOAuthState(pub Arc<CodexOAuthManager>);
+
+/// Read-only quota responses carry an explicit lifecycle outcome when the
+/// backend cache rejected publication because the account generation changed
+/// while the request was in flight.  The quota payload is kept flattened for
+/// compatibility with existing frontend consumers.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexOauthQuotaResult {
+    #[serde(flatten)]
+    quota: SubscriptionQuota,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifecycle: Option<&'static str>,
+}
+
+fn codex_oauth_quota_result(quota: SubscriptionQuota, published: bool) -> CodexOauthQuotaResult {
+    CodexOauthQuotaResult {
+        quota,
+        lifecycle: (!published).then_some("superseded"),
+    }
+}
 
 /// 查询 Codex OAuth (ChatGPT Plus/Pro) 订阅额度
 ///
@@ -36,7 +57,7 @@ pub async fn get_codex_oauth_quota(
     app_state: State<'_, crate::store::AppState>,
     account_id: Option<String>,
     state: State<'_, CodexOAuthState>,
-) -> Result<SubscriptionQuota, String> {
+) -> Result<CodexOauthQuotaResult, String> {
     let manager = &state.0;
 
     // 解析最终使用的账号 ID：显式 > 默认账号 > 无账号 (not_found)
@@ -45,7 +66,10 @@ pub async fn get_codex_oauth_quota(
         None => manager.default_account_id().await,
     };
     let Some(id) = resolved else {
-        return Ok(SubscriptionQuota::not_found("codex_oauth"));
+        return Ok(codex_oauth_quota_result(
+            SubscriptionQuota::not_found("codex_oauth"),
+            true,
+        ));
     };
 
     let cache_generation = app_state.usage_cache.codex_oauth_generation(&id);
@@ -53,13 +77,20 @@ pub async fn get_codex_oauth_quota(
     // Cache by the resolved account, even if the default/binding changes while
     // the request is in flight. Transport errors retain the last good snapshot;
     // authentication/HTTP failures replace it so the tray hides invalid quotas.
-    if let Ok(quota) = &result {
-        app_state
-            .usage_cache
-            .put_codex_oauth_if_generation(id, cache_generation, quota.clone());
-        crate::tray::schedule_tray_refresh(&app);
+    match result {
+        Ok(quota) => {
+            let published = app_state.usage_cache.put_codex_oauth_if_generation(
+                id,
+                cache_generation,
+                quota.clone(),
+            );
+            if published {
+                crate::tray::schedule_tray_refresh(&app);
+            }
+            Ok(codex_oauth_quota_result(quota, published))
+        }
+        Err(error) => Err(error),
     }
-    result
 }
 
 async fn query_codex_oauth_quota_for(
@@ -544,7 +575,25 @@ pub async fn poll_codex_oauth_quota_for_activation(
     )
     .await?;
     let Some(result) = dispatch else {
-        return Ok(disabled_poll(account_id, "authorization_changed"));
+        let precondition_finished = app_state
+            .db
+            .finish_codex_quota_activation_attempt_if_revision(
+                &account_id,
+                authorization_revision,
+                &attempt_id,
+                "unknown",
+                Some("dispatch_precondition_changed"),
+                now_millis(),
+            )
+            .map_err(|error| error.to_string())?;
+        return Ok(disabled_poll(
+            account_id,
+            if precondition_finished {
+                "activation_configuration_changed"
+            } else {
+                "authorization_changed"
+            },
+        ));
     };
     let status = match result.status {
         ActivationHttpStatus::Completed => "completed",
@@ -665,7 +714,10 @@ mod tests {
     use super::*;
     use crate::database::Database;
     use crate::error::AppError;
+    use crate::provider::{AuthBinding, AuthBindingSource, Provider, ProviderMeta, UsageScript};
     use crate::services::codex_quota_activation::{ActivationState, WindowKind};
+    use crate::services::subscription::{QuotaTier, SubscriptionQuota};
+    use crate::services::usage_cache::UsageCache;
     use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Router};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -692,9 +744,52 @@ mod tests {
         )
     }
 
+    fn account_provider(account_id: Option<&str>, enabled: bool, interval: u64) -> Provider {
+        let mut meta = ProviderMeta::default();
+        meta.provider_type = Some("codex_oauth".to_string());
+        meta.auth_binding = Some(AuthBinding {
+            source: AuthBindingSource::ManagedAccount,
+            auth_provider: Some("codex_oauth".to_string()),
+            account_id: account_id.map(str::to_string),
+        });
+        meta.usage_script = Some(UsageScript {
+            enabled,
+            language: "javascript".to_string(),
+            code: "return {};".to_string(),
+            timeout: None,
+            api_key: None,
+            base_url: None,
+            access_token: None,
+            user_id: None,
+            template_type: Some("official_subscription".to_string()),
+            auto_query_interval: Some(interval),
+            coding_plan_provider: None,
+            access_key_id: None,
+            secret_access_key: None,
+            team_organization_id: None,
+            team_project_id: None,
+        });
+        Provider {
+            id: "codex-provider".to_string(),
+            name: "Codex OAuth".to_string(),
+            settings_config: serde_json::json!({}),
+            website_url: None,
+            category: Some("official".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(meta),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        }
+    }
+
     async fn prepared_claim() -> (Arc<Database>, i64, String) {
         let db = Arc::new(Database::memory().unwrap());
-        db.set_codex_quota_activation_enabled("account", true, Some(1), 1)
+        db.save_provider("codex", &account_provider(Some("account"), true, 5))
+            .unwrap();
+        db.set_codex_quota_activation_enabled("account", true, Some(5), 1)
             .unwrap();
         db.save_codex_quota_activation_state(
             "account",
@@ -716,6 +811,119 @@ mod tests {
             .unwrap()
             .is_some());
         (db, revision, attempt)
+    }
+
+    #[test]
+    fn s04_backend_cache_rejection_is_serialized_as_superseded() {
+        let cache = UsageCache::new();
+        let quota = SubscriptionQuota {
+            tool: "codex_oauth".to_string(),
+            credential_status: CredentialStatus::Valid,
+            credential_message: None,
+            success: true,
+            tiers: vec![QuotaTier {
+                name: "five_hour".to_string(),
+                utilization: 20.0,
+                resets_at: None,
+                used_value_usd: None,
+                max_value_usd: None,
+            }],
+            extra_usage: None,
+            reset_credits: None,
+            credits_balance: None,
+            error: None,
+            queried_at: Some(100),
+        };
+        let generation = cache.codex_oauth_generation("account");
+        cache.invalidate_codex_oauth("account");
+        assert!(!cache.put_codex_oauth_if_generation(
+            "account".to_string(),
+            generation,
+            quota.clone(),
+        ));
+
+        let result = serde_json::to_value(codex_oauth_quota_result(quota, false)).unwrap();
+        assert_eq!(result["lifecycle"], "superseded");
+        assert_eq!(result["tool"], "codex_oauth");
+        assert_eq!(result["success"], true);
+    }
+
+    #[tokio::test]
+    async fn s01_provider_configuration_is_checked_before_loopback_sender() {
+        let server = Arc::new(FakeActivationServer {
+            calls: AtomicUsize::new(0),
+            seen: Notify::new(),
+            release: Notify::new(),
+        });
+        let app = Router::new()
+            .route("/activation", post(activation_handler))
+            .with_state(server.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (db, revision, attempt) = prepared_claim().await;
+        let ready = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let before_ready = ready.clone();
+        let before_release = release.clone();
+        let client =
+            crate::proxy::http_client::build_client_with_redirect_policy(None, true).unwrap();
+        let dispatch_db = db.clone();
+        let result = tokio::spawn(async move {
+            dispatch_activation_with(
+                &dispatch_db,
+                "account",
+                revision,
+                &attempt,
+                move || async move {
+                    before_ready.notify_one();
+                    before_release.notified().await;
+                },
+                move || async move {
+                    send_activation_once(
+                        &client,
+                        &format!("http://{address}/activation"),
+                        "fake-token",
+                        "fake-workspace",
+                    )
+                    .await
+                },
+            )
+            .await
+            .unwrap()
+        });
+
+        ready.notified().await;
+        // This is a real provider save, so the final DB critical section must
+        // observe the changed effective query switch/interval before submit.
+        db.save_provider("codex", &account_provider(Some("account"), true, 0))
+            .unwrap();
+        release.notify_one();
+
+        assert!(result.await.unwrap().is_none());
+        assert_eq!(server.calls.load(Ordering::SeqCst), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn s01_disabled_or_unbound_provider_cannot_submit_reserved_attempt() {
+        for (case, account_id, enabled, interval) in [
+            ("query_switch_off", Some("account"), false, 5),
+            ("zero_interval", Some("account"), true, 0),
+            ("binding_changed", Some("other-account"), true, 5),
+        ] {
+            let (db, revision, attempt) = prepared_claim().await;
+            db.save_provider("codex", &account_provider(account_id, enabled, interval))
+                .unwrap();
+            assert!(
+                !db.begin_codex_quota_activation_dispatch_if_revision(
+                    "account", revision, &attempt, 4,
+                )
+                .unwrap(),
+                "{case} must fail closed before submitted"
+            );
+        }
     }
 
     #[tokio::test]
