@@ -1026,6 +1026,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn u01_expired_window_uses_real_dispatch_once_and_never_reclaims() -> Result<(), AppError>
+    {
+        const BOUNDARY: i64 = 1_800_000_000;
+        let server = Arc::new(FakeActivationServer {
+            calls: AtomicUsize::new(0),
+            seen: Notify::new(),
+            release: Notify::new(),
+        });
+        let app = Router::new()
+            .route("/activation", post(activation_handler))
+            .with_state(server.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let db = Arc::new(Database::memory()?);
+        db.save_provider("codex", &account_provider(Some("account"), true, 5))?;
+        let interval = db.derive_codex_quota_activation_interval("account", None)?;
+        db.set_codex_quota_activation_enabled("account", true, interval, 1)?;
+        let record = db.get_codex_quota_activation_state("account")?.unwrap();
+        let observation = |server_seconds: i64, used: f64| {
+            let value = serde_json::json!({
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {
+                        "used_percent": used,
+                        "limit_window_seconds": 18000,
+                        "reset_at": BOUNDARY,
+                        "reset_after_seconds": (BOUNDARY - server_seconds).max(0)
+                    },
+                    "secondary_window": {
+                        "used_percent": 50,
+                        "limit_window_seconds": 604800,
+                        "reset_at": server_seconds + 604800,
+                        "reset_after_seconds": 604800
+                    }
+                }
+            });
+            let mut snapshot = crate::services::codex_quota_activation::snapshot_from_value(
+                &value,
+                server_seconds * 1000,
+                server_seconds * 1000,
+            )
+            .unwrap();
+            snapshot.server_date_at_ms = Some(server_seconds * 1000);
+            snapshot.cache_age_seconds = Some(0);
+            snapshot
+        };
+
+        let initial = observation(BOUNDARY - 60, 0.0);
+        let mut state = record.state;
+        assert!(matches!(
+            state.observe(&initial, initial.observed_at_ms),
+            ActivationDecision::Candidate(WindowKind::FiveHour)
+        ));
+        assert!(db.save_codex_quota_activation_state_if_revision(
+            "account",
+            record.authorization_revision,
+            &state,
+            initial.observed_at_ms,
+        )?);
+        let attempt = db
+            .claim_codex_quota_activation_if_revision(
+                "account",
+                record.authorization_revision,
+                "attempt-a",
+                BOUNDARY - 50_000,
+            )?
+            .expect("initial candidate must claim");
+
+        let client =
+            crate::proxy::http_client::build_client_with_redirect_policy(None, true).unwrap();
+        let dispatch_db = db.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_activation_with(
+                &dispatch_db,
+                "account",
+                record.authorization_revision,
+                &attempt.attempt_id,
+                || async {},
+                move || async move {
+                    send_activation_once(
+                        &client,
+                        &format!("http://{address}/activation"),
+                        "fake-token",
+                        "fake-workspace",
+                    )
+                    .await
+                },
+            )
+            .await
+            .unwrap()
+        });
+        server.seen.notified().await;
+        server.release.notify_one();
+        assert!(dispatch.await.unwrap().is_some());
+        assert!(db.finish_codex_quota_activation_attempt_if_revision(
+            "account",
+            record.authorization_revision,
+            "attempt-a",
+            "completed",
+            None,
+            BOUNDARY,
+        )?);
+
+        let record = db.get_codex_quota_activation_state("account")?.unwrap();
+        let expired_nonzero = observation(BOUNDARY + 120, 20.0);
+        let mut state = record.state;
+        assert_eq!(
+            state.observe(&expired_nonzero, expired_nonzero.observed_at_ms),
+            ActivationDecision::Observe
+        );
+        assert!(matches!(state, ActivationState::Spent { .. }));
+        let repeated_zero = observation(BOUNDARY + 180, 0.0);
+        assert_eq!(
+            state.observe(&repeated_zero, repeated_zero.observed_at_ms),
+            ActivationDecision::Observe
+        );
+        assert!(db
+            .claim_codex_quota_activation_if_revision(
+                "account",
+                record.authorization_revision,
+                "attempt-b",
+                repeated_zero.observed_at_ms,
+            )?
+            .is_none());
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn n02_disable_before_dispatch_commit_calls_real_sender_zero_times() {
         let server = Arc::new(FakeActivationServer {
             calls: AtomicUsize::new(0),

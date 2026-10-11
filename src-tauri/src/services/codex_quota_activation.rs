@@ -747,6 +747,7 @@ impl ActivationState {
                 if *previous == target
                     && window.used_percent.is_some_and(|value| value > 0.0)
                     && server_observation_after_attempt(snapshot, *attempted_at_ms)
+                    && current_nonzero_window_is_valid(snapshot, window, target)
                     && window.reset_at.is_some_and(|reset| {
                         event_boundary(event_key).is_some_and(|boundary| reset >= boundary)
                     })
@@ -814,6 +815,20 @@ fn server_observation_after_attempt(snapshot: &CodexQuotaSnapshot, attempted_at_
     // server window fields; it must not be used to reinterpret an old local
     // attempt after a clock offset changes.
     snapshot.server_date_at_ms.is_some() && snapshot.request_started_at_ms > attempted_at_ms
+}
+
+fn current_nonzero_window_is_valid(
+    snapshot: &CodexQuotaSnapshot,
+    window: &QuotaWindowSnapshot,
+    kind: WindowKind,
+) -> bool {
+    let Some(server_date_at_ms) = snapshot.server_date_at_ms else {
+        return false;
+    };
+    let server_seconds = server_date_at_ms.div_euclid(1000);
+    window.reset_after_seconds.is_some_and(|after| after > 0)
+        && window.reset_at.is_some_and(|reset| reset > server_seconds)
+        && valid_timing(window, kind, snapshot)
 }
 
 fn trusted_exhaustion_snapshot(snapshot: &CodexQuotaSnapshot) -> bool {
@@ -958,6 +973,36 @@ mod tests {
                     .max(0),
             );
         }
+        snapshot
+    }
+
+    fn audit_observation(
+        server_seconds: i64,
+        five_hour: Option<f64>,
+        five_reset: Option<i64>,
+    ) -> CodexQuotaSnapshot {
+        let value = json!({
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": five_hour.map(|used| json!({
+                    "used_percent": used,
+                    "limit_window_seconds": FIVE_HOUR_SECONDS,
+                    "reset_at": five_reset.unwrap(),
+                    "reset_after_seconds": five_reset.unwrap().saturating_sub(server_seconds).max(0)
+                })),
+                "secondary_window": {
+                    "used_percent": 50,
+                    "limit_window_seconds": WEEKLY_SECONDS,
+                    "reset_at": server_seconds + WEEKLY_SECONDS,
+                    "reset_after_seconds": WEEKLY_SECONDS
+                }
+            }
+        });
+        let mut snapshot =
+            snapshot_from_value(&value, server_seconds * 1000, server_seconds * 1000).unwrap();
+        snapshot.server_date_at_ms = Some(server_seconds * 1000);
+        snapshot.cache_age_seconds = Some(0);
         snapshot
     }
 
@@ -1427,6 +1472,141 @@ mod tests {
             state.observe(&recovered, recovered.observed_at_ms),
             ActivationDecision::Candidate(WindowKind::Weekly)
         );
+    }
+
+    #[test]
+    fn u01_expired_five_hour_nonzero_cannot_rearm_but_t01_current_window_still_can() {
+        const B: i64 = 1_800_000_000;
+        let mut expired_state = ActivationState::default();
+        let first = audit_observation(B + 60, Some(0.0), Some(B));
+        assert_eq!(
+            expired_state.observe(&first, first.observed_at_ms),
+            ActivationDecision::Candidate(WindowKind::FiveHour)
+        );
+        assert!(expired_state
+            .claim("attempt-a", first.observed_at_ms)
+            .is_some());
+
+        let expired_nonzero = audit_observation(B + 120, Some(20.0), Some(B));
+        assert_eq!(
+            expired_state.observe(&expired_nonzero, expired_nonzero.observed_at_ms),
+            ActivationDecision::Observe
+        );
+        assert!(matches!(expired_state, ActivationState::Spent { .. }));
+        let repeated_zero = audit_observation(B + 180, Some(0.0), Some(B));
+        assert_eq!(
+            expired_state.observe(&repeated_zero, repeated_zero.observed_at_ms),
+            ActivationDecision::Observe
+        );
+        assert!(matches!(expired_state, ActivationState::Spent { .. }));
+        assert!(expired_state
+            .claim("attempt-b", repeated_zero.observed_at_ms)
+            .is_none());
+
+        let mut valid_state = ActivationState::default();
+        let before_boundary = audit_observation(B - 60, Some(0.0), Some(B));
+        assert!(matches!(
+            valid_state.observe(&before_boundary, before_boundary.observed_at_ms),
+            ActivationDecision::Candidate(WindowKind::FiveHour)
+        ));
+        assert!(valid_state
+            .claim("valid-a", before_boundary.observed_at_ms)
+            .is_some());
+        let valid_nonzero = audit_observation(B - 30, Some(20.0), Some(B));
+        assert_eq!(
+            valid_state.observe(&valid_nonzero, valid_nonzero.observed_at_ms),
+            ActivationDecision::Observe
+        );
+        assert!(matches!(valid_state, ActivationState::TrackingUsage { .. }));
+        let recovered = audit_observation(B + 1, Some(0.0), Some(B));
+        assert!(matches!(
+            valid_state.observe(&recovered, recovered.observed_at_ms),
+            ActivationDecision::Candidate(WindowKind::FiveHour)
+        ));
+    }
+
+    #[test]
+    fn u01_expired_weekly_only_nonzero_cannot_rearm() {
+        const B: i64 = 1_800_000_000;
+        let mut state = ActivationState::default();
+        let first = audit_observation(B + 60, None, None);
+        // The weekly fixture is currently future-dated. Move it to the same
+        // expired boundary while keeping Date and countdown internally valid.
+        let mut first = first;
+        let weekly = first
+            .windows
+            .iter_mut()
+            .find(|window| window.limit_window_seconds == Some(WEEKLY_SECONDS))
+            .unwrap();
+        weekly.used_percent = Some(0.0);
+        weekly.reset_at = Some(B);
+        weekly.reset_after_seconds = Some(0);
+        assert_eq!(
+            state.observe(&first, first.observed_at_ms),
+            ActivationDecision::Candidate(WindowKind::Weekly)
+        );
+        assert!(state.claim("weekly-a", first.observed_at_ms).is_some());
+
+        let mut expired_nonzero = audit_observation(B + 120, None, None);
+        let weekly = expired_nonzero
+            .windows
+            .iter_mut()
+            .find(|window| window.limit_window_seconds == Some(WEEKLY_SECONDS))
+            .unwrap();
+        weekly.used_percent = Some(20.0);
+        weekly.reset_at = Some(B);
+        weekly.reset_after_seconds = Some(0);
+        assert_eq!(
+            state.observe(&expired_nonzero, expired_nonzero.observed_at_ms),
+            ActivationDecision::Observe
+        );
+        assert!(matches!(state, ActivationState::Spent { .. }));
+        let mut next_zero = audit_observation(B + 180, None, None);
+        let weekly = next_zero
+            .windows
+            .iter_mut()
+            .find(|window| window.limit_window_seconds == Some(WEEKLY_SECONDS))
+            .unwrap();
+        weekly.used_percent = Some(0.0);
+        weekly.reset_at = Some(B);
+        weekly.reset_after_seconds = Some(0);
+        assert_eq!(
+            state.observe(&next_zero, next_zero.observed_at_ms),
+            ActivationDecision::Observe
+        );
+        assert!(state.claim("weekly-b", next_zero.observed_at_ms).is_none());
+    }
+
+    #[test]
+    fn u01_post_attempt_nonzero_with_a_new_future_boundary_is_valid() {
+        const B: i64 = 1_800_000_000;
+        let mut state = ActivationState::default();
+        let first = audit_observation(B - 60, Some(0.0), Some(B));
+        assert!(matches!(
+            state.observe(&first, first.observed_at_ms),
+            ActivationDecision::Candidate(WindowKind::FiveHour)
+        ));
+        assert!(state.claim("attempt", first.observed_at_ms).is_some());
+
+        let new_boundary = B + FIVE_HOUR_SECONDS;
+        let used = audit_observation(B + 120, Some(20.0), Some(new_boundary));
+        assert_eq!(
+            state.observe(&used, used.observed_at_ms),
+            ActivationDecision::Observe
+        );
+        assert_eq!(
+            state,
+            ActivationState::TrackingUsage {
+                target: WindowKind::FiveHour,
+                boundary_reset_at: new_boundary,
+            }
+        );
+
+        let recovered = audit_observation(new_boundary + 1, Some(0.0), Some(new_boundary));
+        assert!(matches!(
+            state.observe(&recovered, recovered.observed_at_ms),
+            ActivationDecision::Candidate(WindowKind::FiveHour)
+        ));
     }
 
     #[test]

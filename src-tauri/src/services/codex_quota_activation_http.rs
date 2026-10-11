@@ -7,6 +7,7 @@
 use crate::proxy::providers::codex_oauth_auth::{
     CODEX_OAUTH_CLIENT_VERSION, CODEX_OAUTH_ORIGINATOR,
 };
+use crate::proxy::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -110,11 +111,10 @@ async fn send_activation_inner(
             failed(&message, &[token, workspace])
         };
     }
-    let body = match read_bounded_stream(response).await {
-        Ok(body) => body,
-        Err(error) => return unknown(&error, &[token, workspace]),
-    };
-    classify_sse_with_secrets(&body, &[token, workspace])
+    match read_sse_until_terminal(response, &[token, workspace]).await {
+        Ok(result) => result,
+        Err(error) => unknown(&error, &[token, workspace]),
+    }
 }
 
 async fn read_bounded(response: reqwest::Response) -> Result<String, String> {
@@ -132,91 +132,141 @@ async fn read_bounded_stream(mut response: reqwest::Response) -> Result<String, 
     Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
+async fn read_sse_until_terminal(
+    mut response: reqwest::Response,
+    secrets: &[&str],
+) -> Result<ActivationHttpResult, String> {
+    let mut buffer = String::new();
+    let mut utf8_remainder = Vec::new();
+    let mut total_bytes = 0usize;
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        total_bytes = total_bytes.saturating_add(chunk.len());
+        if total_bytes > MAX_RESPONSE_BYTES {
+            return Err("response exceeded size limit".to_string());
+        }
+        append_utf8_safe(&mut buffer, &mut utf8_remainder, &chunk);
+        let mut terminal = None;
+        while let Some(block) = take_sse_block(&mut buffer) {
+            if let Some(result) = classify_sse_block(&block, secrets) {
+                terminal = Some(match terminal.take() {
+                    Some(previous) => merge_terminal_results(previous, result, secrets),
+                    None => result,
+                });
+            }
+        }
+        if let Some(result) = terminal {
+            return Ok(result);
+        }
+    }
+    Ok(unknown("response ended without a terminal event", secrets))
+}
+
 pub(crate) fn classify_sse(body: &str) -> ActivationHttpResult {
     classify_sse_with_secrets(body, &[])
 }
 
 fn classify_sse_with_secrets(body: &str, secrets: &[&str]) -> ActivationHttpResult {
-    let mut completed: Option<String> = None;
-    let mut failure: Option<String> = None;
-    let normalized = body.replace("\r\n", "\n");
-    for block in normalized.split("\n\n") {
-        let mut event = None;
-        let mut data = String::new();
-        for line in block.lines() {
-            if let Some(value) = line.strip_prefix("event:") {
-                event = Some(value.trim());
-            } else if let Some(value) = line.strip_prefix("data:") {
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(value.trim_start());
-            }
+    let mut buffer = body.to_string();
+    let mut terminal = None;
+    while let Some(block) = take_sse_block(&mut buffer) {
+        if let Some(result) = classify_sse_block(&block, secrets) {
+            terminal = Some(match terminal.take() {
+                Some(previous) => merge_terminal_results(previous, result, secrets),
+                None => result,
+            });
         }
-        let parsed = serde_json::from_str::<Value>(&data).ok();
-        let event_name = event.or_else(|| {
-            parsed
+    }
+    terminal.unwrap_or_else(|| unknown("response ended without a terminal event", secrets))
+}
+
+fn merge_terminal_results(
+    previous: ActivationHttpResult,
+    next: ActivationHttpResult,
+    secrets: &[&str],
+) -> ActivationHttpResult {
+    if previous.status != next.status {
+        return failed(
+            &format!(
+                "conflicting terminal events: {}",
+                next.error
+                    .unwrap_or_else(|| "conflicting terminal event".to_string())
+            ),
+            secrets,
+        );
+    }
+    previous
+}
+
+fn classify_sse_block(block: &str, secrets: &[&str]) -> Option<ActivationHttpResult> {
+    let mut event = None;
+    let mut data = String::new();
+    for line in block.lines() {
+        if let Some(value) = strip_sse_field(line, "event") {
+            event = Some(value.trim());
+        } else if let Some(value) = strip_sse_field(line, "data") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(value);
+        }
+    }
+    let parsed = serde_json::from_str::<Value>(&data).ok();
+    let event_name = event.or_else(|| {
+        parsed
+            .as_ref()
+            .and_then(|value| value.get("type").and_then(Value::as_str))
+    });
+    match event_name {
+        Some("response.completed") => {
+            let payload_type = parsed
                 .as_ref()
-                .and_then(|value| value.get("type").and_then(Value::as_str))
-        });
-        match event_name {
-            Some("response.completed") => {
-                let payload_type = parsed
-                    .as_ref()
-                    .and_then(|value| value.get("type"))
-                    .and_then(Value::as_str);
-                let response_status = parsed
-                    .as_ref()
-                    .and_then(|value| value.pointer("/response/status"))
-                    .and_then(Value::as_str);
-                let response_error = parsed
-                    .as_ref()
-                    .and_then(|value| value.pointer("/response/error"));
-                if payload_type.is_some_and(|value| value != "response.completed")
-                    || response_status.is_some_and(|value| value != "completed")
-                    || response_error.is_some_and(|value| !value.is_null())
-                {
-                    failure = Some(parsed.as_ref().and_then(error_message).unwrap_or_else(|| {
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str);
+            let response_status = parsed
+                .as_ref()
+                .and_then(|value| value.pointer("/response/status"))
+                .and_then(Value::as_str);
+            let response_error = parsed
+                .as_ref()
+                .and_then(|value| value.pointer("/response/error"));
+            if payload_type.is_some_and(|value| value != "response.completed")
+                || response_status.is_some_and(|value| value != "completed")
+                || response_error.is_some_and(|value| !value.is_null())
+            {
+                return Some(failed(
+                    &parsed.as_ref().and_then(error_message).unwrap_or_else(|| {
                         "activation completion payload was not successful".to_string()
-                    }));
-                    continue;
-                }
-                completed = parsed.as_ref().and_then(|value| {
-                    value
-                        .pointer("/response/model")
-                        .or_else(|| value.get("model"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                });
+                    }),
+                    secrets,
+                ));
             }
-            Some("response.failed" | "response.cancelled" | "response.incomplete" | "error") => {
-                failure = Some(
-                    parsed
-                        .as_ref()
-                        .and_then(error_message)
-                        .unwrap_or_else(|| "activation failed".to_string()),
-                );
+            let actual_model = parsed.as_ref().and_then(|value| {
+                value
+                    .pointer("/response/model")
+                    .or_else(|| value.get("model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })?;
+            if actual_model != ACTIVATION_MODEL {
+                return Some(failed("server returned an unexpected model", secrets));
             }
-            _ => {}
+            Some(ActivationHttpResult {
+                status: ActivationHttpStatus::Completed,
+                actual_model: Some(actual_model),
+                error: None,
+            })
         }
-    }
-    if let (Some(_), Some(error)) = (completed.as_ref(), failure.as_ref()) {
-        return failed(&format!("conflicting terminal events: {error}"), secrets);
-    }
-    if let Some(actual_model) = completed {
-        if actual_model != ACTIVATION_MODEL {
-            return failed("server returned an unexpected model", secrets);
+        Some("response.failed" | "response.cancelled" | "response.incomplete" | "error") => {
+            Some(failed(
+                &parsed
+                    .as_ref()
+                    .and_then(error_message)
+                    .unwrap_or_else(|| "activation failed".to_string()),
+                secrets,
+            ))
         }
-        return ActivationHttpResult {
-            status: ActivationHttpStatus::Completed,
-            actual_model: Some(actual_model),
-            error: None,
-        };
+        _ => None,
     }
-    if let Some(error) = failure {
-        return failed(&error, secrets);
-    }
-    unknown("response ended without a terminal event", secrets)
 }
 
 fn error_message(value: &Value) -> Option<String> {
@@ -262,7 +312,16 @@ fn sanitize(error: &str, secrets: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{extract::State, http::header, response::IntoResponse, routing::post, Router};
+    use axum::{
+        body::Body,
+        extract::State,
+        http::header,
+        response::{IntoResponse, Response},
+        routing::post,
+        Router,
+    };
+    use bytes::Bytes;
+    use futures::StreamExt;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -433,5 +492,158 @@ mod tests {
         assert!(!error.contains("FAKE_TOKEN"));
         assert!(!error.contains("FAKE_WORKSPACE"));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn complete_frame_finishes_before_http_body_eof() {
+        async fn completed_pending() -> Response {
+            let stream = futures::stream::once(async {
+                Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                    b"event: response.completed\ndata: {\"response\":{\"model\":\"gpt-6-luna\",\"status\":\"completed\"}}\n\n",
+                ))
+            })
+            .chain(futures::stream::pending());
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+        let app = Router::new().route("/completed-pending", post(completed_pending));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            crate::proxy::http_client::build_client_with_redirect_policy(None, true).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_activation_once(
+                &client,
+                &format!("http://{address}/completed-pending"),
+                "fake-token",
+                "fake-workspace",
+            ),
+        )
+        .await
+        .expect("complete frame should not wait for body EOF");
+        assert_eq!(result.status, ActivationHttpStatus::Completed);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_frame_finishes_before_http_body_eof() {
+        async fn failed_pending() -> Response {
+            let stream = futures::stream::once(async {
+                Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                    b"event: response.failed\ndata: {\"error\":{\"message\":\"bad FAKE_TOKEN\"}}\n\n",
+                ))
+            })
+            .chain(futures::stream::pending());
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+        let app = Router::new().route("/failed-pending", post(failed_pending));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            crate::proxy::http_client::build_client_with_redirect_policy(None, true).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_activation_once(
+                &client,
+                &format!("http://{address}/failed-pending"),
+                "FAKE_TOKEN",
+                "fake-workspace",
+            ),
+        )
+        .await
+        .expect("failed frame should not wait for body EOF");
+        assert_eq!(result.status, ActivationHttpStatus::Failed);
+        assert!(!result.error.unwrap_or_default().contains("FAKE_TOKEN"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn production_stream_parser_handles_utf8_split_and_mixed_delimiters() {
+        async fn split_stream() -> Response {
+            let first = "event: response.output_text.delta\r\ndata: {\"text\":\"你";
+            let second = "好\"}\n\r\nevent: response.completed\ndata: {\"response\":{\"model\":\"gpt-6-luna\",\"status\":\"completed\"}}\n\n";
+            let first_bytes = first.as_bytes();
+            let split = first_bytes.len() - "你".len();
+            let stream = futures::stream::iter(vec![
+                Ok::<_, std::convert::Infallible>(Bytes::copy_from_slice(
+                    &first_bytes[..split + 1],
+                )),
+                Ok::<_, std::convert::Infallible>(Bytes::from(
+                    [&first_bytes[split + 1..], second.as_bytes()].concat(),
+                )),
+            ]);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+        let app = Router::new().route("/split", post(split_stream));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            crate::proxy::http_client::build_client_with_redirect_policy(None, true).unwrap();
+        let result = send_activation_once(
+            &client,
+            &format!("http://{address}/split"),
+            "fake-token",
+            "fake-workspace",
+        )
+        .await;
+        assert_eq!(result.status, ActivationHttpStatus::Completed);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fake_server_eof_after_an_unterminated_json_frame_is_unknown() {
+        async fn incomplete() -> impl IntoResponse {
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                "event: response.completed\ndata: {\"response\":{\"model\":\"gpt-6-luna\",\"status\":\"completed\"}}\n",
+            )
+        }
+        let app = Router::new().route("/incomplete", post(incomplete));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client =
+            crate::proxy::http_client::build_client_with_redirect_policy(None, true).unwrap();
+        let result = send_activation_once(
+            &client,
+            &format!("http://{address}/incomplete"),
+            "fake-token",
+            "fake-workspace",
+        )
+        .await;
+        assert_eq!(result.status, ActivationHttpStatus::Unknown);
+        server.abort();
+    }
+
+    #[test]
+    fn eof_without_a_complete_sse_frame_is_unknown() {
+        let result = classify_sse(
+            "event: response.completed\ndata: {\"response\":{\"model\":\"gpt-6-luna\",\"status\":\"completed\"}}\n",
+        );
+        assert_eq!(result.status, ActivationHttpStatus::Unknown);
+    }
+
+    #[test]
+    fn complete_and_failed_frames_in_one_batch_are_conservative() {
+        let result = classify_sse(
+            "event: response.completed\ndata: {\"response\":{\"model\":\"gpt-6-luna\",\"status\":\"completed\"}}\n\nevent: response.failed\ndata: {\"error\":{\"message\":\"later failure\"}}\n\n",
+        );
+        assert_eq!(result.status, ActivationHttpStatus::Failed);
     }
 }
