@@ -2629,6 +2629,82 @@ mod tests {
 
     #[test]
     #[serial]
+    fn v01_full_restore_awaiting_baseline_rejects_expired_nonzero() -> Result<(), AppError> {
+        let _test_home = TestHomeGuard::new();
+        const B: i64 = 1_800_000_000;
+        let source = Database::memory()?;
+        source.set_codex_quota_activation_enabled("account-a", true, Some(5), 1)?;
+        let backup_sql = source.export_sql_string()?;
+
+        let live = Database::memory()?;
+        live.import_sql_string(&backup_sql)?;
+        let record = live
+            .get_codex_quota_activation_state("account-a")?
+            .expect("full restore must create the activation row");
+        assert!(!record.enabled);
+        assert!(matches!(
+            record.state,
+            crate::services::codex_quota_activation::ActivationState::AwaitingBaseline
+        ));
+
+        let snapshot = |server_seconds: i64, used: f64| {
+            let raw = serde_json::json!({
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {
+                        "used_percent": used,
+                        "limit_window_seconds": 18000,
+                        "reset_at": B,
+                        "reset_after_seconds": 0
+                    },
+                    "secondary_window": {
+                        "used_percent": 50,
+                        "limit_window_seconds": 604800,
+                        "reset_at": server_seconds + 604800,
+                        "reset_after_seconds": 604800
+                    }
+                }
+            });
+            let mut parsed = crate::services::codex_quota_activation::snapshot_from_value(
+                &raw,
+                server_seconds * 1000,
+                server_seconds * 1000,
+            )
+            .unwrap();
+            parsed.server_date_at_ms = Some(server_seconds * 1000);
+            parsed.cache_age_seconds = Some(0);
+            parsed
+        };
+
+        let mut state = record.state;
+        let expired_nonzero = snapshot(B + 300, 20.0);
+        assert_eq!(
+            state.observe(&expired_nonzero, expired_nonzero.observed_at_ms),
+            crate::services::codex_quota_activation::ActivationDecision::Observe
+        );
+        assert!(matches!(
+            state,
+            crate::services::codex_quota_activation::ActivationState::AwaitingBaseline
+        ));
+        let expired_zero = snapshot(B + 600, 0.0);
+        assert!(!matches!(
+            state.observe(&expired_zero, expired_zero.observed_at_ms),
+            crate::services::codex_quota_activation::ActivationDecision::Candidate(_)
+        ));
+        assert!(live
+            .claim_codex_quota_activation_if_revision(
+                "account-a",
+                record.authorization_revision,
+                "must-not-claim",
+                expired_zero.observed_at_ms,
+            )?
+            .is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
     fn failed_backup_publish_leaves_no_visible_or_temporary_file() -> Result<(), AppError> {
         let _test_home = TestHomeGuard::new();
         let db = Database::init()?;

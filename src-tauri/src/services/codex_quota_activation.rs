@@ -670,6 +670,9 @@ impl ActivationState {
                     *self = Self::Eligible { target, event_key };
                     decision
                 } else if window.used_percent.is_some_and(|value| value > 0.0) {
+                    if !current_nonzero_window_is_valid(snapshot, window, target) {
+                        return decision;
+                    }
                     let Some(boundary_reset_at) = window.reset_at else {
                         *self = Self::AwaitingBaseline;
                         return ActivationDecision::Unsupported("missing_window_boundary");
@@ -690,10 +693,12 @@ impl ActivationState {
                 boundary_reset_at,
             } => {
                 if window.used_percent.is_some_and(|value| value > 0.0) {
-                    if let Some(reset_at) =
-                        window.reset_at.filter(|reset| *reset >= *boundary_reset_at)
-                    {
-                        *boundary_reset_at = reset_at;
+                    if current_nonzero_window_is_valid(snapshot, window, target) {
+                        if let Some(reset_at) =
+                            window.reset_at.filter(|reset| *reset >= *boundary_reset_at)
+                        {
+                            *boundary_reset_at = reset_at;
+                        }
                     }
                     decision
                 } else if can_qualify
@@ -717,13 +722,13 @@ impl ActivationState {
                     *self = Self::AwaitingBaseline;
                     ActivationDecision::Unsupported("window_structure_changed")
                 } else if window.used_percent.is_some_and(|value| value > 0.0) {
-                    if let Some(reset_at) = window.reset_at {
-                        *self = Self::TrackingUsage {
-                            target,
-                            boundary_reset_at: reset_at,
-                        };
-                    } else {
-                        *self = Self::AwaitingBaseline;
+                    if current_nonzero_window_is_valid(snapshot, window, target) {
+                        if let Some(reset_at) = window.reset_at {
+                            *self = Self::TrackingUsage {
+                                target,
+                                boundary_reset_at: reset_at,
+                            };
+                        }
                     }
                     decision
                 } else {
@@ -766,7 +771,9 @@ impl ActivationState {
                 }
             }
             Self::AwaitingBaseline => {
-                if window.used_percent.is_some_and(|value| value > 0.0) {
+                if window.used_percent.is_some_and(|value| value > 0.0)
+                    && current_nonzero_window_is_valid(snapshot, window, target)
+                {
                     if let Some(reset_at) = window.reset_at {
                         *self = Self::TrackingUsage {
                             target,
@@ -1607,6 +1614,59 @@ mod tests {
             state.observe(&recovered, recovered.observed_at_ms),
             ActivationDecision::Candidate(WindowKind::FiveHour)
         ));
+    }
+
+    #[test]
+    fn v01_shape_change_awaiting_baseline_rejects_expired_nonzero() {
+        const B: i64 = 1_800_000_000;
+        let mut state = ActivationState::default();
+        let first = audit_observation(B + 60, Some(0.0), Some(B));
+        assert_eq!(
+            state.observe(&first, first.observed_at_ms),
+            ActivationDecision::Candidate(WindowKind::FiveHour)
+        );
+        assert!(state.claim("first", first.observed_at_ms).is_some());
+
+        let weekly_only = audit_observation(B + 300, None, None);
+        assert_eq!(
+            state.observe(&weekly_only, weekly_only.observed_at_ms),
+            ActivationDecision::Unsupported("window_structure_changed")
+        );
+        assert!(matches!(state, ActivationState::AwaitingBaseline));
+
+        let expired_nonzero = audit_observation(B + 600, Some(20.0), Some(B));
+        assert_eq!(
+            state.observe(&expired_nonzero, expired_nonzero.observed_at_ms),
+            ActivationDecision::Observe
+        );
+        assert!(matches!(state, ActivationState::AwaitingBaseline));
+        let expired_zero = audit_observation(B + 900, Some(0.0), Some(B));
+        assert!(!matches!(
+            state.observe(&expired_zero, expired_zero.observed_at_ms),
+            ActivationDecision::Candidate(_)
+        ));
+        assert!(state
+            .claim("must-not-send", expired_zero.observed_at_ms)
+            .is_none());
+    }
+
+    #[test]
+    fn v01_awaiting_baseline_rejects_expired_nonzero_with_missing_countdown() {
+        const B: i64 = 1_800_000_000;
+        let mut state = ActivationState::AwaitingBaseline;
+        let mut expired = audit_observation(B + 300, Some(20.0), Some(B));
+        if let Some(window) = expired
+            .windows
+            .iter_mut()
+            .find(|window| window.limit_window_seconds == Some(FIVE_HOUR_SECONDS))
+        {
+            window.reset_after_seconds = None;
+        }
+        assert_eq!(
+            state.observe(&expired, expired.observed_at_ms),
+            ActivationDecision::Observe
+        );
+        assert!(matches!(state, ActivationState::AwaitingBaseline));
     }
 
     #[test]
