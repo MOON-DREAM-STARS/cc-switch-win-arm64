@@ -127,6 +127,81 @@ describe("Codex quota automatic cache ordering", () => {
     }
   });
 
+  it("does not publish a superseded automatic quota while the frontend keeps an old revision", async () => {
+    vi.useFakeTimers();
+    const previousTauri = (
+      window as unknown as { __TAURI_INTERNALS__?: unknown }
+    ).__TAURI_INTERNALS__;
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    const state = {
+      accountId: "stale-poll-account",
+      enabled: true,
+      effectiveIntervalMinutes: 1,
+      authorizationRevision: 7,
+      state: { kind: "eligible" },
+      updatedAt: 1,
+    };
+    const list = vi
+      .spyOn(subscriptionApi, "listCodexQuotaActivationStates")
+      .mockResolvedValue([state]);
+    const poll = vi
+      .spyOn(subscriptionApi, "pollCodexOauthQuotaForActivation")
+      .mockResolvedValue({
+        accountId: state.accountId,
+        polled: true,
+        attempted: false,
+        target: null,
+        status: "superseded",
+        reason: "automatic quota result superseded by account invalidation",
+        quota: { ...quota(10, 90), lifecycle: "superseded" },
+      });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const key = ["codex_oauth", "quota", state.accountId] as const;
+    client.setQueryData(key, quota(20, 20));
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+    renderHook(() => useCodexQuotaAutoPolling(), { wrapper });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(poll).toHaveBeenCalledTimes(1);
+    expect(client.getQueryData<SubscriptionQuota>(key)?.queriedAt).toBe(20);
+    const current = client.getQueryData<Array<Record<string, unknown>>>(
+      CODEX_QUOTA_ACTIVATION_STATES_QUERY_KEY,
+    );
+    expect(current?.[0]?.lastPollStatus).toBe("superseded");
+
+    list.mockRestore();
+    poll.mockRestore();
+    vi.useRealTimers();
+    if (previousTauri === undefined) {
+      Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+    } else {
+      Object.defineProperty(window, "__TAURI_INTERNALS__", {
+        configurable: true,
+        value: previousTauri,
+      });
+    }
+  });
+
   it("orders manual and automatic completions through the real QueryClient queryFn", async () => {
     const manualOlder = deferred<SubscriptionQuota>();
     const automaticNewer = deferred<SubscriptionQuota>();

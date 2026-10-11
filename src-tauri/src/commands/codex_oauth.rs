@@ -13,6 +13,7 @@ use crate::services::codex_quota_activation_http::{
 };
 use crate::services::model_fetch::FetchedModel;
 use crate::services::subscription::{query_codex_quota, CredentialStatus, SubscriptionQuota};
+use crate::services::usage_cache::CodexOauthCachePublication;
 use serde::Serialize;
 use std::sync::Arc;
 use tauri::State;
@@ -350,13 +351,18 @@ pub async fn poll_codex_oauth_quota_for_activation(
     if !activation_revision_is_current(&app_state.db, &account_id, authorization_revision)? {
         return Ok(disabled_poll(account_id, "authorization_changed"));
     }
-    if app_state.usage_cache.put_codex_oauth_if_generation(
+    let publication = publish_activation_quota_with(
+        &app_state.usage_cache,
         account_id.clone(),
         cache_generation,
         quota.clone(),
-    ) {
-        crate::tray::schedule_tray_refresh(&app);
+        || async {},
+    )
+    .await;
+    if publication != CodexOauthCachePublication::Published {
+        return Ok(cache_rejected_poll(account_id, publication));
     }
+    crate::tray::schedule_tray_refresh(&app);
     let Some(snapshot) = snapshot else {
         return Ok(CodexQuotaActivationPollResult {
             account_id,
@@ -660,6 +666,24 @@ where
     Ok(Some(sender().await))
 }
 
+/// The automatic tick's cache publication boundary. Keeping the optional
+/// barrier here lets isolated tests pause after the revision check and before
+/// the real generation-aware writer, matching the production call graph.
+async fn publish_activation_quota_with<Before, BeforeFuture>(
+    usage_cache: &crate::services::usage_cache::UsageCache,
+    account_id: String,
+    expected_generation: u64,
+    quota: SubscriptionQuota,
+    before_write: Before,
+) -> CodexOauthCachePublication
+where
+    Before: FnOnce() -> BeforeFuture,
+    BeforeFuture: std::future::Future<Output = ()>,
+{
+    before_write().await;
+    usage_cache.put_codex_oauth_if_generation_result(account_id, expected_generation, quota)
+}
+
 fn failed_poll(account_id: String, status: &str, reason: String) -> CodexQuotaActivationPollResult {
     CodexQuotaActivationPollResult {
         account_id,
@@ -679,6 +703,35 @@ fn disabled_poll(account_id: String, reason: &str) -> CodexQuotaActivationPollRe
         attempted: false,
         target: None,
         status: "disabled".to_string(),
+        reason: Some(reason.to_string()),
+        quota: None,
+    }
+}
+
+fn cache_rejected_poll(
+    account_id: String,
+    publication: CodexOauthCachePublication,
+) -> CodexQuotaActivationPollResult {
+    let (status, reason) = match publication {
+        CodexOauthCachePublication::Superseded => (
+            "superseded",
+            "automatic quota result superseded by account invalidation",
+        ),
+        CodexOauthCachePublication::Stale => (
+            "stale_result",
+            "automatic quota result was older than the current cache",
+        ),
+        CodexOauthCachePublication::Unavailable => {
+            ("stale_result", "automatic quota cache was unavailable")
+        }
+        CodexOauthCachePublication::Published => unreachable!(),
+    };
+    CodexQuotaActivationPollResult {
+        account_id,
+        polled: true,
+        attempted: false,
+        target: None,
+        status: status.to_string(),
         reason: Some(reason.to_string()),
         quota: None,
     }
@@ -813,17 +866,15 @@ mod tests {
         (db, revision, attempt)
     }
 
-    #[test]
-    fn s04_backend_cache_rejection_is_serialized_as_superseded() {
-        let cache = UsageCache::new();
-        let quota = SubscriptionQuota {
+    fn test_quota(queried_at: i64, utilization: f64) -> SubscriptionQuota {
+        SubscriptionQuota {
             tool: "codex_oauth".to_string(),
             credential_status: CredentialStatus::Valid,
             credential_message: None,
             success: true,
             tiers: vec![QuotaTier {
                 name: "five_hour".to_string(),
-                utilization: 20.0,
+                utilization,
                 resets_at: None,
                 used_value_usd: None,
                 max_value_usd: None,
@@ -832,8 +883,14 @@ mod tests {
             reset_credits: None,
             credits_balance: None,
             error: None,
-            queried_at: Some(100),
-        };
+            queried_at: Some(queried_at),
+        }
+    }
+
+    #[test]
+    fn s04_backend_cache_rejection_is_serialized_as_superseded() {
+        let cache = UsageCache::new();
+        let quota = test_quota(100, 20.0);
         let generation = cache.codex_oauth_generation("account");
         cache.invalidate_codex_oauth("account");
         assert!(!cache.put_codex_oauth_if_generation(
@@ -846,6 +903,48 @@ mod tests {
         assert_eq!(result["lifecycle"], "superseded");
         assert_eq!(result["tool"], "codex_oauth");
         assert_eq!(result["success"], true);
+    }
+
+    #[tokio::test]
+    async fn t02_automatic_publication_barrier_returns_superseded_without_quota() {
+        let (db, revision, _) = prepared_claim().await;
+        assert!(activation_revision_is_current(&db, "account", revision).unwrap());
+
+        let cache = Arc::new(UsageCache::new());
+        let generation = cache.codex_oauth_generation("account");
+        let ready = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let task_cache = cache.clone();
+        let task_ready = ready.clone();
+        let task_release = release.clone();
+        let task = tokio::spawn(async move {
+            publish_activation_quota_with(
+                &task_cache,
+                "account".to_string(),
+                generation,
+                test_quota(100, 90.0),
+                move || async move {
+                    task_ready.notify_one();
+                    task_release.notified().await;
+                },
+            )
+            .await
+        });
+
+        ready.notified().await;
+        // The old frontend revision is intentionally irrelevant here: the
+        // backend invalidation must win before the real cache writer runs.
+        db.set_codex_quota_activation_enabled("account", false, None, 4)
+            .unwrap();
+        cache.invalidate_codex_oauth("account");
+        release.notify_one();
+
+        let publication = task.await.unwrap();
+        assert_eq!(publication, CodexOauthCachePublication::Superseded);
+        let result = cache_rejected_poll("account".to_string(), publication);
+        assert_eq!(result.status, "superseded");
+        assert!(result.quota.is_none());
+        assert!(cache.with_codex_oauth("account", |_| true).is_none());
     }
 
     #[tokio::test]

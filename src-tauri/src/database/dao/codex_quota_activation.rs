@@ -1142,6 +1142,124 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn t01_parser_state_dao_preserves_current_window_nonzero_before_recovery(
+    ) -> Result<(), AppError> {
+        let db = Database::memory()?;
+        insert_codex_provider(
+            &db,
+            "codex-provider",
+            Some("official"),
+            provider_meta(
+                Some("account-a"),
+                Some(usage_script(true, Some(5), Some("official_subscription"))),
+            ),
+        )?;
+        let interval = db.derive_codex_quota_activation_interval("account-a", None)?;
+        assert_eq!(interval, Some(5));
+        db.set_codex_quota_activation_enabled("account-a", true, interval, 0)?;
+        assert!(db.try_begin_codex_quota_activation_poll("account-a", interval, 300_001)?);
+
+        let parse = |used: f64, request_started_at_ms: i64, reset_after_seconds: i64| {
+            let raw = json!({
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {
+                        "used_percent": used,
+                        "limit_window_seconds": 18000,
+                        "reset_at": 19000,
+                        "reset_after_seconds": reset_after_seconds
+                    },
+                    "secondary_window": {
+                        "used_percent": 50,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 19000,
+                        "reset_after_seconds": reset_after_seconds
+                    }
+                }
+            });
+            let mut snapshot = crate::services::codex_quota_activation::snapshot_from_value(
+                &raw,
+                request_started_at_ms,
+                request_started_at_ms,
+            )
+            .unwrap();
+            snapshot.server_date_at_ms = Some(snapshot.observed_at_ms);
+            snapshot
+        };
+
+        let record = db.get_codex_quota_activation_state("account-a")?.unwrap();
+        let initial = parse(0.0, 1_000_000, 18_000);
+        let mut state = record.state;
+        assert!(matches!(
+            state.observe(&initial, initial.observed_at_ms),
+            crate::services::codex_quota_activation::ActivationDecision::Candidate(
+                crate::services::codex_quota_activation::WindowKind::FiveHour
+            )
+        ));
+        assert!(db.save_codex_quota_activation_state_if_revision(
+            "account-a",
+            record.authorization_revision,
+            &state,
+            1_100_000,
+        )?);
+        assert!(db
+            .claim_codex_quota_activation_if_revision(
+                "account-a",
+                record.authorization_revision,
+                "attempt",
+                1_000_100,
+            )?
+            .is_some());
+
+        let record = db.get_codex_quota_activation_state("account-a")?.unwrap();
+        let used_before_boundary = parse(20.0, 1_300_000, 17_700);
+        let mut state = record.state;
+        assert_eq!(
+            state.observe(&used_before_boundary, used_before_boundary.observed_at_ms,),
+            crate::services::codex_quota_activation::ActivationDecision::Observe
+        );
+        assert!(matches!(
+            state,
+            ActivationState::TrackingUsage {
+                boundary_reset_at: 19_000,
+                ..
+            }
+        ));
+        assert!(db.save_codex_quota_activation_state_if_revision(
+            "account-a",
+            record.authorization_revision,
+            &state,
+            1_300_001,
+        )?);
+
+        let record = db.get_codex_quota_activation_state("account-a")?.unwrap();
+        let recovered = parse(0.0, 19_001_000, 0);
+        let mut state = record.state;
+        assert!(matches!(
+            state.observe(&recovered, recovered.observed_at_ms),
+            crate::services::codex_quota_activation::ActivationDecision::Candidate(
+                crate::services::codex_quota_activation::WindowKind::FiveHour
+            )
+        ));
+        assert!(db.save_codex_quota_activation_state_if_revision(
+            "account-a",
+            record.authorization_revision,
+            &state,
+            19_001_001,
+        )?);
+        assert!(db
+            .claim_codex_quota_activation_if_revision(
+                "account-a",
+                record.authorization_revision,
+                "second-attempt",
+                19_001_002,
+            )?
+            .is_some());
+        Ok(())
+    }
+
     fn seed_eligible(db: &Database, account_id: &str) -> Result<(), AppError> {
         db.set_codex_quota_activation_enabled(account_id, true, Some(1), 0)?;
         db.save_codex_quota_activation_state(

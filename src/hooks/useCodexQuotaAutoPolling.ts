@@ -133,7 +133,7 @@ export function useCodexQuotaAutoPolling() {
               (state) => state.accountId === result.accountId,
             );
             if (
-              currentState &&
+              !currentState ||
               currentState.authorizationRevision !== authorizationRevision
             ) {
               latestPollSummaries.delete(result.accountId);
@@ -154,9 +154,13 @@ export function useCodexQuotaAutoPolling() {
             if (result.quota) {
               const quota = result.quota;
               if (
-                !["superseded", "authorization_changed", "disabled"].includes(
-                  result.status,
-                )
+                ![
+                  "superseded",
+                  "stale_result",
+                  "authorization_changed",
+                  "disabled",
+                ].includes(result.status) &&
+                quota.lifecycle !== "superseded"
               ) {
                 publishCodexOauthQuota(queryClient, result.accountId, quota);
               }

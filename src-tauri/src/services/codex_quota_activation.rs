@@ -740,12 +740,13 @@ impl ActivationState {
                     *self = Self::AwaitingBaseline;
                     return ActivationDecision::Unsupported("window_structure_changed");
                 }
+                // A nonzero observation after the attempt establishes use in
+                // the current window even while its reset boundary is still
+                // ahead. Crossing that boundary is reserved for the later
+                // zero observation that creates the next candidate.
                 if *previous == target
                     && window.used_percent.is_some_and(|value| value > 0.0)
                     && server_observation_after_attempt(snapshot, *attempted_at_ms)
-                    && server_observation_seconds(snapshot).is_some_and(|observed| {
-                        event_boundary(event_key).is_some_and(|boundary| observed > boundary)
-                    })
                     && window.reset_at.is_some_and(|reset| {
                         event_boundary(event_key).is_some_and(|boundary| reset >= boundary)
                     })
@@ -808,12 +809,11 @@ fn server_observation_seconds(snapshot: &CodexQuotaSnapshot) -> Option<i64> {
 }
 
 fn server_observation_after_attempt(snapshot: &CodexQuotaSnapshot, attempted_at_ms: i64) -> bool {
-    let Some(server_date_at_ms) = snapshot.server_date_at_ms else {
-        return false;
-    };
-    let offset_ms = server_date_at_ms.saturating_sub(snapshot.request_started_at_ms);
-    let attempted_server_at_ms = attempted_at_ms.saturating_add(offset_ms);
-    server_date_at_ms > attempted_server_at_ms
+    // Attempt timestamps and request start timestamps are both persisted in
+    // the local wall-clock domain. HTTP Date independently validates the
+    // server window fields; it must not be used to reinterpret an old local
+    // attempt after a clock offset changes.
+    snapshot.server_date_at_ms.is_some() && snapshot.request_started_at_ms > attempted_at_ms
 }
 
 fn trusted_exhaustion_snapshot(snapshot: &CodexQuotaSnapshot) -> bool {
@@ -1340,6 +1340,93 @@ mod tests {
             ActivationDecision::Blocked("permission_or_limit")
         );
         assert_eq!(state, trusted_state);
+    }
+
+    #[test]
+    fn t01_post_attempt_nonzero_before_old_boundary_rearms_five_hour() {
+        let mut state = ActivationState::default();
+        let initial = snapshot_at(Some(0.0), Some(50.0), 1_000_000, 19_000);
+        assert_eq!(
+            state.observe(&initial, initial.observed_at_ms),
+            ActivationDecision::Candidate(WindowKind::FiveHour)
+        );
+        assert!(state.claim("attempt", 1_000_100).is_some());
+
+        let used_before_boundary = snapshot_at(Some(20.0), Some(50.0), 1_300_000, 19_000);
+        assert_eq!(
+            state.observe(&used_before_boundary, used_before_boundary.observed_at_ms),
+            ActivationDecision::Observe
+        );
+        assert_eq!(
+            state,
+            ActivationState::TrackingUsage {
+                target: WindowKind::FiveHour,
+                boundary_reset_at: 19_000,
+            }
+        );
+
+        let recovered = snapshot_at(Some(0.0), Some(50.0), 19_001_000, 19_000);
+        assert_eq!(
+            state.observe(&recovered, recovered.observed_at_ms),
+            ActivationDecision::Candidate(WindowKind::FiveHour)
+        );
+        assert!(state
+            .claim("second-attempt", recovered.observed_at_ms)
+            .is_some());
+    }
+
+    #[test]
+    fn t01_post_attempt_exhaustion_before_old_boundary_rearms_five_hour() {
+        let mut state = ActivationState::Spent {
+            target: WindowKind::FiveHour,
+            event_key: "five_hour:19000".to_string(),
+            attempt_id: "attempt".to_string(),
+            attempted_at_ms: 1_000_100,
+        };
+        let mut exhausted = snapshot_at(Some(100.0), Some(50.0), 1_300_000, 19_000);
+        exhausted.allowed = Some(false);
+        exhausted.limit_reached = Some(true);
+        assert_eq!(
+            state.observe(&exhausted, exhausted.observed_at_ms),
+            ActivationDecision::Blocked("permission_or_limit")
+        );
+        assert!(matches!(state, ActivationState::TrackingUsage { .. }));
+
+        let recovered = snapshot_at(Some(0.0), Some(50.0), 19_001_000, 19_000);
+        assert_eq!(
+            state.observe(&recovered, recovered.observed_at_ms),
+            ActivationDecision::Candidate(WindowKind::FiveHour)
+        );
+    }
+
+    #[test]
+    fn t01_post_attempt_nonzero_before_old_boundary_rearms_weekly_only() {
+        let mut state = ActivationState::default();
+        let initial = snapshot_at(None, Some(0.0), 1_000_000, 605_800);
+        assert_eq!(
+            state.observe(&initial, initial.observed_at_ms),
+            ActivationDecision::Candidate(WindowKind::Weekly)
+        );
+        assert!(state.claim("attempt", 1_000_100).is_some());
+
+        let used_before_boundary = snapshot_at(None, Some(20.0), 1_300_000, 605_800);
+        assert_eq!(
+            state.observe(&used_before_boundary, used_before_boundary.observed_at_ms),
+            ActivationDecision::Observe
+        );
+        assert_eq!(
+            state,
+            ActivationState::TrackingUsage {
+                target: WindowKind::Weekly,
+                boundary_reset_at: 605_800,
+            }
+        );
+
+        let recovered = snapshot_at(None, Some(0.0), 605_801_000, 605_800);
+        assert_eq!(
+            state.observe(&recovered, recovered.observed_at_ms),
+            ActivationDecision::Candidate(WindowKind::Weekly)
+        );
     }
 
     #[test]

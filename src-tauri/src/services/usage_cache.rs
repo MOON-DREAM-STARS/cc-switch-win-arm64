@@ -23,6 +23,14 @@ struct CodexOauthCacheEntry {
     quota: Option<SubscriptionQuota>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexOauthCachePublication {
+    Published,
+    Superseded,
+    Stale,
+    Unavailable,
+}
+
 impl UsageCache {
     pub fn new() -> Self {
         Self::default()
@@ -36,7 +44,10 @@ impl UsageCache {
 
     pub fn put_codex_oauth(&self, account_id: String, quota: SubscriptionQuota) -> bool {
         let generation = self.codex_oauth_generation(&account_id);
-        self.put_codex_oauth_if_generation(account_id, generation, quota)
+        matches!(
+            self.put_codex_oauth_if_generation_result(account_id, generation, quota),
+            CodexOauthCachePublication::Published
+        )
     }
 
     pub fn codex_oauth_generation(&self, account_id: &str) -> u64 {
@@ -60,10 +71,22 @@ impl UsageCache {
         expected_generation: u64,
         quota: SubscriptionQuota,
     ) -> bool {
+        matches!(
+            self.put_codex_oauth_if_generation_result(account_id, expected_generation, quota),
+            CodexOauthCachePublication::Published
+        )
+    }
+
+    pub(crate) fn put_codex_oauth_if_generation_result(
+        &self,
+        account_id: String,
+        expected_generation: u64,
+        quota: SubscriptionQuota,
+    ) -> CodexOauthCachePublication {
         if let Ok(mut accounts) = self.codex_oauth.write() {
             let entry = accounts.entry(account_id).or_default();
             if entry.generation != expected_generation {
-                return false;
+                return CodexOauthCachePublication::Superseded;
             }
             if let Some(previous) = entry.quota.as_ref() {
                 let is_older = match (previous.queried_at, quota.queried_at) {
@@ -72,13 +95,13 @@ impl UsageCache {
                     _ => false,
                 };
                 if is_older {
-                    return false;
+                    return CodexOauthCachePublication::Stale;
                 }
             }
             entry.quota = Some(quota);
-            return true;
+            return CodexOauthCachePublication::Published;
         }
-        false
+        CodexOauthCachePublication::Unavailable
     }
 
     /// Invalidate a single managed account's in-flight quota publication.
