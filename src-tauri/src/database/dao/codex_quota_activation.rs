@@ -524,7 +524,7 @@ impl Database {
         conn.execute(
             "UPDATE codex_quota_activation_state
              SET last_attempt_status = 'unknown', last_reason = 'previous process ended after reserving the request', updated_at = ?1
-             WHERE last_attempt_status = 'reserved'",
+             WHERE last_attempt_status IN ('reserved', 'submitted')",
             params![now_ms],
         ).map_err(|error| AppError::Database(error.to_string()))?;
         Ok(())
@@ -623,18 +623,23 @@ impl Database {
         now_ms: i64,
     ) -> Result<(), AppError> {
         let conn = lock_conn!(self.conn);
-        Self::pause_codex_quota_activation_after_restore_on_conn(&conn, now_ms)
+        Self::pause_codex_quota_activation_after_restore_on_conn(&conn, now_ms, None)
     }
 
     pub(crate) fn pause_codex_quota_activation_after_restore_on_conn(
         conn: &Connection,
         now_ms: i64,
+        minimum_revision: Option<i64>,
     ) -> Result<(), AppError> {
         conn.execute(
             "UPDATE codex_quota_activation_state
              SET enabled = 0, state_json = ?1, last_attempt_id = NULL,
-                 authorization_revision = authorization_revision + 1, updated_at = ?2",
-            params![encode_state(&ActivationState::AwaitingBaseline)?, now_ms],
+                 authorization_revision = MAX(authorization_revision + 1, ?3), updated_at = ?2",
+            params![
+                encode_state(&ActivationState::AwaitingBaseline)?,
+                now_ms,
+                minimum_revision.map_or(0, |revision| revision.saturating_add(1))
+            ],
         )
         .map_err(|error| AppError::Database(error.to_string()))?;
         Ok(())
@@ -651,6 +656,32 @@ impl Database {
         )
         .map_err(|error| AppError::Database(error.to_string()))?;
         Ok(())
+    }
+
+    /// Linearization point for the final, not-yet-submitted dispatch.  The
+    /// conditional UPDATE is serialized with disable/restore writes by
+    /// SQLite, so a close that commits first prevents the sender call.  Once
+    /// this succeeds the request is considered handed to the one-shot
+    /// sender; a later close may invalidate its finish but cannot retract it.
+    pub(crate) fn begin_codex_quota_activation_dispatch_if_revision(
+        &self,
+        account_id: &str,
+        expected_revision: i64,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, AppError> {
+        let conn = lock_conn!(self.conn);
+        let changed = conn
+            .execute(
+                "UPDATE codex_quota_activation_state
+                 SET last_attempt_status = 'submitted', updated_at = ?1
+                 WHERE account_id = ?2 AND enabled = 1
+                   AND authorization_revision = ?3 AND last_attempt_id = ?4
+                   AND last_attempt_status = 'reserved'",
+                params![now_ms, account_id, expected_revision, attempt_id],
+            )
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        Ok(changed == 1)
     }
 }
 

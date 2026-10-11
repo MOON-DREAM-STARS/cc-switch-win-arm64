@@ -1,5 +1,9 @@
 import { useRef } from "react";
-import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import {
+  useQuery,
+  useQueryClient,
+  type UseQueryResult,
+} from "@tanstack/react-query";
 import { subscriptionApi } from "@/lib/api/subscription";
 import type { AppId } from "@/lib/api/types";
 import type { ProviderMeta } from "@/types";
@@ -10,6 +14,19 @@ import { resolveDisplayUsage, type LastGoodSnapshot } from "./queries";
 import { extractErrorMessage } from "@/utils/errorUtils";
 
 const REFETCH_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
+function mergeNewerSubscriptionQuota(
+  current: SubscriptionQuota | undefined,
+  incoming: SubscriptionQuota,
+): SubscriptionQuota {
+  if (
+    current?.queriedAt != null &&
+    (incoming.queriedAt == null || incoming.queriedAt < current.queriedAt)
+  ) {
+    return current;
+  }
+  return incoming;
+}
 
 export const subscriptionKeys = {
   all: ["subscription"] as const,
@@ -124,6 +141,7 @@ export function useCodexOauthQuotaByAccountId(
   accountId: string | null,
   options: UseCodexOauthQuotaOptions = {},
 ) {
+  const queryClient = useQueryClient();
   const {
     enabled = true,
     autoQuery = false,
@@ -133,9 +151,18 @@ export function useCodexOauthQuotaByAccountId(
     autoQuery && autoQueryIntervalMinutes > 0
       ? Math.max(autoQueryIntervalMinutes, 1) * 60 * 1000
       : false;
+  const queryKey = ["codex_oauth", "quota", accountId ?? "default"] as const;
   const query = useQuery({
-    queryKey: ["codex_oauth", "quota", accountId ?? "default"],
-    queryFn: () => subscriptionApi.getCodexOauthQuota(accountId),
+    queryKey,
+    // React Query writes the value returned by queryFn into the cache after
+    // the promise resolves.  Merge against the current cache here as well as
+    // in the automatic timer, so an older manual request cannot overwrite a
+    // newer automatic observation on either completion order.
+    queryFn: async () => {
+      const incoming = await subscriptionApi.getCodexOauthQuota(accountId);
+      const current = queryClient.getQueryData<SubscriptionQuota>(queryKey);
+      return mergeNewerSubscriptionQuota(current, incoming);
+    },
     enabled,
     refetchInterval,
     refetchIntervalInBackground: Boolean(refetchInterval),

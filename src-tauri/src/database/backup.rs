@@ -226,22 +226,7 @@ impl Database {
         Self::apply_schema_migrations_on_conn(&temp_conn)?;
         on_staging_ready()?;
 
-        // Full restore disables activation before the staged database becomes
-        // visible. Sync keeps the local authorization and dedup state, but
-        // advances its revision so an in-flight pre-sync tick cannot finish
-        // against the replaced database.
         let restore_now = chrono::Utc::now().timestamp_millis();
-        if preserve_tables.is_empty() {
-            crate::database::Database::pause_codex_quota_activation_after_restore_on_conn(
-                &temp_conn,
-                restore_now,
-            )?;
-        } else {
-            crate::database::Database::bump_codex_quota_activation_revisions_on_conn(
-                &temp_conn,
-                restore_now,
-            )?;
-        }
 
         let backup_file_guard = lock_backup_file_operations()?;
         // Keep one main-DB guard across the safety snapshot, local-table read,
@@ -253,6 +238,31 @@ impl Database {
                 Self::backup_database_file_from_conn(&backup_file_guard, &main_conn, &[])?;
             if !preserve_tables.is_empty() {
                 Self::restore_tables(&main_conn, &temp_conn, preserve_tables)?;
+                // The local-only rows have now reached their final staged
+                // form.  Invalidate an in-flight tick after that copy, or
+                // the next backup operation would overwrite the bump again.
+                crate::database::Database::bump_codex_quota_activation_revisions_on_conn(
+                    &temp_conn,
+                    restore_now,
+                )?;
+            } else {
+                // A full restore may carry an old revision.  Make the staged
+                // revision strictly newer than every live revision before it
+                // becomes visible, so pause + re-enable cannot ABA-match an
+                // in-flight task from the replaced database.
+                let live_max_revision: Option<i64> = main_conn
+                    .query_row(
+                        "SELECT MAX(authorization_revision)
+                         FROM codex_quota_activation_state",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                crate::database::Database::pause_codex_quota_activation_after_restore_on_conn(
+                    &temp_conn,
+                    restore_now,
+                    live_max_revision,
+                )?;
             }
             let backup = Backup::new(&temp_conn, &mut main_conn)
                 .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1081,10 +1091,6 @@ impl Database {
         Self::create_tables_on_conn(&staging_conn)?;
         Self::apply_schema_migrations_on_conn(&staging_conn)?;
         Self::ensure_model_pricing_seeded_on_conn(&staging_conn)?;
-        crate::database::Database::pause_codex_quota_activation_after_restore_on_conn(
-            &staging_conn,
-            chrono::Utc::now().timestamp_millis(),
-        )?;
         Self::validate_sqlite_integrity(&staging_conn)?;
 
         // Keep one main-DB guard across the safety snapshot and final apply so
@@ -1097,6 +1103,19 @@ impl Database {
                 &[backup_path.as_path()],
             )?;
             before_replace(safety_backup.as_deref())?;
+            let live_max_revision: Option<i64> = main_conn
+                .query_row(
+                    "SELECT MAX(authorization_revision)
+                     FROM codex_quota_activation_state",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            crate::database::Database::pause_codex_quota_activation_after_restore_on_conn(
+                &staging_conn,
+                chrono::Utc::now().timestamp_millis(),
+                live_max_revision,
+            )?;
             let backup = Backup::new(&staging_conn, &mut main_conn)
                 .map_err(|e| AppError::Database(e.to_string()))?;
             Self::complete_backup(&backup, "恢复主数据库")?;
@@ -2381,6 +2400,16 @@ mod tests {
 
         let local_db = Database::memory()?;
         local_db.set_codex_quota_activation_enabled("local", true, Some(3), 1)?;
+        {
+            let conn = crate::database::lock_conn!(local_db.conn);
+            conn.execute(
+                "UPDATE codex_quota_activation_state
+                 SET authorization_revision=7, last_attempt_id='attempt-local',
+                     last_attempt_at_ms=2, last_attempt_status='unknown'
+                 WHERE account_id='local'",
+                [],
+            )?;
+        }
         local_db.save_codex_quota_activation_state(
             "local",
             &crate::services::codex_quota_activation::ActivationState::Spent {
@@ -2396,11 +2425,52 @@ mod tests {
             .get_codex_quota_activation_state("local")?
             .expect("sync keeps local activation row");
         assert!(after_sync.enabled);
+        assert!(after_sync.authorization_revision > 7);
+        assert_eq!(after_sync.last_attempt_at_ms, Some(2));
+        assert_eq!(after_sync.last_attempt_status.as_deref(), Some("unknown"));
         assert!(matches!(
-            after_sync.state,
+            &after_sync.state,
+            crate::services::codex_quota_activation::ActivationState::Spent { .. }
+        ));
+        assert!(!local_db.save_codex_quota_activation_state_if_revision(
+            "local",
+            7,
+            &crate::services::codex_quota_activation::ActivationState::BootstrapPending,
+            3,
+        )?);
+        assert!(local_db
+            .claim_codex_quota_activation_if_revision("local", 7, "stale-claim", 3)?
+            .is_none());
+        assert!(!local_db.finish_codex_quota_activation_attempt_if_revision(
+            "local",
+            7,
+            "attempt-local",
+            "completed",
+            None,
+            3,
+        )?);
+        assert!(matches!(
+            local_db
+                .get_codex_quota_activation_state("local")?
+                .unwrap()
+                .state,
             crate::services::codex_quota_activation::ActivationState::Spent { .. }
         ));
 
+        // Full restore from an older backup is fenced by the live revision,
+        // not by the older value copied from the snapshot. Re-enable right
+        // after restore still cannot make an in-flight revision-5 task valid.
+        let old_backup = Database::memory()?;
+        old_backup.set_codex_quota_activation_enabled("local", true, Some(3), 1)?;
+        {
+            let conn = crate::database::lock_conn!(old_backup.conn);
+            conn.execute(
+                "UPDATE codex_quota_activation_state SET authorization_revision=3
+                 WHERE account_id='local'",
+                [],
+            )?;
+        }
+        let old_full = old_backup.export_sql_string()?;
         local_db.import_sql_string(&remote_full)?;
         let after_full = local_db
             .get_codex_quota_activation_state("remote")?
@@ -2410,6 +2480,20 @@ mod tests {
             after_full.state,
             crate::services::codex_quota_activation::ActivationState::AwaitingBaseline
         ));
+        local_db.import_sql_string(&old_full)?;
+        let after_old_restore = local_db
+            .get_codex_quota_activation_state("local")?
+            .expect("old restore keeps the account row");
+        assert!(!after_old_restore.enabled);
+        assert!(after_old_restore.authorization_revision > 7);
+        let reenabled = local_db.set_codex_quota_activation_enabled("local", true, Some(3), 4)?;
+        assert_ne!(reenabled.authorization_revision, 5);
+        assert!(!local_db.save_codex_quota_activation_state_if_revision(
+            "local",
+            5,
+            &crate::services::codex_quota_activation::ActivationState::BootstrapPending,
+            5,
+        )?);
         Ok(())
     }
 

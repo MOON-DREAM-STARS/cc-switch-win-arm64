@@ -144,6 +144,11 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
         undefined,
       );
       setActivationError(null);
+      // A toggle creates a new authorization revision.  Do not leave the
+      // previous generation's quota visible while a new read is pending.
+      void queryClient?.removeQueries({
+        queryKey: ["codex_oauth", "quota", accountId],
+      });
       queryClient?.setQueryData(
         CODEX_QUOTA_ACTIVATION_STATES_QUERY_KEY,
         (current: typeof activationStateList | undefined) => {
@@ -461,6 +466,8 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
   const rows: GroupAccountRow[] = accounts.map((account) => {
     const date = signedInDate(account.authenticated_at, i18n.language);
     const needsReauth = !!account.reauth_required;
+    const activationState = activationStates[account.id];
+    const activationStateCorrupt = Boolean(activationState?.stateError);
     return {
       id: account.id,
       login: account.login,
@@ -507,36 +514,57 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
                   defaultValue: "paused",
                 })}
           </span>
-          {(activationStates[account.id]?.lastAttemptAtMs ||
-            activationStates[account.id]?.lastReason ||
+          {(activationState?.lastAttemptAtMs ||
+            activationState?.lastPolledAtMs ||
+            activationState?.lastReason ||
+            activationState?.lastPollReason ||
             activationStates[account.id]?.stateError) && (
             <span className="text-[10px] text-fg-3">
               {t("codexOauth.quotaActivationLastAttempt", {
                 defaultValue: "{{status}} · {{time}}",
-                status: activationStates[account.id]?.stateError
+                status: activationState?.stateError
                   ? t("codexOauth.quotaActivationCorrupt", "corrupt / paused")
-                  : (activationStates[account.id]?.lastAttemptStatus ??
+                  : (activationState?.lastAttemptStatus ??
+                    activationState?.lastPollStatus ??
                     "unknown"),
-                time: activationStates[account.id]?.lastAttemptAtMs
+                time: activationState?.lastAttemptAtMs
                   ? new Date(
-                      activationStates[account.id]!.lastAttemptAtMs!,
+                      activationState.lastAttemptAtMs,
                     ).toLocaleTimeString([], {
                       hour: "2-digit",
                       minute: "2-digit",
                     })
-                  : (activationStates[account.id]?.lastReason ??
-                    activationStates[account.id]?.stateError ??
-                    ""),
+                  : activationState?.lastPolledAtMs
+                    ? new Date(
+                        activationState.lastPolledAtMs,
+                      ).toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })
+                    : (activationState?.lastPollReason ??
+                      activationState?.lastReason ??
+                      activationState?.stateError ??
+                      ""),
               })}
             </span>
           )}
           <Switch
-            checked={activationStates[account.id]?.enabled === true}
+            checked={activationState?.enabled === true}
             disabled={activationStateReadError}
             onCheckedChange={(checked) =>
-              void setActivation(account.id, checked)
+              void setActivation(
+                account.id,
+                activationStateCorrupt ? false : checked,
+              )
             }
-            aria-label={t("codexOauth.quotaActivation", "额度恢复后自动激活")}
+            aria-label={t(
+              activationStateCorrupt
+                ? "codexOauth.quotaActivationDisableCorrupt"
+                : "codexOauth.quotaActivation",
+              activationStateCorrupt
+                ? "关闭损坏账号的自动激活"
+                : "额度恢复后自动激活",
+            )}
           />
         </div>
       ) : undefined,

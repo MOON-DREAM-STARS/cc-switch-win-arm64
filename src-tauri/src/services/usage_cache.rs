@@ -14,6 +14,7 @@ use crate::services::subscription::SubscriptionQuota;
 pub struct UsageCache {
     subscription: RwLock<HashMap<AppType, SubscriptionQuota>>,
     codex_oauth: RwLock<HashMap<String, SubscriptionQuota>>,
+    codex_oauth_generations: RwLock<HashMap<String, u64>>,
     script: RwLock<HashMap<(AppType, String), UsageResult>>,
 }
 
@@ -29,7 +30,30 @@ impl UsageCache {
     }
 
     pub fn put_codex_oauth(&self, account_id: String, quota: SubscriptionQuota) -> bool {
+        let generation = self.codex_oauth_generation(&account_id);
+        self.put_codex_oauth_if_generation(account_id, generation, quota)
+    }
+
+    pub fn codex_oauth_generation(&self, account_id: &str) -> u64 {
+        self.codex_oauth_generations
+            .write()
+            .ok()
+            .map(|mut generations| *generations.entry(account_id.to_string()).or_insert(0))
+            .unwrap_or(0)
+    }
+
+    /// Publish a quota only if no account lifecycle operation invalidated the
+    /// generation captured before the request started.
+    pub fn put_codex_oauth_if_generation(
+        &self,
+        account_id: String,
+        expected_generation: u64,
+        quota: SubscriptionQuota,
+    ) -> bool {
         if let Ok(mut w) = self.codex_oauth.write() {
+            if self.codex_oauth_generation(&account_id) != expected_generation {
+                return false;
+            }
             if let Some(previous) = w.get(&account_id) {
                 let is_older = match (previous.queried_at, quota.queried_at) {
                     (Some(previous), Some(incoming)) => incoming < previous,
@@ -44,6 +68,21 @@ impl UsageCache {
             return true;
         }
         false
+    }
+
+    /// Invalidate a single managed account's in-flight quota publication.
+    pub fn invalidate_codex_oauth(&self, account_id: &str) {
+        if let Ok(mut accounts) = self.codex_oauth.write() {
+            accounts.remove(account_id);
+        }
+        if let Ok(mut generations) = self.codex_oauth_generations.write() {
+            let next = generations
+                .get(account_id)
+                .copied()
+                .unwrap_or(0)
+                .wrapping_add(1);
+            generations.insert(account_id.to_string(), next);
+        }
     }
 
     /// Managed accounts must never share the CLI's app-wide subscription snapshot.
@@ -124,6 +163,11 @@ impl UsageCache {
         }
         if let Ok(mut accounts) = self.codex_oauth.write() {
             accounts.clear();
+        }
+        if let Ok(mut generations) = self.codex_oauth_generations.write() {
+            for generation in generations.values_mut() {
+                *generation = generation.wrapping_add(1);
+            }
         }
     }
 }
@@ -233,5 +277,30 @@ mod tests {
             cache.with_codex_oauth("account", |quota| quota.queried_at),
             Some(Some(20))
         );
+    }
+
+    #[test]
+    fn codex_oauth_generation_rejects_results_after_account_invalidation() {
+        let cache = UsageCache::new();
+        let generation = cache.codex_oauth_generation("account");
+        cache.invalidate_codex_oauth("account");
+        assert!(!cache.put_codex_oauth_if_generation(
+            "account".to_string(),
+            generation,
+            fake_quota(),
+        ));
+        assert!(cache.with_codex_oauth("account", |_| true).is_none());
+    }
+
+    #[test]
+    fn invalidate_all_rejects_an_inflight_account_seen_only_by_generation() {
+        let cache = UsageCache::new();
+        let generation = cache.codex_oauth_generation("inflight-only");
+        cache.invalidate_all();
+        assert!(!cache.put_codex_oauth_if_generation(
+            "inflight-only".to_string(),
+            generation,
+            fake_quota(),
+        ));
     }
 }

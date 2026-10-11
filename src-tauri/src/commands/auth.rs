@@ -398,6 +398,7 @@ pub(crate) async fn remove_codex_oauth_account_with_switch_lock(
             chrono::Utc::now().timestamp_millis(),
         )
         .map_err(|error| error.to_string())?;
+    app_state.usage_cache.invalidate_codex_oauth(account_id);
     app_state
         .db
         .unbind_codex_managed_accounts(&[account_id.to_string()])

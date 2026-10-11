@@ -48,12 +48,15 @@ pub async fn get_codex_oauth_quota(
         return Ok(SubscriptionQuota::not_found("codex_oauth"));
     };
 
+    let cache_generation = app_state.usage_cache.codex_oauth_generation(&id);
     let result = query_codex_oauth_quota_for(manager, &id).await;
     // Cache by the resolved account, even if the default/binding changes while
     // the request is in flight. Transport errors retain the last good snapshot;
     // authentication/HTTP failures replace it so the tray hides invalid quotas.
     if let Ok(quota) = &result {
-        app_state.usage_cache.put_codex_oauth(id, quota.clone());
+        app_state
+            .usage_cache
+            .put_codex_oauth_if_generation(id, cache_generation, quota.clone());
         crate::tray::schedule_tray_refresh(&app);
     }
     result
@@ -192,7 +195,7 @@ pub async fn set_codex_quota_activation_enabled(
             "No enabled official Codex quota interval is available for this account".to_string(),
         );
     }
-    app_state
+    let record = app_state
         .db
         .set_codex_quota_activation_enabled(
             account_id,
@@ -200,7 +203,11 @@ pub async fn set_codex_quota_activation_enabled(
             effective_interval_minutes,
             chrono::Utc::now().timestamp_millis(),
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    // Enabling, disabling, and re-enabling all create a new authorization
+    // generation.  Drop any quota request that was started by the prior one.
+    app_state.usage_cache.invalidate_codex_oauth(account_id);
+    Ok(record)
 }
 
 /// Explicit automatic polling entry. The frontend timer only requests this
@@ -301,6 +308,7 @@ pub async fn poll_codex_oauth_quota_for_activation(
     if !activation_revision_is_current(&app_state.db, &account_id, authorization_revision)? {
         return Ok(disabled_poll(account_id, "authorization_changed"));
     }
+    let cache_generation = app_state.usage_cache.codex_oauth_generation(&account_id);
     let (quota, snapshot) = crate::services::subscription::query_codex_quota_with_snapshot(
         &token,
         Some(&workspace),
@@ -308,12 +316,15 @@ pub async fn poll_codex_oauth_quota_for_activation(
         "Codex OAuth access token expired or rejected. Please re-login via cc-switch.",
     )
     .await?;
-    app_state
-        .usage_cache
-        .put_codex_oauth(account_id.clone(), quota.clone());
-    crate::tray::schedule_tray_refresh(&app);
     if !activation_revision_is_current(&app_state.db, &account_id, authorization_revision)? {
         return Ok(disabled_poll(account_id, "authorization_changed"));
+    }
+    if app_state.usage_cache.put_codex_oauth_if_generation(
+        account_id.clone(),
+        cache_generation,
+        quota.clone(),
+    ) {
+        crate::tray::schedule_tray_refresh(&app);
     }
     let Some(snapshot) = snapshot else {
         return Ok(CodexQuotaActivationPollResult {
@@ -503,9 +514,6 @@ pub async fn poll_codex_oauth_quota_for_activation(
             quota: Some(quota),
         });
     }
-    if !activation_revision_is_current(&app_state.db, &account_id, authorization_revision)? {
-        return Ok(disabled_poll(account_id, "authorization_changed"));
-    }
     let client = match crate::proxy::http_client::get_for_single_post() {
         Ok(client) => client,
         Err(error) => {
@@ -522,13 +530,28 @@ pub async fn poll_codex_oauth_quota_for_activation(
             return Ok(failed_poll(account_id, "transport_unavailable", error));
         }
     };
-    let result = send_activation_once(&client, ACTIVATION_ENDPOINT, &token, &workspace).await;
+    // This conditional write is the dispatch linearization point.  It is
+    // serialized with the disable/restore UPDATE, so a close that commits
+    // first prevents the sender call; a close after it succeeds may leave one
+    // in-flight request but cannot make its late finish current.
+    let dispatch = dispatch_activation_with(
+        &app_state.db,
+        &account_id,
+        authorization_revision,
+        &attempt_id,
+        || async {},
+        || async { send_activation_once(&client, ACTIVATION_ENDPOINT, &token, &workspace).await },
+    )
+    .await?;
+    let Some(result) = dispatch else {
+        return Ok(disabled_poll(account_id, "authorization_changed"));
+    };
     let status = match result.status {
         ActivationHttpStatus::Completed => "completed",
         ActivationHttpStatus::Failed => "failed",
         ActivationHttpStatus::Unknown => "unknown",
     };
-    app_state
+    let finished = app_state
         .db
         .finish_codex_quota_activation_attempt_if_revision(
             &account_id,
@@ -539,6 +562,11 @@ pub async fn poll_codex_oauth_quota_for_activation(
             chrono::Utc::now().timestamp_millis(),
         )
         .map_err(|error| error.to_string())?;
+    // The POST may already have been handed to the transport when a close or
+    // restore invalidates the revision.  Keep that fact visible to callers,
+    // but never project the late terminal result as the current generation's
+    // success.
+    let status = if finished { status } else { "superseded" };
     Ok(CodexQuotaActivationPollResult {
         account_id,
         polled: true,
@@ -548,6 +576,39 @@ pub async fn poll_codex_oauth_quota_for_activation(
         reason: result.error,
         quota: Some(quota),
     })
+}
+
+/// Shared production dispatch boundary. `before_submit` represents the final
+/// preparation/barrier point and always runs outside the DB transaction. The
+/// conditional status transition and account close/restore serialize through
+/// SQLite; the sender is entered only after the transition succeeds.
+async fn dispatch_activation_with<T, Prepare, PrepareFuture, Sender, SenderFuture>(
+    db: &crate::database::Database,
+    account_id: &str,
+    expected_revision: i64,
+    attempt_id: &str,
+    before_submit: Prepare,
+    sender: Sender,
+) -> Result<Option<T>, String>
+where
+    Prepare: FnOnce() -> PrepareFuture,
+    PrepareFuture: std::future::Future<Output = ()>,
+    Sender: FnOnce() -> SenderFuture,
+    SenderFuture: std::future::Future<Output = T>,
+{
+    before_submit().await;
+    if !db
+        .begin_codex_quota_activation_dispatch_if_revision(
+            account_id,
+            expected_revision,
+            attempt_id,
+            now_millis(),
+        )
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(None);
+    }
+    Ok(Some(sender().await))
 }
 
 fn failed_poll(account_id: String, status: &str, reason: String) -> CodexQuotaActivationPollResult {
@@ -597,4 +658,177 @@ async fn derive_activation_interval(
     let _ = manager;
     db.derive_codex_quota_activation_interval(account_id, None)
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::Database;
+    use crate::services::codex_quota_activation::{ActivationState, WindowKind};
+    use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::Notify;
+
+    struct FakeActivationServer {
+        calls: AtomicUsize,
+        seen: Notify,
+        release: Notify,
+    }
+
+    async fn activation_handler(
+        State(server): State<Arc<FakeActivationServer>>,
+    ) -> impl IntoResponse {
+        server.calls.fetch_add(1, Ordering::SeqCst);
+        server.seen.notify_one();
+        server.release.notified().await;
+        (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "event: response.completed\ndata: {\"response\":{\"model\":\"gpt-6-luna\",\"status\":\"completed\"}}\n\n",
+        )
+    }
+
+    async fn prepared_claim() -> (Arc<Database>, i64, String) {
+        let db = Arc::new(Database::memory().unwrap());
+        db.set_codex_quota_activation_enabled("account", true, Some(1), 1)
+            .unwrap();
+        db.save_codex_quota_activation_state(
+            "account",
+            &ActivationState::Eligible {
+                target: WindowKind::FiveHour,
+                event_key: "five_hour:1800000000".to_string(),
+            },
+            2,
+        )
+        .unwrap();
+        let revision = db
+            .codex_quota_activation_revision("account")
+            .unwrap()
+            .unwrap()
+            .1;
+        let attempt = "attempt".to_string();
+        assert!(db
+            .claim_codex_quota_activation_if_revision("account", revision, &attempt, 3)
+            .unwrap()
+            .is_some());
+        (db, revision, attempt)
+    }
+
+    #[tokio::test]
+    async fn n02_disable_before_dispatch_commit_calls_real_sender_zero_times() {
+        let server = Arc::new(FakeActivationServer {
+            calls: AtomicUsize::new(0),
+            seen: Notify::new(),
+            release: Notify::new(),
+        });
+        let app = Router::new()
+            .route("/activation", post(activation_handler))
+            .with_state(server.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (db, revision, attempt) = prepared_claim().await;
+        let ready = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let before_ready = ready.clone();
+        let before_release = release.clone();
+        let client =
+            crate::proxy::http_client::build_client_with_redirect_policy(None, true).unwrap();
+        let dispatch_db = db.clone();
+        let result = tokio::spawn(async move {
+            dispatch_activation_with(
+                &dispatch_db,
+                "account",
+                revision,
+                &attempt,
+                move || async move {
+                    before_ready.notify_one();
+                    before_release.notified().await;
+                },
+                move || async move {
+                    send_activation_once(
+                        &client,
+                        &format!("http://{address}/activation"),
+                        "fake-token",
+                        "fake-workspace",
+                    )
+                    .await
+                },
+            )
+            .await
+            .unwrap()
+        });
+        ready.notified().await;
+        db.set_codex_quota_activation_enabled("account", false, None, 4)
+            .unwrap();
+        release.notify_one();
+        assert!(result.await.unwrap().is_none());
+        assert_eq!(server.calls.load(Ordering::SeqCst), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn n02_dispatch_commit_allows_one_inflight_request_but_finish_is_stale() {
+        let server = Arc::new(FakeActivationServer {
+            calls: AtomicUsize::new(0),
+            seen: Notify::new(),
+            release: Notify::new(),
+        });
+        let app = Router::new()
+            .route("/activation", post(activation_handler))
+            .with_state(server.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (db, revision, attempt) = prepared_claim().await;
+        let client =
+            crate::proxy::http_client::build_client_with_redirect_policy(None, true).unwrap();
+        let dispatch_db = db.clone();
+        let result = tokio::spawn(async move {
+            dispatch_activation_with(
+                &dispatch_db,
+                "account",
+                revision,
+                &attempt,
+                || async {},
+                move || async move {
+                    send_activation_once(
+                        &client,
+                        &format!("http://{address}/activation"),
+                        "fake-token",
+                        "fake-workspace",
+                    )
+                    .await
+                },
+            )
+            .await
+            .unwrap()
+        });
+        server.seen.notified().await;
+        db.set_codex_quota_activation_enabled("account", false, None, 4)
+            .unwrap();
+        server.release.notify_one();
+        let sent = result
+            .await
+            .unwrap()
+            .expect("dispatch committed before close");
+        assert_eq!(sent.status, ActivationHttpStatus::Completed);
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert!(!db
+            .finish_codex_quota_activation_attempt_if_revision(
+                "account",
+                revision,
+                "attempt",
+                "completed",
+                None,
+                5,
+            )
+            .unwrap());
+        task.abort();
+    }
 }

@@ -7,6 +7,8 @@ export interface CodexQuotaActivationState {
   effectiveIntervalMinutes?: number | null;
   enabledAtMs?: number | null;
   lastPolledAtMs?: number | null;
+  lastPollStatus?: string | null;
+  lastPollReason?: string | null;
   lastAttemptAtMs?: number | null;
   lastAttemptStatus?: string | null;
   lastReason?: string | null;

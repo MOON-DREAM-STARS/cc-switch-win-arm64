@@ -1,22 +1,19 @@
-# Checklist 实际状态
+# 第二轮审计修复清单
 
-对应交接包 `CHECKLIST.md` v2.0。状态只记录本轮真实证据；没有把旧 PR 数字当作本轮结果。
+审计对象：`85647d116cb10fcaabb0994d8185d521fbd54d60`
 
-| 区域 | 状态 | 证据 |
+当前工作树：未提交的局部修复；真实 OAuth/额度/模型/生成请求均 `NOT RUN`。
+
+| 项目 | 状态 | 核查依据 |
 |---|---|---|
-| G0 基线、工作树和禁止真实服务操作 | PASS | 起点 HEAD=`c7a4daf14795a13d07ca297f2a40b6933d202b9d`，当前分支与工作树范围已核对；本轮无 commit/push/PR/生产请求。 |
-| F01–F05 P1 | PASS | 40 项 activation/DAO/HTTP 测试；Provider serde、模型对象、revision barrier、freshness、boundary rollback 旧实现红灯后修复通过。 |
-| B01–B08 选择、精度、窗口结构和阻断 | PASS | 27 条 `decision_cases.json` 经过真实 parser/selector；严格 0/0.001/0.1、5h 优先、weekly 耗尽和坏窗口覆盖。 |
-| C01–C06 查询与精度 | PASS | 同一次 usage GET 返回显示 DTO + 私有 snapshot；queriedAt 以请求观察语义排序；普通只读命令不进入 sender。 |
-| D01–D14 状态生命周期/DB | PASS / 局部 | Bootstrap/Tracking/Eligible/Spent/AwaitingBaseline、schema v22 revision、条件 claim/finish、reserved→unknown、坏行隔离、Sync/FullRestore 测试通过；跨进程崩溃演练未运行。 |
-| E01–E12 并发、HTTP、SSE | PASS / 局部 | 同账号并发、fake barrier、no retry/redirect、bounded body、矛盾终态、HTTP 200 脱敏和 loopback 计数通过；真实服务端兼容性 UNVERIFIED。 |
-| F01–F06 根轮询生命周期 | PASS / 局部 | 根 hook 账号 timer、间隔 0 暂停、footer 接管和 cache 排序已实现；系统休眠/唤醒、实际 WebView timer 未运行。 |
-| F07–F10 UI、警示、状态可见性 | PASS / 局部 | 统一 query key/mutation、失败状态可见、固定模型/Low/hello 红色文案、四语言、Switch aria-label；未做 WebView 截图和多分辨率验收。 |
-| F11–F13 集成修复 | PASS / 局部 | timer/cache 乱序、Sync/FullRestore、坏账号隔离已覆盖；真实 WebView/系统级生命周期 NOT RUN。 |
-| G01–G06 交付边界 | PASS | 命令、测试数、未运行边界和职责写入 `ACCEPTANCE_REPORT.md`；无依赖升级、无 commit/push/PR/deploy。 |
-
-## NOT RUN / UNVERIFIED
-
-- 真实 OAuth、额度、模型、生成请求：`NOT RUN`。
-- Luna 线上权限、实际 Responses 兼容性、真实消耗量化、reset 生命周期和 exactly-once：`UNVERIFIED`。
-- 生产安装/签名、Windows WebView 截图、多分辨率视觉验收、系统休眠/唤醒：`NOT RUN`。
+| N01 Sync revision / FullRestore ABA | FIXED | 真实 sync import + old save/claim/finish gate；低 revision restore 后重新开启不复用旧 revision。 |
+| N02 dispatch linearization | FIXED | 生产 dispatch helper + loopback sender；关闭先提交为 0 POST，派发点后允许 1 个在途且 finish stale。 |
+| N03 timing consistency | FIXED | 真实 epoch 矛盾 timing、Bootstrap、weekly exhausted、Tracking/Spent 回归。 |
+| N04 permission conflict | FIXED | parser/selector conflict marker、invalid alias、nested/top-level conflict。 |
+| N05 poll vs attempt | FIXED | QueryClient、自动 timer、invalidate/refetch 后 model_unavailable 可见；non-attempt 不覆盖 lastAttempt。 |
+| N06 late GET/finish | FIXED | UsageCache generation、superseded finish、FullRestore/close DAO 回归；真实服务端竞态 `NOT RUN`。 |
+| N07 all quota writers ordering | FIXED | 两个 deferred promise 的真实 QueryClient M<A/A<M。 |
+| N08 corrupt account disable | FIXED | `CodexOAuthSection` 实际 UI 点击坏账号开关调用 false；不重建 Bootstrap。 |
+| 真实 OAuth / token refresh / quota / model catalog / generation | NOT RUN | 用户明确禁止，只有 fake token 与 127.0.0.1 loopback。 |
+| Luna 线上协议、扣费与 exactly-once | UNVERIFIED | 源码/fixture 证据不足，未执行 live probe。 |
+| WebView、系统休眠、跨进程崩溃 | NOT RUN | 需要生产运行时，超出本轮隔离测试。 |

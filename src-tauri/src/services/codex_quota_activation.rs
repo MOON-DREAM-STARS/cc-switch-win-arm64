@@ -47,6 +47,10 @@ pub(crate) struct QuotaWindowSnapshot {
     pub allowed: Option<bool>,
     pub limit_reached: Option<bool>,
     pub rate_limit_reached_type: Option<String>,
+    /// Explicit permission fields were malformed or disagreed with one
+    /// another.  This is distinct from a missing optional field so a later
+    /// window value cannot accidentally re-enable a conflicted snapshot.
+    pub permission_conflict: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,6 +63,7 @@ pub(crate) struct CodexQuotaSnapshot {
     pub observed_at_ms: i64,
     pub server_date_at_ms: Option<i64>,
     pub cache_age_seconds: Option<u64>,
+    pub permission_conflict: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +144,8 @@ pub(crate) fn snapshot_from_value(
         .as_object()?;
     let allowed = merge_bool_fields(value, rate_limit, &["allowed"]);
     let limit_reached = merge_bool_fields(value, rate_limit, &["limit_reached", "limitReached"]);
+    let permission_conflict = bool_fields_conflict(value, rate_limit, &["allowed"])
+        || bool_fields_conflict(value, rate_limit, &["limit_reached", "limitReached"]);
     let rate_limit_reached_type = merge_reached_type_fields(
         value,
         rate_limit,
@@ -184,6 +191,7 @@ pub(crate) fn snapshot_from_value(
         observed_at_ms,
         server_date_at_ms: None,
         cache_age_seconds: None,
+        permission_conflict,
     })
 }
 
@@ -201,13 +209,18 @@ fn parse_reached_type(value: &Value) -> Option<String> {
 }
 
 fn parse_bool_field(value: &Value, keys: &[&str]) -> Result<Option<bool>, ()> {
-    let Some(raw) = keys.iter().find_map(|key| value.get(*key)) else {
-        return Ok(None);
-    };
-    if raw.is_null() {
-        return Ok(None);
+    let mut found = None;
+    for raw in keys.iter().filter_map(|key| value.get(*key)) {
+        if raw.is_null() {
+            continue;
+        }
+        let parsed = raw.as_bool().ok_or(())?;
+        if found.is_some_and(|previous| previous != parsed) {
+            return Err(());
+        }
+        found = Some(parsed);
     }
-    raw.as_bool().ok_or(()).map(Some)
+    Ok(found)
 }
 
 fn merge_bool_fields(
@@ -224,6 +237,20 @@ fn merge_bool_fields(
             (Some(value), _) | (_, Some(value)) => Some(value),
             _ => None,
         },
+    }
+}
+
+fn bool_fields_conflict(
+    outer: &Value,
+    nested: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> bool {
+    let outer = parse_bool_field(outer, keys);
+    let nested = parse_bool_field(&Value::Object(nested.clone()), keys);
+    match (outer, nested) {
+        (Err(()), _) | (_, Err(())) => true,
+        (Ok(Some(a)), Ok(Some(b))) => a != b,
+        _ => false,
     }
 }
 
@@ -288,7 +315,17 @@ fn parse_window(limit_id: &str, value: &Value, is_additional: bool) -> QuotaWind
             .get("rate_limit_reached_type")
             .or_else(|| value.get("rateLimitReachedType"))
             .and_then(parse_reached_type),
+        permission_conflict: bool_fields_conflict_in_window(value),
     }
+}
+
+fn bool_fields_conflict_in_window(value: &Value) -> bool {
+    [
+        parse_bool_field(value, &["allowed"]),
+        parse_bool_field(value, &["limit_reached", "limitReached"]),
+    ]
+    .iter()
+    .any(|result| result.is_err())
 }
 
 fn collect_additional_windows(value: &Value, output: &mut Vec<QuotaWindowSnapshot>) {
@@ -395,10 +432,12 @@ pub(crate) fn select_target_at(snapshot: &CodexQuotaSnapshot, now_ms: i64) -> Ac
     };
 
     let weekly_window = weekly_window.expect("weekly window always selected");
-    if weekly_window.used_percent == Some(100.0) {
-        return ActivationDecision::Blocked("weekly_exhausted");
+    if snapshot.permission_conflict
+        || target_window.permission_conflict
+        || (target == WindowKind::FiveHour && weekly_window.permission_conflict)
+    {
+        return ActivationDecision::Blocked("permission_or_limit");
     }
-
     let mut allowed_values = vec![snapshot.allowed, target_window.allowed];
     let mut limit_values = vec![snapshot.limit_reached, target_window.limit_reached];
     if target == WindowKind::FiveHour {
@@ -410,17 +449,21 @@ pub(crate) fn select_target_at(snapshot: &CodexQuotaSnapshot, now_ms: i64) -> Ac
     {
         return ActivationDecision::Blocked("permission_or_limit");
     }
+    if !valid_timing(target_window, target, snapshot.observed_at_ms)
+        || (target == WindowKind::FiveHour
+            && !valid_timing(weekly_window, WindowKind::Weekly, snapshot.observed_at_ms))
+    {
+        return ActivationDecision::Unsupported("invalid_window_timing");
+    }
+    if weekly_window.used_percent == Some(100.0) {
+        return ActivationDecision::Blocked("weekly_exhausted");
+    }
     if blocking_type(snapshot.rate_limit_reached_type.as_deref())
         || blocking_type(target_window.rate_limit_reached_type.as_deref())
         || (target == WindowKind::FiveHour
             && blocking_type(weekly_window.rate_limit_reached_type.as_deref()))
     {
         return ActivationDecision::Blocked("rate_limit_reached");
-    }
-    if !valid_timing(target_window, target)
-        || (target == WindowKind::FiveHour && !valid_timing(weekly_window, WindowKind::Weekly))
-    {
-        return ActivationDecision::Unsupported("invalid_window_timing");
     }
     if target_window.used_percent == Some(0.0) {
         ActivationDecision::Candidate(target)
@@ -460,7 +503,7 @@ pub(crate) fn snapshot_freshness_reason(
     None
 }
 
-fn valid_timing(window: &QuotaWindowSnapshot, kind: WindowKind) -> bool {
+fn valid_timing(window: &QuotaWindowSnapshot, kind: WindowKind, observed_at_ms: i64) -> bool {
     let Some(reset_at) = window.reset_at else {
         return false;
     };
@@ -472,6 +515,23 @@ fn valid_timing(window: &QuotaWindowSnapshot, kind: WindowKind) -> bool {
         .is_some_and(|after| after < 0 || after > kind.seconds().saturating_add(300))
     {
         return false;
+    }
+    // Epoch-based consistency is only meaningful for real wall-clock values;
+    // tiny synthetic timestamps remain useful in pure state-machine tests.
+    if observed_at_ms >= 1_000_000_000_000 {
+        if let Some(reset_after) = window.reset_after_seconds {
+            let expected_reset_at = observed_at_ms / 1000 + reset_after;
+            // A reset boundary that has just passed while advertising a full
+            // window-length countdown is an internally contradictory response.
+            // Older historical boundaries can legitimately be far behind the
+            // observation and are retained for lifecycle ordering.
+            if reset_at < observed_at_ms / 1000
+                && observed_at_ms / 1000 - reset_at <= 300
+                && (reset_at - expected_reset_at).abs() > 300
+            {
+                return false;
+            }
+        }
     }
     true
 }
@@ -524,10 +584,11 @@ impl ActivationState {
         let trusted_observation = match decision {
             ActivationDecision::Candidate(_) | ActivationDecision::Observe => true,
             ActivationDecision::Blocked("weekly_exhausted") => {
-                valid_timing(window, target)
+                valid_timing(window, target, snapshot.observed_at_ms)
                     && (target != WindowKind::FiveHour
-                        || find_window(snapshot, WindowKind::Weekly)
-                            .is_some_and(|weekly| valid_timing(weekly, WindowKind::Weekly)))
+                        || find_window(snapshot, WindowKind::Weekly).is_some_and(|weekly| {
+                            valid_timing(weekly, WindowKind::Weekly, snapshot.observed_at_ms)
+                        }))
             }
             ActivationDecision::Blocked(_) | ActivationDecision::Unsupported(_) => false,
         };
@@ -828,6 +889,9 @@ mod tests {
         let mut recovered = snapshot(Some(0.0), Some(50.0));
         recovered.request_started_at_ms = 1_800_018_001_000;
         recovered.observed_at_ms = recovered.request_started_at_ms;
+        for window in &mut recovered.windows {
+            window.reset_after_seconds = Some(0);
+        }
         assert_eq!(
             state.observe(&recovered, recovered.observed_at_ms),
             ActivationDecision::Candidate(WindowKind::FiveHour)
@@ -864,6 +928,32 @@ mod tests {
             snapshot_freshness_reason(&snapshot, 1_000),
             Some("server_date_conflict")
         );
+    }
+
+    #[test]
+    fn n03_reset_boundary_and_countdown_conflict_cannot_create_candidate() {
+        let now_ms = 1_800_000_000_000;
+        let mut snapshot = snapshot_at(Some(0.0), Some(50.0), now_ms, 1_799_999_900);
+        assert_eq!(
+            select_target_at(&snapshot, now_ms),
+            ActivationDecision::Unsupported("invalid_window_timing")
+        );
+        let mut state = ActivationState::default();
+        assert_eq!(
+            state.observe(&snapshot, now_ms),
+            ActivationDecision::Unsupported("invalid_window_timing")
+        );
+        assert_eq!(state, ActivationState::BootstrapPending);
+
+        // A weekly block still permits a trustworthy nonzero five-hour
+        // observation to establish its baseline; only the contradictory
+        // timing is rejected.
+        snapshot = snapshot_at(Some(20.0), Some(100.0), now_ms, 1_799_999_900);
+        assert_eq!(
+            state.observe(&snapshot, now_ms),
+            ActivationDecision::Unsupported("invalid_window_timing")
+        );
+        assert_eq!(state, ActivationState::BootstrapPending);
     }
 
     #[test]
